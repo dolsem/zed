@@ -33,7 +33,7 @@ use project::{
         branch_diff::{self, BranchDiffEvent, DiffBase},
     },
 };
-use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
+use settings::{GitPanelGroupBy, GitPanelSortBy, GitPanelUntrackedChanges, Settings, SettingsStore};
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -576,16 +576,19 @@ impl ProjectDiff {
         let mut was_tree_view = GitPanelSettings::get_global(cx).tree_view;
         let mut was_collapse_untracked_diff =
             GitPanelSettings::get_global(cx).collapse_untracked_diff;
+        let mut was_untracked_changes = GitPanelSettings::get_global(cx).untracked_changes;
         cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
             let settings = GitPanelSettings::get_global(cx);
             let sort_by = settings.sort_by;
             let group_by = settings.group_by;
             let tree_view = settings.tree_view;
             let is_collapse_untracked_diff = settings.collapse_untracked_diff;
+            let untracked_changes = settings.untracked_changes;
             if sort_by != was_sort_by
                 || group_by != was_group_by
                 || tree_view != was_tree_view
                 || is_collapse_untracked_diff != was_collapse_untracked_diff
+                || untracked_changes != was_untracked_changes
             {
                 this._task = {
                     window.spawn(cx, {
@@ -598,6 +601,7 @@ impl ProjectDiff {
             was_group_by = group_by;
             was_tree_view = tree_view;
             was_collapse_untracked_diff = is_collapse_untracked_diff;
+            was_untracked_changes = untracked_changes;
         })
         .detach();
 
@@ -985,7 +989,13 @@ impl ProjectDiff {
     pub async fn refresh(this: WeakEntity<Self>, cx: &mut AsyncWindowContext) -> Result<()> {
         let entries = this.update(cx, |this, cx| {
             let (repo, buffers_to_load) = this.branch_diff.update(cx, |branch_diff, cx| {
-                let load_buffers = branch_diff.load_buffers(cx);
+                let mut load_buffers = branch_diff.load_buffers(cx);
+                if branch_diff.diff_base() == &DiffBase::Head
+                    && GitPanelSettings::get_global(cx).untracked_changes
+                        == GitPanelUntrackedChanges::Hidden
+                {
+                    load_buffers.retain(|entry| !entry.file_status.is_untracked());
+                }
                 (branch_diff.repo().cloned(), load_buffers)
             });
             let mut previous_paths = this
@@ -2150,10 +2160,10 @@ mod tests {
     use db::indoc;
     use editor::test::editor_test_context::{EditorTestContext, assert_state_with_diff};
     use git::status::{TrackedStatus, UnmergedStatus, UnmergedStatusCode};
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal};
     use project::FakeFs;
     use serde_json::json;
-    use settings::{DiffViewStyle, SettingsStore};
+    use settings::{DiffViewStyle, GitPanelUntrackedChanges, SettingsStore};
     use std::path::Path;
     use unindent::Unindent as _;
     use util::{
@@ -2183,6 +2193,67 @@ mod tests {
             editor::init(cx);
             crate::init(cx);
         });
+    }
+
+    #[gpui::test]
+    async fn test_hidden_untracked_changes_excludes_untracked_buffers(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().untracked_changes =
+                        Some(GitPanelUntrackedChanges::Hidden);
+                })
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked.txt": "changed\n",
+                "new.txt": "new\n",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("tracked.txt", "original\n".into())],
+            "deadbeef",
+        );
+        fs.set_status_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("tracked.txt", git::status::StatusCode::Modified.worktree()),
+                ("new.txt", FileStatus::Untracked),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace, window, cx)
+        });
+        cx.run_until_parked();
+
+        let paths = diff.read_with(cx, |diff, cx| {
+            diff.editor
+                .read(cx)
+                .rhs_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .all_buffers()
+                .iter()
+                .map(|buffer| buffer.read(cx).file().unwrap().path().clone())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(paths, vec![rel_path("tracked.txt").into_arc()]);
     }
 
     #[gpui::test]
