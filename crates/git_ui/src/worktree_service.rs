@@ -1,12 +1,13 @@
 use std::error::Error;
 use std::fmt;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::anyhow;
 use askpass::AskPassDelegate;
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use fs::Fs;
+use git::repository::Worktree as GitWorktree;
 use gpui::{
     AsyncWindowContext, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
     Task, TaskExt, WeakEntity,
@@ -309,6 +310,17 @@ impl Render for WorktreeFetchFailedToast {
             )
     }
 }
+
+#[derive(Clone, Copy)]
+enum WorktreeNavigationTarget {
+    Main,
+    Last,
+    Next,
+    Previous,
+}
+
+static LAST_ACTIVE_WORKTREES: LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashMap::default()));
 
 /// Classifies the project's visible worktrees into git-managed repositories
 /// and non-git paths. Each unique repository is returned only once.
@@ -884,6 +896,274 @@ fn create_worktree_workspace_inner(
     })
 }
 
+pub fn handle_open_main_worktree(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    handle_open_worktree_navigation(workspace, WorktreeNavigationTarget::Main, window, cx);
+}
+
+pub fn handle_open_last_worktree(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    handle_open_worktree_navigation(workspace, WorktreeNavigationTarget::Last, window, cx);
+}
+
+pub fn handle_open_next_worktree(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    handle_open_worktree_navigation(workspace, WorktreeNavigationTarget::Next, window, cx);
+}
+
+pub fn handle_open_previous_worktree(
+    workspace: &mut Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    handle_open_worktree_navigation(workspace, WorktreeNavigationTarget::Previous, window, cx);
+}
+
+fn handle_open_worktree_navigation(
+    workspace: &mut Workspace,
+    target: WorktreeNavigationTarget,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let project = workspace.project().clone();
+
+    if project.read(cx).repositories(cx).is_empty() {
+        log::error!("open_worktree_navigation: no git repository in the project");
+        return;
+    }
+    if project.read(cx).is_via_collab() {
+        log::error!("open_worktree_navigation: not supported in collab projects");
+        return;
+    }
+    if workspace.active_worktree_creation().label.is_some() {
+        return;
+    }
+
+    let Some(repository) = project.read(cx).active_repository(cx) else {
+        return;
+    };
+
+    let (current_worktree_path, main_worktree_path, repository_key) =
+        repository.update(cx, |repository, _| {
+            (
+                repository.work_directory_abs_path.to_path_buf(),
+                repository.main_worktree_abs_path().map(Path::to_path_buf),
+                repository_key(repository),
+            )
+        });
+
+    match target {
+        WorktreeNavigationTarget::Main => {
+            let Some(target_path) = main_worktree_path else {
+                return;
+            };
+            if target_path == current_worktree_path {
+                return;
+            }
+            handle_switch_worktree(
+                workspace,
+                &zed_actions::SwitchWorktree {
+                    path: target_path,
+                    display_name: "main worktree".to_string(),
+                },
+                window,
+                None,
+                cx,
+            );
+            return;
+        }
+        WorktreeNavigationTarget::Last => {
+            let Some(target_path) =
+                LAST_ACTIVE_WORKTREES
+                    .lock()
+                    .ok()
+                    .and_then(|last_active_worktrees| {
+                        last_active_worktrees.get(repository_key.as_path()).cloned()
+                    })
+            else {
+                return;
+            };
+            if target_path == current_worktree_path {
+                return;
+            }
+            let display_name = display_name_for_path_fallback(target_path.as_path());
+            handle_switch_worktree(
+                workspace,
+                &zed_actions::SwitchWorktree {
+                    path: target_path,
+                    display_name,
+                },
+                window,
+                None,
+                cx,
+            );
+            return;
+        }
+        WorktreeNavigationTarget::Next | WorktreeNavigationTarget::Previous => {}
+    }
+
+    let worktrees_request = repository.update(cx, |repository, _| repository.worktrees());
+
+    cx.spawn_in(window, async move |workspace, cx| {
+        let worktrees: Vec<_> = match worktrees_request.await {
+            Ok(Ok(worktrees)) => worktrees
+                .into_iter()
+                .filter(|worktree| !worktree.is_bare)
+                .collect(),
+            Ok(Err(err)) => {
+                log::warn!("open_worktree_navigation: git worktree list failed: {err}");
+                return anyhow::Ok(());
+            }
+            Err(_) => {
+                log::warn!("open_worktree_navigation: worktree request was cancelled");
+                return anyhow::Ok(());
+            }
+        };
+
+        let Some((target_path, display_name)) = resolve_worktree_navigation_target(
+            target,
+            &worktrees,
+            current_worktree_path.as_path(),
+            main_worktree_path.as_deref(),
+            repository_key.as_path(),
+        ) else {
+            return anyhow::Ok(());
+        };
+
+        if target_path == current_worktree_path {
+            return anyhow::Ok(());
+        }
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            handle_switch_worktree(
+                workspace,
+                &zed_actions::SwitchWorktree {
+                    path: target_path,
+                    display_name,
+                },
+                window,
+                None,
+                cx,
+            );
+        })?;
+
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+fn resolve_worktree_navigation_target(
+    target: WorktreeNavigationTarget,
+    worktrees: &[GitWorktree],
+    current_worktree_path: &Path,
+    main_worktree_path: Option<&Path>,
+    repository_key: &Path,
+) -> Option<(PathBuf, String)> {
+    match target {
+        WorktreeNavigationTarget::Main => {
+            let main_worktree_path = main_worktree_path?;
+            Some((
+                main_worktree_path.to_path_buf(),
+                display_name_for_worktree_path(worktrees, main_worktree_path, main_worktree_path),
+            ))
+        }
+        WorktreeNavigationTarget::Last => {
+            let last_worktree_path =
+                LAST_ACTIVE_WORKTREES
+                    .lock()
+                    .ok()
+                    .and_then(|last_active_worktrees| {
+                        last_active_worktrees.get(repository_key).cloned()
+                    })?;
+            worktrees
+                .iter()
+                .any(|worktree| worktree.path == last_worktree_path)
+                .then(|| {
+                    let display_name = display_name_for_worktree_path(
+                        worktrees,
+                        last_worktree_path.as_path(),
+                        main_worktree_path.unwrap_or(repository_key),
+                    );
+                    (last_worktree_path, display_name)
+                })
+        }
+        WorktreeNavigationTarget::Next | WorktreeNavigationTarget::Previous => {
+            let main_worktree_path = main_worktree_path.unwrap_or(repository_key);
+            let mut sorted_worktrees = worktrees.to_vec();
+            sorted_worktrees.sort_by(|a, b| {
+                a.directory_name(Some(main_worktree_path))
+                    .cmp(&b.directory_name(Some(main_worktree_path)))
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+
+            if sorted_worktrees.len() < 2 {
+                return None;
+            }
+
+            let current_index = sorted_worktrees
+                .iter()
+                .position(|worktree| worktree.path == current_worktree_path)?;
+            let target_index = if matches!(target, WorktreeNavigationTarget::Next) {
+                (current_index + 1) % sorted_worktrees.len()
+            } else {
+                (current_index + sorted_worktrees.len() - 1) % sorted_worktrees.len()
+            };
+            let worktree = &sorted_worktrees[target_index];
+            Some((
+                worktree.path.clone(),
+                worktree.directory_name(Some(main_worktree_path)),
+            ))
+        }
+    }
+}
+
+fn display_name_for_worktree_path(
+    worktrees: &[GitWorktree],
+    path: &Path,
+    main_worktree_path: &Path,
+) -> String {
+    worktrees
+        .iter()
+        .find(|worktree| worktree.path == path)
+        .map(|worktree| worktree.directory_name(Some(main_worktree_path)))
+        .unwrap_or_else(|| display_name_for_path_fallback(path))
+}
+
+fn display_name_for_path_fallback(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("worktree")
+        .to_string()
+}
+
+fn repository_key(repository: &Repository) -> PathBuf {
+    repository
+        .main_worktree_abs_path()
+        .unwrap_or(repository.common_dir_abs_path.as_ref())
+        .to_path_buf()
+}
+
+fn last_worktree_update_for_repository(
+    repository: &Repository,
+    target_worktree_path: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    let current_worktree_path = repository.work_directory_abs_path.to_path_buf();
+    if current_worktree_path == target_worktree_path {
+        return None;
+    }
+
+    Some((repository_key(repository), current_worktree_path))
+}
+
 pub fn handle_switch_worktree(
     workspace: &mut Workspace,
     action: &zed_actions::SwitchWorktree,
@@ -925,6 +1205,13 @@ pub fn handle_switch_worktree(
     workspace.set_active_worktree_creation(Some(display_name), true, cx);
 
     let worktree_path = action.path.clone();
+    let last_worktree_update = project
+        .read(cx)
+        .active_repository(cx)
+        .and_then(|repository| {
+            let repository = repository.read(cx);
+            last_worktree_update_for_repository(repository, &worktree_path)
+        });
 
     cx.spawn_in(window, async move |_workspace_entity, mut cx| {
         let result = do_switch_worktree(
@@ -938,6 +1225,13 @@ pub fn handle_switch_worktree(
             &mut cx,
         )
         .await;
+
+        if result.is_ok()
+            && let Some((repository_key, previous_worktree_path)) = last_worktree_update
+            && let Ok(mut last_active_worktrees) = LAST_ACTIVE_WORKTREES.lock()
+        {
+            last_active_worktrees.insert(repository_key, previous_worktree_path);
+        }
 
         if let Err(err) = &result {
             log::error!("Failed to switch worktree: {err}");

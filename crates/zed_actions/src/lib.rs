@@ -342,6 +342,14 @@ pub mod git {
             ViewStash,
             /// Opens the git worktree selector.
             Worktree,
+            /// Switches to the main git worktree.
+            OpenMainWorktree,
+            /// Switches to the last active git worktree for this repository.
+            OpenLastWorktree,
+            /// Switches to the next git worktree.
+            OpenNextWorktree,
+            /// Switches to the previous git worktree.
+            OpenPreviousWorktree,
             /// Creates a pull request for the current branch.
             CreatePullRequest
         ]

@@ -105,6 +105,26 @@ pub fn init(cx: &mut App) {
                 worktree_service::handle_switch_worktree(workspace, action, window, None, cx);
             },
         );
+        workspace.register_action(
+            |workspace, _: &zed_actions::git::OpenMainWorktree, window, cx| {
+                worktree_service::handle_open_main_worktree(workspace, window, cx);
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &zed_actions::git::OpenLastWorktree, window, cx| {
+                worktree_service::handle_open_last_worktree(workspace, window, cx);
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &zed_actions::git::OpenNextWorktree, window, cx| {
+                worktree_service::handle_open_next_worktree(workspace, window, cx);
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &zed_actions::git::OpenPreviousWorktree, window, cx| {
+                worktree_service::handle_open_previous_worktree(workspace, window, cx);
+            },
+        );
 
         workspace.register_action(|workspace, _: &zed_actions::git::Worktree, window, cx| {
             let focused_dock = workspace.focused_dock_position(window, cx);
