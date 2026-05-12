@@ -862,7 +862,7 @@ impl SshRemoteConnection {
         }
 
         let wanted_version = cx.update(|cx| match release_channel {
-            ReleaseChannel::Nightly => Ok(None),
+            ReleaseChannel::Nightly | ReleaseChannel::Dolsem => Ok(None),
             ReleaseChannel::Dev => {
                 anyhow::bail!(
                     "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",

@@ -9,7 +9,7 @@ use semver::Version;
 
 const ZED_DOCS_URL: &str = "https://zed.dev/docs";
 
-/// stable | dev | nightly | preview
+/// stable | dev | nightly | preview | dolsem
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
     if cfg!(debug_assertions) {
         env::var("ZED_RELEASE_CHANNEL")
@@ -34,6 +34,7 @@ pub fn app_identifier() -> &'static str {
         ReleaseChannel::Nightly => "Zed-Editor-Nightly",
         ReleaseChannel::Preview => "Zed-Editor-Preview",
         ReleaseChannel::Stable => "Zed-Editor-Stable",
+        ReleaseChannel::Dolsem => "Zed-Editor-Dolsem",
     }
 }
 
@@ -137,6 +138,9 @@ pub enum ReleaseChannel {
 
     /// The Stable release channel.
     Stable,
+
+    /// Personal local channel; behaves like Nightly but never auto-updates.
+    Dolsem,
 }
 
 struct GlobalReleaseChannel(ReleaseChannel);
@@ -165,11 +169,12 @@ pub fn docs_url(slug: &str, cx: &App) -> String {
 
 impl ReleaseChannel {
     /// All release channels.
-    pub const ALL: [ReleaseChannel; 4] = [
+    pub const ALL: [ReleaseChannel; 5] = [
         ReleaseChannel::Dev,
         ReleaseChannel::Nightly,
         ReleaseChannel::Preview,
         ReleaseChannel::Stable,
+        ReleaseChannel::Dolsem,
     ];
 
     /// Returns the global [`ReleaseChannel`].
@@ -185,7 +190,7 @@ impl ReleaseChannel {
 
     /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
     pub fn poll_for_updates(&self) -> bool {
-        !matches!(self, ReleaseChannel::Dev)
+        !matches!(self, ReleaseChannel::Dev | ReleaseChannel::Dolsem)
     }
 
     /// Returns the display name for this [`ReleaseChannel`].
@@ -195,6 +200,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
             ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Dolsem => "Zed Dolsem",
         }
     }
 
@@ -205,6 +211,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "nightly",
             ReleaseChannel::Preview => "preview",
             ReleaseChannel::Stable => "stable",
+            ReleaseChannel::Dolsem => "dolsem",
         }
     }
 
@@ -217,6 +224,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
             ReleaseChannel::Preview => "dev.zed.Zed-Preview",
             ReleaseChannel::Stable => "dev.zed.Zed",
+            ReleaseChannel::Dolsem => "dev.zed.Zed-Dolsem",
         }
     }
 
@@ -227,6 +235,7 @@ impl ReleaseChannel {
             Self::Nightly => Some("nightly=1"),
             Self::Preview => Some("preview=1"),
             Self::Stable => None,
+            Self::Dolsem => None,
         }
     }
 
@@ -237,6 +246,7 @@ impl ReleaseChannel {
             Self::Dev | Self::Nightly => Some("nightly"),
             Self::Preview => Some("preview"),
             Self::Stable => None,
+            Self::Dolsem => None,
         };
 
         match channel_path_segment {
@@ -261,6 +271,7 @@ impl FromStr for ReleaseChannel {
             "nightly" => ReleaseChannel::Nightly,
             "preview" => ReleaseChannel::Preview,
             "stable" => ReleaseChannel::Stable,
+            "dolsem" => ReleaseChannel::Dolsem,
             _ => return Err(InvalidReleaseChannel),
         })
     }
