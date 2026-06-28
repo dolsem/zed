@@ -2006,8 +2006,15 @@ impl AgentPanel {
     ) {
         let terminal_working_directory = working_directory.clone();
         let init_command = Self::terminal_init_command(run_init_command, cx);
+        // Expose the terminal thread's stable id to the shell (and thus to the
+        // init command) so sessions can be correlated across restarts; the id is
+        // persisted with the thread metadata and reused when the thread is restored.
+        let terminal_env = HashMap::from_iter([(
+            "ZED_THREAD_ID".to_string(),
+            terminal_id.to_key_string(),
+        )]);
         let terminal_task = self.project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
+            project.create_terminal_shell_with_env(working_directory, terminal_env, cx)
         });
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
