@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::agent_connection_store::AgentConnectionStore;
 
+use crate::terminal_thread_metadata_store::{TerminalThreadMetadata, TerminalThreadMetadataStore};
 use crate::thread_metadata_store::{
     ThreadId, ThreadMetadata, ThreadMetadataStore, worktree_info_from_thread_paths,
 };
@@ -61,6 +62,43 @@ enum ArchiveListItem {
         thread: ThreadMetadata,
         highlight_positions: Vec<usize>,
     },
+    /// An archived terminal thread. Live terminals are only listed in the
+    /// sidebar, so every terminal shown here is archived.
+    Terminal {
+        terminal: TerminalThreadMetadata,
+        highlight_positions: Vec<usize>,
+    },
+}
+
+enum HistoryEntry {
+    Thread(ThreadMetadata),
+    Terminal(TerminalThreadMetadata),
+}
+
+impl HistoryEntry {
+    fn date(&self) -> DateTime<Utc> {
+        match self {
+            HistoryEntry::Thread(thread) => thread.created_at.unwrap_or(thread.updated_at),
+            HistoryEntry::Terminal(terminal) => terminal.created_at,
+        }
+    }
+
+    fn title(&self) -> SharedString {
+        match self {
+            HistoryEntry::Thread(thread) => thread
+                .title
+                .clone()
+                .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into()),
+            HistoryEntry::Terminal(terminal) => terminal.display_title(),
+        }
+    }
+
+    fn folder_paths(&self) -> &PathList {
+        match self {
+            HistoryEntry::Thread(thread) => thread.folder_paths(),
+            HistoryEntry::Terminal(terminal) => terminal.folder_paths(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +169,7 @@ pub fn fuzzy_match_positions(query: &str, candidate: &str) -> Option<Vec<usize>>
 pub enum ThreadsArchiveViewEvent {
     Close,
     Activate { thread: ThreadMetadata },
+    ActivateTerminal { terminal: TerminalThreadMetadata },
     CancelRestore { thread_id: ThreadId },
     Import,
     NewThread,
@@ -203,6 +242,13 @@ impl ThreadsArchiveView {
             },
         );
 
+        let terminal_metadata_store_subscription = cx.observe(
+            &TerminalThreadMetadataStore::global(cx),
+            |this: &mut Self, _, cx| {
+                this.update_items(cx);
+            },
+        );
+
         cx.on_focus_out(&focus_handle, window, |this: &mut Self, _, _window, cx| {
             this.selection = None;
             cx.notify();
@@ -221,6 +267,7 @@ impl ThreadsArchiveView {
             _subscriptions: vec![
                 filter_editor_subscription,
                 thread_metadata_store_subscription,
+                terminal_metadata_store_subscription,
             ],
             _refresh_history_task: Task::ready(()),
             workspace,
@@ -270,26 +317,35 @@ impl ThreadsArchiveView {
 
     fn update_items(&mut self, cx: &mut Context<Self>) {
         let store = ThreadMetadataStore::global(cx).read(cx);
+        let terminal_store = TerminalThreadMetadataStore::global(cx).read(cx);
 
         // If we're filtering to archived threads but none remain (e.g. the
         // user just deleted the last one), fall back to showing all threads
         // so they aren't stranded with an empty list and a disabled toggle.
         if self.thread_filter == ThreadFilter::ArchivedOnly
             && store.archived_entries().next().is_none()
+            && terminal_store.archived_entries().next().is_none()
         {
             self.thread_filter = ThreadFilter::All;
         }
 
         let thread_filter = self.thread_filter;
-        let sessions = store
+        let threads = store
             .entries()
             .filter(|t| match thread_filter {
                 ThreadFilter::All => true,
                 ThreadFilter::ArchivedOnly => t.archived,
             })
-            .sorted_by_cached_key(|t| t.created_at.unwrap_or(t.updated_at))
-            .rev()
             .cloned()
+            .map(HistoryEntry::Thread);
+        let terminals = terminal_store
+            .archived_entries()
+            .cloned()
+            .map(HistoryEntry::Terminal);
+        let sessions = threads
+            .chain(terminals)
+            .sorted_by_cached_key(HistoryEntry::date)
+            .rev()
             .collect::<Vec<_>>();
 
         let query = self.filter_editor.read(cx).text(cx).to_lowercase();
@@ -300,12 +356,8 @@ impl ThreadsArchiveView {
 
         for session in sessions {
             let highlight_positions = if !query.is_empty() {
-                let title = session
-                    .title
-                    .as_ref()
-                    .map(|t| t.as_ref())
-                    .unwrap_or(DEFAULT_THREAD_TITLE);
-                if let Some(positions) = fuzzy_match_positions(&query, title) {
+                let title = session.title();
+                if let Some(positions) = fuzzy_match_positions(&query, &title) {
                     positions
                 } else {
                     // If title didn't match, also try matching the project name
@@ -327,12 +379,7 @@ impl ThreadsArchiveView {
             };
 
             let entry_bucket = {
-                let entry_date = session
-                    .created_at
-                    .unwrap_or(session.updated_at)
-                    .with_timezone(&Local)
-                    .naive_local()
-                    .date();
+                let entry_date = session.date().with_timezone(&Local).naive_local().date();
                 TimeBucket::from_dates(today, entry_date)
             };
 
@@ -341,9 +388,15 @@ impl ThreadsArchiveView {
                 items.push(ArchiveListItem::BucketSeparator(entry_bucket));
             }
 
-            items.push(ArchiveListItem::Entry {
-                thread: session,
-                highlight_positions,
+            items.push(match session {
+                HistoryEntry::Thread(thread) => ArchiveListItem::Entry {
+                    thread,
+                    highlight_positions,
+                },
+                HistoryEntry::Terminal(terminal) => ArchiveListItem::Terminal {
+                    terminal,
+                    highlight_positions,
+                },
             });
         }
 
@@ -441,6 +494,27 @@ impl ThreadsArchiveView {
         self.archive_thread(thread.thread_id, cx);
     }
 
+    /// Asks the sidebar to restore an archived terminal, which re-spawns its
+    /// shell with the same `ZED_THREAD_ID`.
+    fn restore_terminal(
+        &mut self,
+        terminal: TerminalThreadMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection = None;
+        self.reset_filter_editor_text(window, cx);
+        cx.emit(ThreadsArchiveViewEvent::ActivateTerminal { terminal });
+    }
+
+    fn delete_terminal(&mut self, terminal: &TerminalThreadMetadata, cx: &mut Context<Self>) {
+        self.preserve_selection_on_next_update = true;
+        let terminal_id = terminal.terminal_id;
+        TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.delete(terminal_id, cx);
+        });
+    }
+
     fn unarchive_thread(
         &mut self,
         thread: ThreadMetadata,
@@ -503,7 +577,10 @@ impl ThreadsArchiveView {
     }
 
     fn is_selectable_item(&self, ix: usize) -> bool {
-        matches!(self.items.get(ix), Some(ArchiveListItem::Entry { .. }))
+        matches!(
+            self.items.get(ix),
+            Some(ArchiveListItem::Entry { .. } | ArchiveListItem::Terminal { .. })
+        )
     }
 
     fn find_next_selectable(&self, start: usize) -> Option<usize> {
@@ -585,11 +662,15 @@ impl ThreadsArchiveView {
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.selection else { return };
-        let Some(ArchiveListItem::Entry { thread, .. }) = self.items.get(ix) else {
-            return;
-        };
-
-        self.unarchive_thread(thread.clone(), window, cx);
+        match self.items.get(ix) {
+            Some(ArchiveListItem::Entry { thread, .. }) => {
+                self.unarchive_thread(thread.clone(), window, cx);
+            }
+            Some(ArchiveListItem::Terminal { terminal, .. }) => {
+                self.restore_terminal(terminal.clone(), window, cx);
+            }
+            _ => {}
+        }
     }
 
     fn render_list_entry(
@@ -787,6 +868,68 @@ impl ThreadsArchiveView {
                     .into_any_element()
                 }
             }
+            ArchiveListItem::Terminal {
+                terminal,
+                highlight_positions,
+            } => {
+                let id = SharedString::from(format!("archive-entry-{}", ix));
+                let button_hover_bg = cx.theme().colors().element_background;
+                let archived_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
+                let focus_handle = self.focus_handle.clone();
+                let worktrees =
+                    worktree_info_from_thread_paths(&terminal.worktree_paths, &HashMap::default());
+
+                ThreadItem::new(id, terminal.display_title())
+                    .icon(IconName::Terminal)
+                    .archived(true)
+                    .icon_color(archived_color)
+                    .title_label_color(Color::Muted)
+                    .timestamp(format_history_entry_timestamp(terminal.created_at))
+                    .highlight_positions(highlight_positions.clone())
+                    .project_paths(terminal.folder_paths().paths_owned())
+                    .worktrees(worktrees)
+                    .focused(self.selection == Some(ix))
+                    .hovered(self.hovered_index == Some(ix))
+                    .on_hover(cx.listener(move |this, is_hovered, _window, cx| {
+                        let previously_hovered = this.hovered_index;
+                        this.hovered_index = if *is_hovered {
+                            Some(ix)
+                        } else {
+                            previously_hovered.filter(|&i| i != ix)
+                        };
+                        if this.hovered_index != previously_hovered {
+                            cx.notify();
+                        }
+                    }))
+                    .action_slot(
+                        IconButton::new("delete-terminal", IconName::Trash)
+                            .hover_background(button_hover_bg)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(move |_window, cx| {
+                                Tooltip::for_action_in(
+                                    "Delete Terminal",
+                                    &RemoveSelectedThread,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            })
+                            .on_click({
+                                let terminal = terminal.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    this.delete_terminal(&terminal, cx);
+                                    cx.stop_propagation();
+                                })
+                            }),
+                    )
+                    .on_click({
+                        let terminal = terminal.clone();
+                        cx.listener(move |this, _, window, cx| {
+                            this.restore_terminal(terminal.clone(), window, cx);
+                        })
+                    })
+                    .into_any_element()
+            }
         }
     }
 
@@ -797,8 +940,14 @@ impl ThreadsArchiveView {
         cx: &mut Context<Self>,
     ) {
         let Some(ix) = self.selection else { return };
-        let Some(ArchiveListItem::Entry { thread, .. }) = self.items.get(ix) else {
-            return;
+        let thread = match self.items.get(ix) {
+            Some(ArchiveListItem::Entry { thread, .. }) => thread,
+            Some(ArchiveListItem::Terminal { terminal, .. }) => {
+                let terminal = terminal.clone();
+                self.delete_terminal(&terminal, cx);
+                return;
+            }
+            _ => return,
         };
 
         self.preserve_selection_on_next_update = true;
@@ -955,12 +1104,19 @@ impl ThreadsArchiveView {
         let entry_count = self
             .items
             .iter()
-            .filter(|item| matches!(item, ArchiveListItem::Entry { .. }))
+            .filter(|item| {
+                matches!(
+                    item,
+                    ArchiveListItem::Entry { .. } | ArchiveListItem::Terminal { .. }
+                )
+            })
             .count();
 
         let has_archived_threads = {
             let store = ThreadMetadataStore::global(cx).read(cx);
+            let terminal_store = TerminalThreadMetadataStore::global(cx).read(cx);
             store.archived_entries().next().is_some()
+                || terminal_store.archived_entries().next().is_some()
         };
 
         let count_label = if entry_count == 1 {

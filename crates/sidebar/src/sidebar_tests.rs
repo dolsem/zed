@@ -2291,7 +2291,7 @@ async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut T
             .expect("terminal should be visible in sidebar")
     });
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.close_terminal(&terminal_metadata, &terminal_workspace, window, cx);
+        sidebar.archive_terminal(&terminal_metadata, &terminal_workspace, window, cx);
     });
     cx.run_until_parked();
 
@@ -2420,6 +2420,7 @@ async fn test_terminal_metadata_is_deduped_across_project_groups(cx: &mut TestAp
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        archived: false,
     };
 
     cx.update(|_, cx| {
@@ -2515,7 +2516,7 @@ async fn test_agent_panel_terminal_shows_project_and_linked_worktree(cx: &mut Te
 }
 
 #[gpui::test]
-async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace(
+async fn test_terminal_close_event_on_linked_worktree_keeps_workspace_and_worktree(
     cx: &mut TestAppContext,
 ) {
     init_test(cx);
@@ -2664,159 +2665,44 @@ async fn test_terminal_close_event_on_archived_linked_worktree_removes_workspace
         cx.run_until_parked();
     }
 
-    let terminal_metadata_deleted = cx.update(|_, cx| {
+    let terminal_metadata_archived = cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx)
             .read(cx)
             .entry(terminal_id)
-            .is_none()
+            .is_some_and(|metadata| metadata.archived)
     });
     assert!(
-        terminal_metadata_deleted,
-        "terminal metadata should be deleted after close"
+        terminal_metadata_archived,
+        "terminal metadata should be archived after its shell exits"
     );
-    let empty_draft_metadata_deleted = cx.update(|_, cx| {
+    let empty_draft_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(empty_draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        empty_draft_metadata_deleted,
-        "empty draft metadata should be deleted before archiving the linked worktree"
-    );
-    let unarchived_worktree_threads = cx.update(|_, cx| {
-        ThreadMetadataStore::global(cx)
-            .read(cx)
-            .entries_for_path(&worktree_folder_paths, None)
-            .count()
-    });
-    assert_eq!(
-        unarchived_worktree_threads, 0,
-        "closing the terminal must not create a fallback draft for the removed worktree"
+        empty_draft_kept,
+        "archiving a terminal must not clean up other threads in its worktree"
     );
     assert_eq!(
         multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
             .workspaces()
             .count()),
-        1,
-        "linked worktree workspace should be removed after closing its last terminal"
+        2,
+        "linked worktree workspace should stay open after archiving its terminal"
     );
     let entries_after = visible_entries_as_strings(&sidebar, cx);
     assert!(
-        !entries_after.iter().any(|entry| entry.contains('{')),
-        "no sidebar entry should reference the archived worktree, got: {entries_after:?}"
+        !entries_after
+            .iter()
+            .any(|entry| entry.contains("Dev Server")),
+        "archived terminal should be hidden from the sidebar, got: {entries_after:?}"
     );
     assert!(
-        !fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
+        fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
             .await,
-        "linked worktree directory should be removed from disk after closing its last terminal"
-    );
-}
-
-#[gpui::test]
-async fn test_terminal_close_event_deletes_empty_draft_when_linked_worktree_has_no_archive_root(
-    cx: &mut TestAppContext,
-) {
-    init_test(cx);
-
-    let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(
-        "/project",
-        serde_json::json!({
-            ".git": {},
-            "src": {},
-        }),
-    )
-    .await;
-    fs.set_branch_name(Path::new("/project/.git"), Some("main"));
-    fs.insert_branches(Path::new("/project/.git"), &["main", "feature-a"]);
-    fs.add_linked_worktree_for_repo(
-        Path::new("/project/.git"),
-        false,
-        git::repository::Worktree {
-            path: PathBuf::from("/external-worktree"),
-            ref_name: Some("refs/heads/feature-a".into()),
-            sha: "aaa".into(),
-            is_main: false,
-            is_bare: false,
-        },
-    )
-    .await;
-    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
-
-    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
-    let worktree_project =
-        project::Project::test(fs.clone(), ["/external-worktree".as_ref()], cx).await;
-
-    main_project
-        .update(cx, |project, cx| project.git_scans_complete(cx))
-        .await;
-    worktree_project
-        .update(cx, |project, cx| project.git_scans_complete(cx))
-        .await;
-
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
-    let _sidebar = setup_sidebar(&multi_workspace, cx);
-    let worktree_workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
-        multi_workspace.test_add_workspace(worktree_project.clone(), window, cx)
-    });
-    let worktree_panel = add_agent_panel(&worktree_workspace, cx);
-
-    save_thread_metadata(
-        acp::SessionId::new(Arc::from("main-thread")),
-        Some("Main Thread".into()),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
-        None,
-        None,
-        &main_project,
-        cx,
-    );
-
-    let worktree_folder_paths = PathList::new(&[PathBuf::from("/external-worktree")]);
-    let empty_draft_id = save_draft_metadata_with_main_paths(
-        None,
-        worktree_folder_paths.clone(),
-        PathList::new(&[PathBuf::from("/project")]),
-        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 3, 0, 0, 0).unwrap(),
-        cx,
-    );
-
-    let terminal_id = worktree_panel
-        .update_in(cx, |panel, window, cx| {
-            panel.insert_test_terminal("Dev Server", true, window, cx)
-        })
-        .expect("test terminal should be inserted");
-    cx.run_until_parked();
-
-    worktree_panel.update(cx, |panel, cx| {
-        panel.emit_test_terminal_close(terminal_id, cx);
-    });
-    for _ in 0..4 {
-        cx.run_until_parked();
-    }
-
-    let empty_draft_metadata_deleted = cx.update(|_, cx| {
-        ThreadMetadataStore::global(cx)
-            .read(cx)
-            .entry(empty_draft_id)
-            .is_none()
-    });
-    assert!(
-        empty_draft_metadata_deleted,
-        "empty draft metadata should be deleted when removing the linked worktree workspace"
-    );
-    assert!(
-        multi_workspace
-            .read_with(cx, |multi_workspace, cx| {
-                multi_workspace.workspace_for_paths(&worktree_folder_paths, None, cx)
-            })
-            .is_none(),
-        "linked worktree workspace should be removed after closing its last terminal"
-    );
-    assert!(
-        fs.is_dir(Path::new("/external-worktree")).await,
-        "external linked worktree directory should remain on disk when no archive root is produced"
+        "linked worktree directory should be kept so the terminal can be restored"
     );
 }
 
@@ -2972,15 +2858,15 @@ async fn test_terminal_close_event_keeps_linked_worktree_workspace_with_live_edi
         cx.run_until_parked();
     }
 
-    let terminal_metadata_deleted = cx.update(|_, cx| {
+    let terminal_metadata_archived = cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx)
             .read(cx)
             .entry(terminal_id)
-            .is_none()
+            .is_some_and(|metadata| metadata.archived)
     });
     assert!(
-        terminal_metadata_deleted,
-        "terminal metadata should be deleted after close"
+        terminal_metadata_archived,
+        "terminal metadata should be archived after its shell exits"
     );
     let unarchived_worktree_threads = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
@@ -3394,7 +3280,7 @@ async fn test_archive_selected_draft_archives_closed_linked_worktree(cx: &mut Te
 }
 
 #[gpui::test]
-async fn test_terminal_close_event_closes_sidebar_terminal(cx: &mut TestAppContext) {
+async fn test_terminal_close_event_archives_sidebar_terminal(cx: &mut TestAppContext) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -3430,8 +3316,8 @@ async fn test_terminal_close_event_closes_sidebar_terminal(cx: &mut TestAppConte
             TerminalThreadMetadataStore::global(cx)
                 .read(cx)
                 .entry(terminal_id)
-                .is_none(),
-            "terminal metadata should be deleted when the terminal requests close"
+                .is_some_and(|metadata| metadata.archived),
+            "terminal metadata should be archived when the shell exits"
         );
     });
 }
@@ -3651,6 +3537,7 @@ async fn test_thread_switcher_includes_terminal_metadata_for_open_project_group(
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        archived: false,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3758,6 +3645,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        archived: false,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3827,7 +3715,7 @@ async fn test_thread_switcher_preserves_closed_terminal_linked_worktree_workspac
 }
 
 #[gpui::test]
-async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut TestAppContext) {
+async fn test_archive_selected_terminal_keeps_closed_linked_worktree(cx: &mut TestAppContext) {
     init_test(cx);
 
     let fs = FakeFs::new(cx.executor());
@@ -3906,6 +3794,7 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         .unwrap(),
         remote_connection: None,
         working_directory: None,
+        archived: false,
     };
     cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
@@ -3959,45 +3848,42 @@ async fn test_archive_selected_terminal_archives_closed_linked_worktree(cx: &mut
         cx.run_until_parked();
     }
 
-    let terminal_metadata_deleted = cx.update(|_, cx| {
+    let terminal_metadata_archived = cx.update(|_, cx| {
         TerminalThreadMetadataStore::global(cx)
             .read(cx)
             .entry(terminal_id)
-            .is_none()
+            .is_some_and(|metadata| metadata.archived)
     });
     assert!(
-        terminal_metadata_deleted,
-        "terminal metadata should be deleted after closing from the sidebar"
+        terminal_metadata_archived,
+        "terminal metadata should be archived after archiving from the sidebar"
     );
-    let empty_draft_metadata_deleted = cx.update(|_, cx| {
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert!(sidebar.contents.entries.iter().all(|entry| {
+            !matches!(entry, ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id)
+        }));
+    });
+    let empty_draft_kept = cx.update(|_, cx| {
         ThreadMetadataStore::global(cx)
             .read(cx)
             .entry(empty_draft_id)
-            .is_none()
+            .is_some()
     });
     assert!(
-        empty_draft_metadata_deleted,
-        "empty draft metadata should be deleted before archiving the linked worktree"
-    );
-    assert!(
-        multi_workspace
-            .read_with(cx, |multi_workspace, cx| {
-                multi_workspace.workspace_for_paths(&worktree_folder_paths, None, cx)
-            })
-            .is_none(),
-        "temporary linked worktree workspace should be removed after archiving"
+        empty_draft_kept,
+        "archiving a terminal must not clean up other threads in its worktree"
     );
     assert_eq!(
         multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
             .workspaces()
             .count()),
         1,
-        "closing a closed linked worktree terminal should leave only the main workspace"
+        "archiving a terminal in a closed workspace should not open that workspace"
     );
     assert!(
-        !fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
+        fs.is_dir(Path::new("/worktrees/project/feature-a/project"))
             .await,
-        "linked worktree directory should be removed from disk after closing its terminal"
+        "archiving a terminal must keep its linked worktree on disk"
     );
 }
 
@@ -4291,7 +4177,7 @@ async fn test_archive_selected_thread_deletes_empty_draft_when_linked_worktree_h
 }
 
 #[gpui::test]
-async fn test_archive_selected_thread_closes_selected_agent_panel_terminal(
+async fn test_archive_selected_thread_archives_selected_agent_panel_terminal(
     cx: &mut TestAppContext,
 ) {
     let project = init_test_project_with_agent_panel("/my-project", cx).await;
@@ -4331,10 +4217,84 @@ async fn test_archive_selected_thread_closes_selected_agent_panel_terminal(
     });
     sidebar.read_with(cx, |_sidebar, cx| {
         let store = TerminalThreadMetadataStore::global(cx).read(cx);
-        assert!(
-            store.entry(terminal_id).is_none(),
-            "terminal metadata should be deleted when closing from the sidebar"
+        let metadata = store
+            .entry(terminal_id)
+            .expect("archived terminal metadata should be kept");
+        assert!(metadata.archived);
+        assert_eq!(
+            store
+                .archived_entries()
+                .map(|entry| entry.terminal_id)
+                .collect::<Vec<_>>(),
+            vec![terminal_id]
         );
+    });
+}
+
+#[gpui::test]
+async fn test_archived_terminal_restores_from_thread_history(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let terminal_id = panel
+        .update_in(cx, |panel, window, cx| {
+            panel.insert_test_terminal("Dev Server", true, window, cx)
+        })
+        .expect("test terminal should be inserted");
+    cx.run_until_parked();
+
+    let (metadata, workspace) = sidebar.read_with(cx, |sidebar, _cx| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id => {
+                    Some((terminal.metadata.clone(), terminal.workspace.clone()))
+                }
+                _ => None,
+            })
+            .expect("terminal should be visible in sidebar")
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_terminal(&metadata, &workspace, window, cx);
+    });
+    cx.run_until_parked();
+
+    let archived_metadata = sidebar.read_with(cx, |_sidebar, cx| {
+        TerminalThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(terminal_id)
+            .cloned()
+            .expect("archived terminal metadata should be kept")
+    });
+    assert!(archived_metadata.archived);
+    panel.read_with(cx, |panel, _cx| {
+        assert!(!panel.has_terminal(terminal_id));
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.open_terminal_from_archive(archived_metadata, window, cx);
+    });
+    cx.run_until_parked();
+
+    // Re-spawning the shell itself needs a real PTY, which sidebar tests
+    // don't have; `AgentPanel::restore_terminal` is covered in agent_ui.
+    sidebar.read_with(cx, |sidebar, cx| {
+        let store = TerminalThreadMetadataStore::global(cx).read(cx);
+        assert!(!store.entry(terminal_id).unwrap().archived);
+        assert!(store.archived_entries().next().is_none());
+        assert!(sidebar.contents.entries.iter().any(|entry| {
+            matches!(entry, ListEntry::Terminal(terminal) if terminal.metadata.terminal_id == terminal_id)
+        }));
+        assert!(
+            matches!(&sidebar.active_entry, Some(ActiveEntry::Terminal { terminal_id: id, .. }) if *id == terminal_id),
+            "the restored terminal should become active, got {:?}",
+            sidebar.active_entry,
+        );
+        assert!(matches!(sidebar.view, SidebarView::ThreadList));
     });
 }
 
@@ -4372,7 +4332,7 @@ async fn test_closing_active_agent_panel_terminal_activates_neighbor(cx: &mut Te
             .expect("server terminal should be visible in sidebar")
     });
     sidebar.update_in(cx, |sidebar, window, cx| {
-        sidebar.close_terminal(&server_metadata, &server_workspace, window, cx);
+        sidebar.archive_terminal(&server_metadata, &server_workspace, window, cx);
     });
     cx.run_until_parked();
 
