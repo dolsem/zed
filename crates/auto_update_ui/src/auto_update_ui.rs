@@ -41,7 +41,7 @@ pub fn init(cx: &mut App) {
 
         if matches!(
             ReleaseChannel::global(cx),
-            ReleaseChannel::Nightly | ReleaseChannel::Dev
+            ReleaseChannel::Nightly | ReleaseChannel::Dev | ReleaseChannel::Dolsem
         ) {
             workspace.register_action(|_workspace, _: &ShowUpdateNotification, _window, cx| {
                 show_update_notification(cx);
@@ -95,7 +95,7 @@ fn view_release_notes_locally(
 
     if matches!(
         release_channel,
-        ReleaseChannel::Nightly | ReleaseChannel::Dev
+        ReleaseChannel::Nightly | ReleaseChannel::Dev | ReleaseChannel::Dolsem
     ) {
         if let Some(url) = release_notes_url(cx) {
             cx.open_url(&url);
@@ -348,7 +348,10 @@ pub fn notify_if_app_was_updated(cx: &mut App) {
         return;
     };
 
-    if let ReleaseChannel::Nightly = ReleaseChannel::global(cx) {
+    if matches!(
+        ReleaseChannel::global(cx),
+        ReleaseChannel::Nightly | ReleaseChannel::Dolsem
+    ) {
         return;
     }
 

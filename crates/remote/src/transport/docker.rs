@@ -216,7 +216,7 @@ impl DockerExecConnection {
             .context("No remote platform defined; cannot proceed.")?;
 
         let version_str = match release_channel {
-            ReleaseChannel::Nightly => {
+            ReleaseChannel::Nightly | ReleaseChannel::Dolsem => {
                 let commit = commit.map(|s| s.full()).unwrap_or_default();
                 format!("{}-{}", version, commit)
             }
@@ -275,7 +275,7 @@ impl DockerExecConnection {
         }
 
         let wanted_version = cx.update(|cx| match release_channel {
-            ReleaseChannel::Nightly => Ok(None),
+            ReleaseChannel::Nightly | ReleaseChannel::Dolsem => Ok(None),
             ReleaseChannel::Dev => {
                 anyhow::bail!(
                     "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",

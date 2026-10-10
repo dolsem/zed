@@ -47,6 +47,7 @@ pub fn compile(manifest: bool) -> Result<(), Box<dyn std::error::Error>> {
         "stable" => ("app-icon.ico", "Zed"),
         "preview" => ("app-icon-preview.ico", "Zed Preview"),
         "nightly" => ("app-icon-nightly.ico", "Zed Nightly"),
+        "dolsem" => ("app-icon-dolsem.ico", "Zed Dolsem"),
         _ => ("app-icon-dev.ico", "Zed Dev"),
     };
     let icon = std::path::PathBuf::from(ICON_DIR).join(icon_filename);
