@@ -150,6 +150,13 @@ fn terminal_program_to_report(
     program_to_report
 }
 
+/// What happens to a terminal's metadata when its shell is closed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TerminalRemoval {
+    Delete,
+    Archive,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TerminalId(uuid::Uuid);
 
@@ -1284,6 +1291,12 @@ impl AgentPanel {
                         match store
                             .read_with(cx, |store, _cx| store.entry(terminal_id).cloned())
                         {
+                            Some(metadata) if metadata.archived => {
+                                log::info!(
+                                    "last active terminal is archived, skipping restoration"
+                                );
+                                None
+                            }
                             Some(metadata) => Some(metadata),
                             None => {
                                 log::info!(
@@ -2296,7 +2309,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_terminal_internal(terminal_id, true, window, cx);
+        self.close_terminal_internal(terminal_id, TerminalRemoval::Delete, true, window, cx);
     }
 
     pub fn close_terminal_without_activating_draft(
@@ -2305,12 +2318,33 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.close_terminal_internal(terminal_id, false, window, cx);
+        self.close_terminal_internal(terminal_id, TerminalRemoval::Delete, false, window, cx);
+    }
+
+    /// Kills the terminal's shell but keeps its metadata, marked as archived,
+    /// so it shows up in Thread History and can be restored later.
+    pub fn archive_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_terminal_internal(terminal_id, TerminalRemoval::Archive, true, window, cx);
+    }
+
+    pub fn archive_terminal_without_activating_draft(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_terminal_internal(terminal_id, TerminalRemoval::Archive, false, window, cx);
     }
 
     fn close_terminal_internal(
         &mut self,
         terminal_id: TerminalId,
+        removal: TerminalRemoval,
         activate_draft_after_close: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2325,8 +2359,9 @@ impl AgentPanel {
             return;
         }
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
-            store.update(cx, |store, cx| {
-                store.delete(terminal_id, cx);
+            store.update(cx, |store, cx| match removal {
+                TerminalRemoval::Delete => store.delete(terminal_id, cx),
+                TerminalRemoval::Archive => store.archive(terminal_id, cx),
             });
         }
         if was_active {
@@ -2422,6 +2457,9 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
+            // A terminal with a live shell is never archived; persisting it
+            // (e.g. when it's restored from Thread History) unarchives it.
+            archived: false,
         })
     }
 
@@ -7615,6 +7653,7 @@ mod tests {
             worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
             remote_connection: None,
             working_directory: None,
+            archived: false,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -7755,6 +7794,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            archived: false,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -7928,6 +7968,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            archived: false,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -10014,6 +10055,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            archived: false,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -10065,6 +10107,7 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            archived: false,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {

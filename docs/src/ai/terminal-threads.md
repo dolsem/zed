@@ -54,7 +54,7 @@ You can also configure this from the Settings UI under **AI**, via the "Terminal
 
 ## Terminal Thread Titles {#terminal-thread-titles}
 
-The terminal title in the toolbar updates automatically to reflect the running shell or process. You can set a custom name by clicking the title or the pencil icon that appears on hover. In the Threads Sidebar, right-click a Terminal Thread and select **Rename Title**, or select it and press {#kb agent::RenameSelectedThread}.
+The terminal title in the toolbar updates automatically to reflect the running shell or process. You can set a custom name by clicking the title or the pencil icon that appears on hover. In the Threads Sidebar, hover over a Terminal Thread and click the pencil icon, right-click it and select **Rename Title**, or select it and press {#kb agent::RenameSelectedThread}.
 
 To edit the title of the active Terminal Thread from the Agent Panel, custom-map {#action agent::RenameSelectedThread} in your `keymap.json`. Its default binding is scoped to the Threads Sidebar.
 
@@ -64,9 +64,13 @@ When a terminal produces a bell character while not in focus, Zed notifies you t
 
 The same `agent.notify_when_agent_waiting` and `agent.play_sound_when_agent_done` settings apply.
 
-## Closing Terminal Threads {#closing-terminal-threads}
+## Archiving Terminal Threads {#archiving-terminal-threads}
 
-Unlike agent threads, Terminal Threads are closed rather than archived. They do not go to Thread History. To close one, hover over it in the Threads Sidebar and click the **×** button, or select it and press {#kb agent::ArchiveSelectedThread}.
+Like agent threads, Terminal Threads are archived rather than deleted. To archive one, hover over it in the Threads Sidebar and click the archive icon, right-click it and select **Archive Terminal**, or select it and press {#kb agent::ArchiveSelectedThread}. A Terminal Thread is also archived when its shell exits, for example after you run `exit`.
+
+Archiving stops the shell and moves the Terminal Thread to Thread History. Click it there to restore it: Zed starts a new shell in the same working directory, with the same title and the same `ZED_THREAD_ID`, and runs the [init command](#terminal-thread-init-command) again. The terminal's scrollback and running processes are not preserved.
+
+Unlike agent threads, archiving a Terminal Thread never removes its Git worktree, so it can always be restored. To delete an archived Terminal Thread permanently, click the trash icon next to it in Thread History.
 
 ## CLI/TUI Setup Notes {#cli-setup}
 

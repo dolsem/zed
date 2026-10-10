@@ -133,7 +133,7 @@ keep/reject hunk controls as the multi-buffer review pane. This temporarily over
 
 ## Terminal Threads {#terminal-threads}
 
-The Agent Panel can host Terminal Threads alongside your agent threads. For opening, closing, notifications, terminal titles, and CLI/TUI-specific setup, see [Terminal Threads](./terminal-threads.md).
+The Agent Panel can host Terminal Threads alongside your agent threads. For opening, archiving, notifications, terminal titles, and CLI/TUI-specific setup, see [Terminal Threads](./terminal-threads.md).
 
 ## Adding Context {#adding-context}
 

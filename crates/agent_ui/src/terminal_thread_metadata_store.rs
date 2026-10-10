@@ -53,6 +53,10 @@ pub struct TerminalThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
+    /// Archived terminals have no live shell and are listed in Thread History
+    /// instead of the sidebar. They still reference their worktree, so it is
+    /// kept on disk for when the terminal is restored.
+    pub archived: bool,
 }
 
 impl TerminalThreadMetadata {
@@ -216,12 +220,17 @@ impl TerminalThreadMetadataStore {
         self.terminals.values()
     }
 
+    pub fn archived_entries(&self) -> impl Iterator<Item = &TerminalThreadMetadata> + '_ {
+        self.terminals.values().filter(|terminal| terminal.archived)
+    }
+
     pub fn reload_task(&self) -> Shared<Task<()>> {
         self.reload_task
             .clone()
             .unwrap_or_else(|| Task::ready(()).shared())
     }
 
+    /// Unarchived terminals whose folder paths match `path_list`.
     pub fn entries_for_path<'a>(
         &'a self,
         path_list: &PathList,
@@ -233,13 +242,15 @@ impl TerminalThreadMetadataStore {
             .flatten()
             .filter_map(|id| self.terminals.get(id))
             .filter(move |terminal| {
-                same_remote_connection_identity(
-                    terminal.remote_connection.as_ref(),
-                    remote_connection,
-                )
+                !terminal.archived
+                    && same_remote_connection_identity(
+                        terminal.remote_connection.as_ref(),
+                        remote_connection,
+                    )
             })
     }
 
+    /// Unarchived terminals whose main worktree paths match `path_list`.
     pub fn entries_for_main_worktree_path<'a>(
         &'a self,
         path_list: &PathList,
@@ -251,13 +262,17 @@ impl TerminalThreadMetadataStore {
             .flatten()
             .filter_map(|id| self.terminals.get(id))
             .filter(move |terminal| {
-                same_remote_connection_identity(
-                    terminal.remote_connection.as_ref(),
-                    remote_connection,
-                )
+                !terminal.archived
+                    && same_remote_connection_identity(
+                        terminal.remote_connection.as_ref(),
+                        remote_connection,
+                    )
             })
     }
 
+    /// Whether any terminal other than `terminal_id` uses `path`. Archived
+    /// terminals count too, so their worktrees survive until they're restored
+    /// or deleted.
     pub fn path_is_referenced_by_terminal(
         &self,
         terminal_id: Option<TerminalId>,
@@ -298,6 +313,27 @@ impl TerminalThreadMetadataStore {
         }
 
         metadata.custom_title = custom_title;
+        self.save_internal(metadata);
+        cx.notify();
+    }
+
+    pub fn archive(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        self.update_archived(terminal_id, true, cx);
+    }
+
+    pub fn unarchive(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        self.update_archived(terminal_id, false, cx);
+    }
+
+    fn update_archived(&mut self, terminal_id: TerminalId, archived: bool, cx: &mut Context<Self>) {
+        let Some(mut metadata) = self.entry(terminal_id).cloned() else {
+            return;
+        };
+        if metadata.archived == archived {
+            return;
+        }
+
+        metadata.archived = archived;
         self.save_internal(metadata);
         cx.notify();
     }
@@ -483,20 +519,23 @@ struct TerminalThreadMetadataDb(ThreadSafeConnection);
 impl Domain for TerminalThreadMetadataDb {
     const NAME: &str = stringify!(TerminalThreadMetadataDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
-            terminal_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            custom_title TEXT,
-            created_at TEXT NOT NULL,
-            working_directory TEXT,
-            folder_paths TEXT,
-            folder_paths_order TEXT,
-            main_worktree_paths TEXT,
-            main_worktree_paths_order TEXT,
-            remote_connection TEXT
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
+                terminal_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                custom_title TEXT,
+                created_at TEXT NOT NULL,
+                working_directory TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT,
+                main_worktree_paths TEXT,
+                main_worktree_paths_order TEXT,
+                remote_connection TEXT
+            ) STRICT;
+        ),
+        sql!(ALTER TABLE sidebar_terminal_threads ADD COLUMN archived INTEGER DEFAULT 0),
+    ];
 }
 
 db::static_connection!(TerminalThreadMetadataDb, []);
@@ -506,7 +545,7 @@ impl TerminalThreadMetadataDb {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection \
+            main_worktree_paths_order, remote_connection, archived \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -540,10 +579,11 @@ impl TerminalThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize terminal thread remote connection")?;
+        let archived = row.archived;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, archived) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -553,7 +593,8 @@ impl TerminalThreadMetadataDb {
                            folder_paths_order = excluded.folder_paths_order, \
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                           remote_connection = excluded.remote_connection";
+                           remote_connection = excluded.remote_connection, \
+                           archived = excluded.archived";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -564,7 +605,8 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&folder_paths_order, i)?;
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
-            stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&remote_connection, i)?;
+            stmt.bind(&archived, i)?;
             stmt.exec()
         })
         .await
@@ -600,6 +642,7 @@ impl Column for TerminalThreadMetadata {
             Column::column(statement, next)?;
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
+        let (archived, next): (bool, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -639,6 +682,7 @@ impl Column for TerminalThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
+                archived,
             },
             next,
         ))
@@ -668,6 +712,7 @@ mod tests {
             worktree_paths,
             remote_connection: None,
             working_directory: None,
+            archived: false,
         }
     }
 
@@ -735,6 +780,85 @@ mod tests {
                 .expect("renamed terminal metadata should exist");
             assert_eq!(metadata.custom_title, None);
             assert_eq!(metadata.display_title().as_ref(), "⠋ Dev Server");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_archive_hides_terminal_but_keeps_worktree_referenced(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let folder_paths = PathList::new(&[Path::new("/repo-feature")]);
+        let metadata = metadata(
+            "Dev Server",
+            WorktreePaths::from_folder_paths(&folder_paths),
+        );
+        let terminal_id = metadata.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(metadata, cx);
+                store.archive(terminal_id, cx);
+            });
+        });
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(store.entry(terminal_id).unwrap().archived);
+            assert!(store.entries_for_path(&folder_paths, None).next().is_none());
+            assert_eq!(
+                store
+                    .archived_entries()
+                    .map(|entry| entry.terminal_id)
+                    .collect::<Vec<_>>(),
+                vec![terminal_id]
+            );
+            assert!(store.path_is_referenced_by_terminal(None, Path::new("/repo-feature"), None));
+        });
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.unarchive(terminal_id, cx);
+            });
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(!store.entry(terminal_id).unwrap().archived);
+            assert_eq!(
+                store
+                    .entries_for_path(&folder_paths, None)
+                    .map(|entry| entry.terminal_id)
+                    .collect::<Vec<_>>(),
+                vec![terminal_id]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_archived_flag_persists_across_reload(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let metadata = metadata(
+            "Dev Server",
+            WorktreePaths::from_folder_paths(&PathList::default()),
+        );
+        let terminal_id = metadata.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(metadata, cx);
+                store.archive(terminal_id, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| store.reload(cx));
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            assert!(store.read(cx).entry(terminal_id).unwrap().archived);
         });
     }
 

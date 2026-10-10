@@ -1159,7 +1159,7 @@ impl Sidebar {
                 AgentPanelEvent::TerminalCloseRequested { metadata } => {
                     if let Some(workspace) = workspace.upgrade() {
                         let workspace = ThreadEntryWorkspace::Open(workspace);
-                        this.close_terminal(metadata, &workspace, window, cx);
+                        this.archive_terminal(metadata, &workspace, window, cx);
                     }
                 }
                 AgentPanelEvent::ThreadInteracted { thread_id } => {
@@ -4166,6 +4166,46 @@ impl Sidebar {
         })
     }
 
+    /// Restores an archived terminal from Thread History: it's unarchived and
+    /// re-spawned with its original id (and so the same `ZED_THREAD_ID`) in a
+    /// workspace for its folder paths. Its worktree was kept on archive, so
+    /// unlike threads there is nothing to restore via git.
+    fn open_terminal_from_archive(
+        &mut self,
+        mut metadata: TerminalThreadMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_id = metadata.terminal_id;
+        TerminalThreadMetadataStore::global(cx)
+            .update(cx, |store, cx| store.unarchive(terminal_id, cx));
+        metadata.archived = false;
+
+        let path_list = metadata.folder_paths().clone();
+        let existing_workspace = if path_list.paths().is_empty() {
+            self.multi_workspace
+                .upgrade()
+                .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+        } else {
+            self.find_current_workspace_for_path_list(
+                &path_list,
+                metadata.remote_connection.as_ref(),
+                cx,
+            )
+        };
+
+        if let Some(workspace) = existing_workspace {
+            self.activate_terminal_in_workspace(&workspace, metadata, false, window, cx);
+        } else {
+            let key = ProjectGroupKey::from_worktree_paths(
+                &metadata.worktree_paths,
+                metadata.remote_connection.clone(),
+            );
+            self.open_workspace_and_activate_terminal(metadata, path_list, &key, window, cx);
+        }
+        self.show_thread_list(window, cx);
+    }
+
     fn open_thread_from_archive(
         &mut self,
         metadata: ThreadMetadata,
@@ -5062,44 +5102,17 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
-    fn close_terminal(
+    /// Archives a terminal thread: its shell (if running) is killed and its
+    /// metadata is kept, marked as archived, so it moves from the sidebar to
+    /// Thread History. Unlike archiving a regular thread, the terminal's
+    /// worktree and workspace are left alone, so it can always be restored.
+    fn archive_terminal(
         &mut self,
         metadata: &TerminalThreadMetadata,
         workspace: &ThreadEntryWorkspace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let ThreadEntryWorkspace::Closed {
-            folder_paths,
-            project_group_key,
-        } = workspace
-            && self.should_load_closed_workspace_for_archive(
-                folder_paths,
-                project_group_key,
-                metadata.remote_connection.as_ref(),
-                None,
-                Some(metadata.terminal_id),
-                cx,
-            )
-        {
-            let metadata = metadata.clone();
-            self.open_workspace_for_archive(
-                folder_paths.clone(),
-                project_group_key.clone(),
-                window,
-                cx,
-                move |this, workspace, window, cx| {
-                    this.close_terminal(
-                        &metadata,
-                        &ThreadEntryWorkspace::Open(workspace),
-                        window,
-                        cx,
-                    );
-                },
-            );
-            return;
-        }
-
         let terminal_id = metadata.terminal_id;
         let is_active = self
             .active_entry
@@ -5117,106 +5130,34 @@ impl Sidebar {
                 )
             })
             .and_then(|position| self.neighboring_activatable_entry(position));
+        let defer_draft_activation = is_active && neighbor.is_some();
 
-        let terminal_folder_paths = metadata.folder_paths().clone();
-        let roots_to_archive = self.roots_to_archive_for_paths(
-            metadata.folder_paths(),
-            metadata.remote_connection.as_ref(),
-            None,
-            Some(terminal_id),
-            cx,
-        );
-
-        let workspace_to_remove = self.linked_worktree_workspace_to_remove(
-            &terminal_folder_paths,
-            metadata.remote_connection.as_ref(),
-            None,
-            Some(terminal_id),
-            &roots_to_archive,
-            cx,
-        );
-
-        let mut workspaces_to_remove: Vec<Entity<Workspace>> =
-            workspace_to_remove.into_iter().collect();
-        let close_item_tasks = self.close_items_for_archived_worktrees(
-            &roots_to_archive,
-            &mut workspaces_to_remove,
-            window,
-            cx,
-        );
-
-        let terminal_workspace_removed = matches!(
-            workspace,
-            ThreadEntryWorkspace::Open(workspace) if workspaces_to_remove.contains(workspace)
-        );
-        let metadata = metadata.clone();
-        let workspace = workspace.clone();
-
-        self.remove_workspaces_then(
-            workspaces_to_remove,
-            close_item_tasks,
-            window,
-            cx,
-            move |this, window, cx| {
-                if terminal_workspace_removed {
-                    this.delete_empty_drafts_for_archive_paths(
-                        metadata.folder_paths(),
-                        metadata.remote_connection.as_ref(),
-                        cx,
-                    );
-                }
-                // If the terminal's workspace has already been removed, don't
-                // synthesize a fallback draft in the detached AgentPanel.
-                this.close_terminal_entry(
-                    &metadata,
-                    &workspace,
-                    is_active,
-                    neighbor.as_ref(),
-                    !terminal_workspace_removed,
-                    roots_to_archive,
-                    window,
-                    cx,
-                );
-            },
-        );
-    }
-
-    fn close_terminal_entry(
-        &mut self,
-        metadata: &TerminalThreadMetadata,
-        workspace: &ThreadEntryWorkspace,
-        is_active: bool,
-        neighbor: Option<&ActivatableEntry>,
-        activate_panel_draft: bool,
-        roots_to_archive: Vec<thread_worktree_archive::RootPlan>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let terminal_id = metadata.terminal_id;
-        let defer_draft_activation = activate_panel_draft && is_active && neighbor.is_some();
-
-        // Closing from the sidebar must not steal focus, since the row's
+        // Archiving from the sidebar must not steal focus, since the row's
         // workspace may not be the active workspace.
         if let ThreadEntryWorkspace::Open(workspace) = workspace {
             workspace.update(cx, |workspace, cx| {
                 if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                     panel.update(cx, |panel, cx| {
-                        if defer_draft_activation || !activate_panel_draft {
-                            panel.close_terminal_without_activating_draft(terminal_id, window, cx);
+                        if defer_draft_activation {
+                            panel.archive_terminal_without_activating_draft(
+                                terminal_id,
+                                window,
+                                cx,
+                            );
                         } else {
-                            panel.close_terminal(terminal_id, window, cx);
+                            panel.archive_terminal(terminal_id, window, cx);
                         }
                     });
                 }
             });
         }
+        // The panel only archives terminals it has a live shell for; a
+        // terminal in a closed workspace is archived directly in the store.
         if let Some(store) = TerminalThreadMetadataStore::try_global(cx) {
             store.update(cx, |store, cx| {
-                store.delete(terminal_id, cx);
+                store.archive(terminal_id, cx);
             });
         }
-
-        self.start_detached_archive_worktree_task(roots_to_archive, cx);
 
         if is_active {
             self.active_entry = None;
@@ -5777,7 +5718,7 @@ impl Sidebar {
             Some(ListEntry::Terminal(terminal)) => {
                 let metadata = terminal.metadata.clone();
                 let workspace = terminal.workspace.clone();
-                self.close_terminal(&metadata, &workspace, window, cx);
+                self.archive_terminal(&metadata, &workspace, window, cx);
             }
             _ => {}
         }
@@ -6648,26 +6589,59 @@ impl Sidebar {
                 this.is_truncated(false).title_slot(title_editor)
             })
             .when(is_hovered && !is_renaming, |this| {
-                this.action_slot(
-                    IconButton::new("close-terminal", IconName::Close)
-                        .hover_background(button_hover_bg)
-                        .active_background(button_active_bg)
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Muted)
-                        .tooltip({
-                            let focus_handle = focus_handle.clone();
-                            move |_window, cx| {
-                                Tooltip::for_action_in(
-                                    "Close Terminal",
-                                    &ArchiveSelectedThread,
-                                    &focus_handle,
-                                    cx,
-                                )
-                            }
+                let rename_button = IconButton::new(("rename-terminal", ix), IconName::Pencil)
+                    .hover_background(button_hover_bg)
+                    .active_background(button_active_bg)
+                    .icon_size(IconSize::Small)
+                    .tooltip({
+                        let focus_handle = focus_handle.clone();
+                        move |_window, cx| {
+                            Tooltip::for_action_in(
+                                "Rename Terminal",
+                                &RenameSelectedThread,
+                                &focus_handle,
+                                cx,
+                            )
+                        }
+                    })
+                    .on_click({
+                        let terminal_id = metadata.terminal_id;
+                        let rename_title = metadata.editable_title();
+                        cx.listener(move |this, _, window, cx| {
+                            this.start_renaming_entry(
+                                ix,
+                                RenameTarget::Terminal(terminal_id),
+                                rename_title.clone(),
+                                window,
+                                cx,
+                            );
                         })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.close_terminal(&metadata, &workspace, window, cx);
-                        })),
+                    });
+
+                let archive_button = IconButton::new("archive-terminal", IconName::Archive)
+                    .hover_background(button_hover_bg)
+                    .active_background(button_active_bg)
+                    .icon_size(IconSize::Small)
+                    .tooltip({
+                        let focus_handle = focus_handle.clone();
+                        move |_window, cx| {
+                            Tooltip::for_action_in(
+                                "Archive Terminal",
+                                &ArchiveSelectedThread,
+                                &focus_handle,
+                                cx,
+                            )
+                        }
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.archive_terminal(&metadata, &workspace, window, cx);
+                    }));
+
+                this.action_slot(
+                    h_flex()
+                        .gap_0p5()
+                        .child(rename_button)
+                        .child(archive_button),
                 )
             })
             .on_click(cx.listener({
@@ -6688,6 +6662,8 @@ impl Sidebar {
         let context_menu_id = SharedString::from(format!("terminal-context-menu-{ix}"));
         let terminal_id = terminal.metadata.terminal_id;
         let rename_title = terminal.metadata.editable_title();
+        let menu_metadata = terminal.metadata.clone();
+        let menu_workspace = terminal.workspace.clone();
         let sidebar = cx.weak_entity();
 
         right_click_menu(context_menu_id)
@@ -6695,17 +6671,30 @@ impl Sidebar {
             .menu(move |window, cx| {
                 let sidebar = sidebar.clone();
                 let rename_title = rename_title.clone();
+                let metadata = menu_metadata.clone();
+                let workspace = menu_workspace.clone();
                 ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                    menu.entry("Rename Title", None, move |window, cx| {
+                    menu.entry("Rename Title", None, {
+                        let sidebar = sidebar.clone();
+                        move |window, cx| {
+                            sidebar
+                                .update(cx, |sidebar, cx| {
+                                    sidebar.start_renaming_entry(
+                                        ix,
+                                        RenameTarget::Terminal(terminal_id),
+                                        rename_title.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        }
+                    })
+                    .separator()
+                    .entry("Archive Terminal", None, move |window, cx| {
                         sidebar
                             .update(cx, |sidebar, cx| {
-                                sidebar.start_renaming_entry(
-                                    ix,
-                                    RenameTarget::Terminal(terminal_id),
-                                    rename_title.clone(),
-                                    window,
-                                    cx,
-                                );
+                                sidebar.archive_terminal(&metadata, &workspace, window, cx);
                             })
                             .ok();
                     })
@@ -7746,6 +7735,9 @@ impl Sidebar {
                 }
                 ThreadsArchiveViewEvent::Activate { thread } => {
                     this.open_thread_from_archive(thread.clone(), window, cx);
+                }
+                ThreadsArchiveViewEvent::ActivateTerminal { terminal } => {
+                    this.open_terminal_from_archive(terminal.clone(), window, cx);
                 }
                 ThreadsArchiveViewEvent::CancelRestore { thread_id } => {
                     this.restoring_tasks.remove(thread_id);
