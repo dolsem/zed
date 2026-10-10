@@ -2040,7 +2040,12 @@ impl AgentPanel {
         self.pending_terminal_spawn = Some(terminal_id);
         let terminal_working_directory = working_directory.clone();
         let init_command = Self::terminal_init_command(run_init_command, cx);
-        let terminal_task = self.create_terminal_shell(working_directory, cx);
+        // Expose the terminal thread's stable id to the shell (and thus to the
+        // init command) so sessions can be correlated across restarts; the id is
+        // persisted with the thread metadata and reused when the thread is restored.
+        let terminal_env =
+            HashMap::from_iter([("ZED_THREAD_ID".to_string(), terminal_id.to_key_string())]);
+        let terminal_task = self.create_terminal_shell(working_directory, terminal_env, cx);
         let workspace = self.workspace.clone();
         let workspace_id = self.workspace_id;
         let project = self.project.downgrade();
@@ -2094,6 +2099,7 @@ impl AgentPanel {
     fn create_terminal_shell(
         &mut self,
         working_directory: Option<PathBuf>,
+        extra_env: HashMap<String, String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<terminal::Terminal>>> {
         // A real shell ties the spawn's timing to the host, so a test that needs
@@ -2108,7 +2114,7 @@ impl AgentPanel {
         }
 
         self.project.update(cx, |project, cx| {
-            project.create_terminal_shell(working_directory, cx)
+            project.create_terminal_shell_with_env(working_directory, extra_env, cx)
         })
     }
 
