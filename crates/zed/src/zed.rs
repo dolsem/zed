@@ -1536,6 +1536,7 @@ fn open_about_window(cx: &mut App) {
                 include_bytes!("../resources/app-icon-preview.png").as_slice()
             }
             ReleaseChannel::Stable => include_bytes!("../resources/app-icon.png").as_slice(),
+            ReleaseChannel::Dolsem => include_bytes!("../resources/app-icon-dolsem.png").as_slice(),
         };
 
         Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec()))

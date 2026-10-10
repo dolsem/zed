@@ -23,7 +23,7 @@ fn docs_url(cx: &App) -> String {
         ReleaseChannel::Preview => {
             format!("{server_url}/docs/preview")
         }
-        ReleaseChannel::Dev | ReleaseChannel::Nightly => {
+        ReleaseChannel::Dev | ReleaseChannel::Nightly | ReleaseChannel::Dolsem => {
             format!("{server_url}/docs/nightly")
         }
     }
