@@ -1001,7 +1001,9 @@ mod tests {
     use multi_buffer::PathKey;
     use project::{FakeFs, git_store::MAX_CONCURRENT_OBJECT_READS};
     use serde_json::json;
-    use settings::{DiffViewStyle, GitPanelGroupBy, GitPanelSortBy, SettingsStore};
+    use settings::{
+        DiffViewStyle, GitPanelGroupBy, GitPanelSortBy, GitPanelUntrackedChanges, SettingsStore,
+    };
     use std::path::Path;
     use unindent::Unindent as _;
     use util::{path, rel_path::rel_path};
@@ -1828,6 +1830,67 @@ mod tests {
             project.read_with(&lhs_cx.cx, |project, _| project.active_entry()),
             Some(changed_entry_id)
         );
+    }
+
+    #[gpui::test]
+    async fn test_hidden_untracked_changes_excludes_untracked_buffers(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().untracked_changes =
+                        Some(GitPanelUntrackedChanges::Hidden);
+                })
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked.txt": "changed\n",
+                "new.txt": "new\n",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("tracked.txt", "original\n".into())],
+            "deadbeef",
+        );
+        fs.set_status_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("tracked.txt", git::status::StatusCode::Modified.worktree()),
+                ("new.txt", git::status::FileStatus::Untracked),
+            ],
+        );
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace, window, cx)
+        });
+        cx.run_until_parked();
+
+        let paths = diff.read_with(cx, |diff, cx| {
+            diff.editor(cx)
+                .read(cx)
+                .rhs_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .all_buffers()
+                .iter()
+                .map(|buffer| buffer.read(cx).file().unwrap().path().clone())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(paths, vec![rel_path("tracked.txt").into_arc()]);
     }
 
     #[gpui::test]

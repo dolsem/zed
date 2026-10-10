@@ -6090,6 +6090,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
     "dock": "right",
     "default_width": 360,
     "status_style": "icon",
+    "untracked_changes": "classic",
     "file_icons": false,
     "folder_indicator": "icon",
     "fallback_branch_name": "main",
@@ -6115,6 +6116,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
 - `dock`: Where to dock the git panel. Can be `left` or `right`
 - `default_width`: Default width of the git panel
 - `status_style`: How to display git status. Can be `label_color` or `icon`
+- `untracked_changes`: How untracked files are displayed and staged. Can be `classic`, `mixed`, `separate`, or `hidden`
 - `file_icons`: Whether to show file icons in the git panel
 - `folder_indicator`: What to show for directories in the git panel. Can be `icon`, `chevron`, or `both`
 - `fallback_branch_name`: What branch name to use if `init.defaultBranch` is not set

@@ -26,7 +26,9 @@ use project::{
         diff_buffer_list::{self, BranchDiffEvent, DiffBase},
     },
 };
-use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
+use settings::{
+    GitPanelGroupBy, GitPanelSortBy, GitPanelUntrackedChanges, Settings, SettingsStore,
+};
 use std::{collections::BTreeMap, sync::Arc};
 use theme::ActiveTheme;
 use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
@@ -131,16 +133,19 @@ impl DiffMultibuffer {
         let mut was_tree_view = GitPanelSettings::get_global(cx).tree_view;
         let mut was_collapse_untracked_diff =
             GitPanelSettings::get_global(cx).collapse_untracked_diff;
+        let mut was_untracked_changes = GitPanelSettings::get_global(cx).untracked_changes;
         cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
             let settings = GitPanelSettings::get_global(cx);
             let sort_by = settings.sort_by;
             let group_by = settings.group_by;
             let tree_view = settings.tree_view;
             let is_collapse_untracked_diff = settings.collapse_untracked_diff;
+            let untracked_changes = settings.untracked_changes;
             if sort_by != was_sort_by
                 || group_by != was_group_by
                 || tree_view != was_tree_view
                 || is_collapse_untracked_diff != was_collapse_untracked_diff
+                || untracked_changes != was_untracked_changes
             {
                 this._task = {
                     window.spawn(cx, {
@@ -153,6 +158,7 @@ impl DiffMultibuffer {
             was_group_by = group_by;
             was_tree_view = tree_view;
             was_collapse_untracked_diff = is_collapse_untracked_diff;
+            was_untracked_changes = untracked_changes;
         })
         .detach();
 
@@ -626,7 +632,13 @@ impl DiffMultibuffer {
     pub(crate) async fn refresh(this: WeakEntity<Self>, cx: &mut AsyncWindowContext) -> Result<()> {
         let entries = this.update(cx, |this, cx| {
             let (repo, buffers_to_load) = this.branch_diff.update(cx, |branch_diff, cx| {
-                let load_buffers = branch_diff.load_buffers(cx);
+                let mut load_buffers = branch_diff.load_buffers(cx);
+                if branch_diff.diff_base() == &DiffBase::Head
+                    && GitPanelSettings::get_global(cx).untracked_changes
+                        == GitPanelUntrackedChanges::Hidden
+                {
+                    load_buffers.retain(|entry| !entry.file_status.is_untracked());
+                }
                 (branch_diff.repo().cloned(), load_buffers)
             });
             let mut previous_paths = this

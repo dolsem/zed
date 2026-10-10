@@ -44,8 +44,8 @@ use git::{
 };
 use git::{
     ExpandCommitEditor, GitHostingProviderRegistry, GitRemote, RestoreTrackedFiles, StageAll,
-    StashAll, StashApply, StashPop, StashStaged, StashTracked, ToggleFillCommitEditor,
-    TrashUntrackedFiles, UnstageAll, ViewFile, parse_git_remote_url,
+    StageUntracked, StashAll, StashApply, StashPop, StashStaged, StashTracked,
+    ToggleFillCommitEditor, TrashUntrackedFiles, UnstageAll, ViewFile, parse_git_remote_url,
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AnyElement, AsyncApp, AsyncWindowContext, ClickEvent,
@@ -75,8 +75,8 @@ use prompt_store::RULES_FILE_NAMES;
 
 use serde::{Deserialize, Serialize};
 use settings::{
-    GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore, StatusStyle,
-    update_settings_file,
+    GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, GitPanelUntrackedChanges, Settings,
+    SettingsStore, StatusStyle, update_settings_file,
 };
 use smallvec::SmallVec;
 use std::cell::Cell;
@@ -299,10 +299,14 @@ impl Render for StashMessageModal {
 }
 
 fn git_panel_context_menu(
+    stage_all_includes_untracked: bool,
+    can_stage_all: bool,
+    can_unstage_all: bool,
+    show_stage_untracked: bool,
+    can_stage_untracked: bool,
     has_tracked_changes: bool,
     has_staged_tracked_changes: bool,
     has_staged_changes: bool,
-    has_unstaged_changes: bool,
     has_new_changes: bool,
     has_stash_items: bool,
     group_by: GitPanelGroupBy,
@@ -311,11 +315,23 @@ fn git_panel_context_menu(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<ContextMenu> {
-    ContextMenu::build(window, cx, |context_menu, _, _| {
+    let (stage_label, unstage_label) = if stage_all_includes_untracked {
+        ("Stage All", "Unstage All")
+    } else {
+        ("Stage Tracked", "Unstage Tracked")
+    };
+    ContextMenu::build(window, cx, move |context_menu, _, _| {
         context_menu
             .context(focus_handle.clone())
-            .action_disabled_when(!has_unstaged_changes, "Stage All", StageAll.boxed_clone())
-            .action_disabled_when(!has_staged_changes, "Unstage All", UnstageAll.boxed_clone())
+            .action_disabled_when(!can_stage_all, stage_label, StageAll.boxed_clone())
+            .when(show_stage_untracked, |this| {
+                this.action_disabled_when(
+                    !can_stage_untracked,
+                    "Stage Untracked",
+                    StageUntracked.boxed_clone(),
+                )
+            })
+            .action_disabled_when(!can_unstage_all, unstage_label, UnstageAll.boxed_clone())
             .action_disabled_when(
                 !has_staged_tracked_changes,
                 "Restore All Changes",
@@ -1129,10 +1145,12 @@ pub struct GitPanel {
     focus_handle: FocusHandle,
     fs: Arc<dyn Fs>,
     new_count: usize,
+    untracked_count: usize,
     entry_count: usize,
     changes_count: usize,
     diff_stat_total: DiffStat,
     new_staged_count: usize,
+    untracked_staged_count: usize,
     pending_commit: Option<Task<()>>,
     pending_remote_operation: Option<RemoteOperationKind>,
     amend_pending: bool,
@@ -1170,6 +1188,7 @@ pub struct GitPanel {
     history_keyboard_nav: bool,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
+    untracked_changes: GitPanelUntrackedChanges,
     _settings_subscription: Subscription,
     git_access: Option<GitAccess>,
     commit_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1312,6 +1331,7 @@ impl GitPanel {
             let mut was_file_icons = GitPanelSettings::get_global(cx).file_icons;
             let mut was_folder_indicator = GitPanelSettings::get_global(cx).folder_indicator;
             let mut was_diff_stats = GitPanelSettings::get_global(cx).diff_stats;
+            let mut was_untracked_changes = GitPanelSettings::get_global(cx).untracked_changes;
             cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
                 let settings = GitPanelSettings::get_global(cx);
                 let sort_by = settings.sort_by;
@@ -1320,6 +1340,7 @@ impl GitPanel {
                 let file_icons = settings.file_icons;
                 let folder_indicator = settings.folder_indicator;
                 let diff_stats = settings.diff_stats;
+                let untracked_changes = settings.untracked_changes;
                 if tree_view != was_tree_view {
                     match (&mut this.view_mode, tree_view) {
                         (GitPanelViewMode::Tree(state), false) => {
@@ -1337,7 +1358,13 @@ impl GitPanel {
                 }
 
                 let mut update_entries = false;
-                if sort_by != was_sort_by || group_by != was_group_by || tree_view != was_tree_view
+                if untracked_changes != was_untracked_changes {
+                    this.untracked_changes = untracked_changes;
+                }
+                if sort_by != was_sort_by
+                    || group_by != was_group_by
+                    || tree_view != was_tree_view
+                    || untracked_changes != was_untracked_changes
                 {
                     this.bulk_staging.take();
                     update_entries = true;
@@ -1354,6 +1381,7 @@ impl GitPanel {
                 was_file_icons = file_icons;
                 was_folder_indicator = folder_indicator;
                 was_diff_stats = diff_stats;
+                was_untracked_changes = untracked_changes;
             })
             .detach();
 
@@ -1443,7 +1471,9 @@ impl GitPanel {
                 focus_handle,
                 fs,
                 new_count: 0,
+                untracked_count: 0,
                 new_staged_count: 0,
+                untracked_staged_count: 0,
                 changes_count: 0,
                 diff_stat_total: DiffStat::default(),
                 pending_commit: None,
@@ -1484,6 +1514,7 @@ impl GitPanel {
                 history_keyboard_nav: false,
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
+                untracked_changes: GitPanelSettings::get_global(cx).untracked_changes,
                 _settings_subscription,
                 git_access: None,
                 commit_menu_handle: PopoverMenuHandle::default(),
@@ -3080,15 +3111,28 @@ impl GitPanel {
         let Some(active_repository) = self.active_repository.clone() else {
             return;
         };
+        let stage_all_includes_untracked = self.stage_all_includes_untracked();
+        let tracked_repo_paths = if stage_all_includes_untracked {
+            Vec::new()
+        } else {
+            self.tracked_repo_paths()
+        };
         cx.spawn({
             async move |this, cx| {
                 let result = this
                     .update(cx, |_this, cx| {
                         active_repository.update(cx, |repo, cx| {
+                            let tracked_repo_paths = tracked_repo_paths.clone();
                             if stage {
-                                repo.stage_all(cx)
-                            } else {
+                                if stage_all_includes_untracked {
+                                    repo.stage_all(cx)
+                                } else {
+                                    repo.stage_entries(tracked_repo_paths, cx)
+                                }
+                            } else if stage_all_includes_untracked {
                                 repo.unstage_all(cx)
+                            } else {
+                                repo.unstage_entries(tracked_repo_paths, cx)
                             }
                         })
                     })?
@@ -3186,6 +3230,23 @@ impl GitPanel {
 
     pub fn stage_all(&mut self, _: &StageAll, _window: &mut Window, cx: &mut Context<Self>) {
         self.change_all_files_stage(true, cx);
+    }
+
+    pub fn stage_untracked(
+        &mut self,
+        _: &StageUntracked,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self
+            .change_entries_by_path()
+            .filter(|status_entry| status_entry.status.is_untracked())
+            .cloned()
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return;
+        }
+        self.change_file_stage(true, entries, cx);
     }
 
     pub fn unstage_all(&mut self, _: &UnstageAll, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3753,11 +3814,7 @@ impl GitPanel {
             });
             cx.background_spawn(async move { commit_task.await? })
         } else {
-            let changed_files = self
-                .change_entries_by_path()
-                .filter(|status_entry| !status_entry.status.is_created())
-                .map(|status_entry| status_entry.repo_path.clone())
-                .collect::<Vec<_>>();
+            let changed_files = self.commit_repo_paths();
 
             if changed_files.is_empty() && !options.amend {
                 error_spawn("No changes to commit", window, cx);
@@ -5343,6 +5400,10 @@ impl GitPanel {
         let group_by_file_status = group_by == GitPanelGroupBy::Status;
         let group_by_staging_state = group_by == GitPanelGroupBy::Staging;
         let is_tree_view = matches!(self.view_mode, GitPanelViewMode::Tree(_));
+        let split_untracked_section = matches!(
+            self.untracked_changes,
+            GitPanelUntrackedChanges::Classic | GitPanelUntrackedChanges::Separate
+        );
 
         if let Some(active_repo) = self.active_repository.as_ref() {
             if self.git_access.is_none() {
@@ -5394,10 +5455,14 @@ impl GitPanel {
         self.stash_entries = repo.cached_stash();
 
         for status_entry in repo.cached_status() {
-            self.changes_count += 1;
             let is_conflict = repo.had_conflict_on_last_merge_head_change(&status_entry.repo_path);
             let is_new = status_entry.status.is_created();
+            let is_untracked = status_entry.status.is_untracked();
             let staging = status_entry.status.staging();
+
+            if self.untracked_changes == GitPanelUntrackedChanges::Hidden && is_untracked {
+                continue;
+            }
 
             if let Some(pending) = repo.pending_ops_for_path(&status_entry.repo_path)
                 && pending
@@ -5407,6 +5472,8 @@ impl GitPanel {
             {
                 continue;
             }
+
+            self.changes_count += 1;
 
             let entry = GitStatusEntry {
                 repo_path: status_entry.repo_path.clone(),
@@ -5441,7 +5508,7 @@ impl GitPanel {
                 }
             } else if group_by_file_status && is_conflict {
                 conflict_entries.push(entry);
-            } else if group_by_file_status && is_new {
+            } else if group_by_file_status && is_new && split_untracked_section {
                 new_entries.push(entry);
             } else {
                 changed_entries.push(entry);
@@ -5805,8 +5872,10 @@ impl GitPanel {
         self.conflicted_count = 0;
         self.conflicted_staged_count = 0;
         self.new_count = 0;
+        self.untracked_count = 0;
         self.tracked_count = 0;
         self.new_staged_count = 0;
+        self.untracked_staged_count = 0;
         self.tracked_staged_count = 0;
         self.entry_count = 0;
         self.diff_stat_total = DiffStat::default();
@@ -5832,8 +5901,14 @@ impl GitPanel {
                 }
             } else if status_entry.status.is_created() {
                 self.new_count += 1;
+                if status_entry.status.is_untracked() {
+                    self.untracked_count += 1;
+                }
                 if stage_status.has_staged() {
                     self.new_staged_count += 1;
+                    if status_entry.status.is_untracked() {
+                        self.untracked_staged_count += 1;
+                    }
                 }
             } else {
                 self.tracked_count += 1;
@@ -5856,7 +5931,44 @@ impl GitPanel {
     }
 
     fn primary_changes_action_stages(&self) -> bool {
-        self.entry_count == 0 || self.has_unstaged_changes()
+        self.stage_scope_entries().next().is_none() || self.can_stage_all()
+    }
+
+    fn stage_all_includes_untracked(&self) -> bool {
+        matches!(
+            self.untracked_changes,
+            GitPanelUntrackedChanges::Classic | GitPanelUntrackedChanges::Mixed
+        )
+    }
+
+    /// Entries affected by Stage All / Unstage All under the current untracked-changes mode.
+    fn stage_scope_entries(&self) -> impl Iterator<Item = &GitStatusEntry> {
+        let include_untracked = self.stage_all_includes_untracked();
+        self.change_entries_by_path()
+            .filter(move |entry| include_untracked || !entry.status.is_untracked())
+    }
+
+    fn has_commit_candidates(&self) -> bool {
+        !self.commit_repo_paths().is_empty()
+    }
+
+    fn can_stage_untracked(&self) -> bool {
+        self.untracked_count > self.untracked_staged_count
+    }
+
+    fn tracked_repo_paths(&self) -> Vec<RepoPath> {
+        self.change_entries_by_path()
+            .filter(|status_entry| !status_entry.status.is_untracked())
+            .map(|status_entry| status_entry.repo_path.clone())
+            .collect()
+    }
+
+    fn commit_repo_paths(&self) -> Vec<RepoPath> {
+        let include_untracked = self.untracked_changes == GitPanelUntrackedChanges::Mixed;
+        self.change_entries_by_path()
+            .filter(|status_entry| include_untracked || !status_entry.status.is_untracked())
+            .map(|status_entry| status_entry.repo_path.clone())
+            .collect()
     }
 
     fn has_tracked_changes(&self) -> bool {
@@ -6038,15 +6150,22 @@ impl GitPanel {
     }
 
     pub fn can_commit(&self) -> bool {
-        (self.has_staged_changes() || self.has_tracked_changes()) && !self.has_unstaged_conflicts()
+        (self.has_staged_changes() || self.has_commit_candidates())
+            && !self.has_unstaged_conflicts()
     }
 
     pub fn can_stage_all(&self) -> bool {
-        self.has_unstaged_changes()
+        self.stage_scope_entries()
+            .any(|entry| entry.staging.has_unstaged())
     }
 
     pub fn can_unstage_all(&self) -> bool {
-        self.has_staged_changes()
+        if self.stage_all_includes_untracked() {
+            self.has_staged_changes()
+        } else {
+            self.stage_scope_entries()
+                .any(|entry| entry.staging.has_staged())
+        }
     }
 
     /// Computes tree indentation depths for visible entries in the given range.
@@ -6330,7 +6449,8 @@ impl GitPanel {
             (false, "Generating commit message...")
         } else if self.has_unstaged_conflicts() {
             (false, "You must resolve conflicts before committing")
-        } else if !self.has_staged_changes() && !self.has_tracked_changes() && !self.amend_pending {
+        } else if !self.has_staged_changes() && !self.has_commit_candidates() && !self.amend_pending
+        {
             (false, "No changes to commit")
         } else if self.pending_commit.is_some() {
             (false, "Commit in progress")
@@ -6353,6 +6473,8 @@ impl GitPanel {
                 "Amend"
             }
         } else if self.has_staged_changes() {
+            "Commit"
+        } else if self.untracked_changes == GitPanelUntrackedChanges::Mixed {
             "Commit"
         } else {
             "Commit Tracked"
@@ -6405,10 +6527,14 @@ impl GitPanel {
         id: impl Into<ElementId>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let stage_all_includes_untracked = self.stage_all_includes_untracked();
+        let can_stage_all = self.can_stage_all();
+        let can_unstage_all = self.can_unstage_all();
+        let show_stage_untracked = self.untracked_changes == GitPanelUntrackedChanges::Separate;
+        let can_stage_untracked = show_stage_untracked && self.can_stage_untracked();
         let has_tracked_changes = self.has_tracked_changes();
         let has_staged_tracked_changes = self.has_staged_tracked_changes();
         let has_staged_changes = self.has_staged_changes();
-        let has_unstaged_changes = self.has_unstaged_changes();
         let has_new_changes = self.new_count > 0;
         let has_stash_items = self.stash_entries.entries.len() > 0;
         let group_by = GitPanelSettings::get_global(cx).group_by;
@@ -6424,10 +6550,14 @@ impl GitPanel {
             .with_handle(self.changes_actions_menu_handle.clone())
             .menu(move |window, cx| {
                 Some(git_panel_context_menu(
+                    stage_all_includes_untracked,
+                    can_stage_all,
+                    can_unstage_all,
+                    show_stage_untracked,
+                    can_stage_untracked,
                     has_tracked_changes,
                     has_staged_tracked_changes,
                     has_staged_changes,
-                    has_unstaged_changes,
                     has_new_changes,
                     has_stash_items,
                     group_by,
@@ -6445,11 +6575,28 @@ impl GitPanel {
     }
 
     fn render_git_changes_actions_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (stage_label, stage_tooltip, unstage_label, unstage_tooltip) =
+            if self.stage_all_includes_untracked() {
+                ("Stage All", "git add --all", "Unstage All", "git reset")
+            } else {
+                (
+                    "Stage Tracked",
+                    "git add -u",
+                    "Unstage Tracked",
+                    "git reset --",
+                )
+            };
         let (text, action, stage, tooltip) = if self.primary_changes_action_stages() {
-            ("Stage All", StageAll.boxed_clone(), true, "git add --all")
+            (stage_label, StageAll.boxed_clone(), true, stage_tooltip)
         } else {
-            ("Unstage All", UnstageAll.boxed_clone(), false, "git reset")
+            (
+                unstage_label,
+                UnstageAll.boxed_clone(),
+                false,
+                unstage_tooltip,
+            )
         };
+        let has_stage_scope_entries = self.stage_scope_entries().next().is_some();
 
         SplitButton::new(
             ButtonLike::new_rounded_left("git-changes-actions-split-button-left")
@@ -6461,7 +6608,7 @@ impl GitPanel {
                     action.as_ref(),
                     &self.focus_handle,
                 ))
-                .disabled(self.entry_count == 0)
+                .disabled(!has_stage_scope_entries)
                 .on_click({
                     let git_panel = cx.weak_entity();
                     move |_, _, cx| {
@@ -8243,7 +8390,6 @@ impl GitPanel {
         let has_stash_items = self.stash_entries.entries.len() > 0;
         let has_tracked_changes = self.has_tracked_changes();
         let has_staged_changes = self.has_staged_changes();
-        let has_unstaged_changes = self.has_unstaged_changes();
         let has_new_changes = self.new_count > 0;
         let has_staged_tracked_changes = target_entry_index
             .and_then(|entry_index| self.directory_descendants(entry_index))
@@ -8251,12 +8397,21 @@ impl GitPanel {
                 || self.has_staged_tracked_changes(),
                 |entries| Self::contains_staged_tracked_entry(entries),
             );
+        let stage_all_includes_untracked = self.stage_all_includes_untracked();
+        let can_stage_all = self.can_stage_all();
+        let can_unstage_all = self.can_unstage_all();
+        let show_stage_untracked = self.untracked_changes == GitPanelUntrackedChanges::Separate;
+        let can_stage_untracked = show_stage_untracked && self.can_stage_untracked();
 
         let context_menu = git_panel_context_menu(
+            stage_all_includes_untracked,
+            can_stage_all,
+            can_unstage_all,
+            show_stage_untracked,
+            can_stage_untracked,
             has_tracked_changes,
             has_staged_tracked_changes,
             has_staged_changes,
-            has_unstaged_changes,
             has_new_changes,
             has_stash_items,
             GitPanelSettings::get_global(cx).group_by,
@@ -11712,6 +11867,116 @@ mod tests {
             assert_eq!(workspace.items_of_type::<StagedDiff>(cx).count(), 1);
             assert_eq!(workspace.items_of_type::<UnstagedDiff>(cx).count(), 1);
             assert_eq!(workspace.items_of_type::<ProjectDiff>(cx).count(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_hidden_untracked_changes_excludes_untracked(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "tracked.txt": "changed\n",
+                "new.txt": "new\n",
+            }),
+        )
+        .await;
+        fs.set_status_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("tracked.txt", StatusCode::Modified.worktree()),
+                ("new.txt", FileStatus::Untracked),
+            ],
+        );
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().untracked_changes =
+                        Some(GitPanelUntrackedChanges::Hidden);
+                })
+            });
+        });
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.changes_count, 1);
+            assert!(panel.can_commit());
+            assert!(panel.can_stage_all());
+            assert!(
+                panel
+                    .entries
+                    .iter()
+                    .filter_map(|entry| entry.status_entry())
+                    .all(|entry| !entry.status.is_untracked())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_hidden_untracked_changes_with_only_untracked(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "new.txt": "new\n",
+            }),
+        )
+        .await;
+        fs.set_status_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("new.txt", FileStatus::Untracked)],
+        );
+
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().untracked_changes =
+                        Some(GitPanelUntrackedChanges::Hidden);
+                })
+            });
+        });
+
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        let panel = workspace.update_in(cx, GitPanel::new);
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.entries.len(), 0);
+            assert_eq!(panel.changes_count, 0);
+            assert!(!panel.can_commit());
+            assert!(!panel.can_stage_all());
         });
     }
 

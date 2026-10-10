@@ -3,8 +3,8 @@ use gpui::Pixels;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    FolderIndicator, GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, IntoGpui,
-    RegisterSetting, Settings, StatusStyle,
+    FolderIndicator, GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy,
+    GitPanelUntrackedChanges, IntoGpui, RegisterSetting, Settings, StatusStyle,
 };
 use ui::scrollbars::{ScrollbarVisibility, ShowScrollbar};
 use workspace::dock::DockPosition;
@@ -20,6 +20,7 @@ pub struct GitPanelSettings {
     pub dock: DockPosition,
     pub default_width: Pixels,
     pub status_style: StatusStyle,
+    pub untracked_changes: GitPanelUntrackedChanges,
     pub file_icons: bool,
     pub folder_indicator: FolderIndicator,
     pub scrollbar: ScrollbarSettings,
@@ -63,6 +64,7 @@ impl Settings for GitPanelSettings {
             dock: git_panel.dock.unwrap().into(),
             default_width: git_panel.default_width.unwrap().into_gpui(),
             status_style: git_panel.status_style.unwrap(),
+            untracked_changes: git_panel.untracked_changes.unwrap(),
             file_icons: git_panel.file_icons.unwrap(),
             folder_indicator: git_panel.folder_indicator.unwrap(),
             scrollbar: ScrollbarSettings {
