@@ -721,9 +721,11 @@ impl Inventory {
     pub fn templates_with_hooks(
         &self,
         hooks: &HashSet<TaskHook>,
-        worktree: WorktreeId,
+        worktree: Option<WorktreeId>,
     ) -> Vec<(TaskSourceKind, TaskTemplate)> {
-        self.worktree_templates_from_settings(worktree)
+        worktree
+            .into_iter()
+            .flat_map(|worktree| self.worktree_templates_from_settings(worktree))
             .chain(self.global_templates_from_settings())
             .filter(|(_, template)| !template.hooks.is_disjoint(hooks))
             .collect()

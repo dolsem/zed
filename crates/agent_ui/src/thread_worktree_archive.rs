@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use gpui::{App, AsyncApp, Entity, Task};
+use gpui::{App, AsyncApp, Entity, Task, WindowHandle};
 use project::{
     LocalProjectFlags, Project, WorktreeId,
     git_store::{Repository, resolve_git_worktree_to_main_repo, worktrees_directory_for_repo},
@@ -250,6 +250,68 @@ pub async fn remove_root(root: RootPlan, cx: &mut AsyncApp) -> Result<()> {
     .log_err();
 
     Ok(())
+}
+
+/// Runs the `remove_worktree` task hooks for `root` in a workspace of the given
+/// window, resolving to an error if any hook fails so the worktree is kept.
+///
+/// Prefers a workspace that has the worktree (or its main repository) open, so
+/// that the tasks come from the same repository the worktree belongs to.
+pub async fn run_remove_worktree_hooks(
+    root: &RootPlan,
+    window_handle: WindowHandle<MultiWorkspace>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let hooks = window_handle.update(cx, |multi_workspace, window, cx| {
+        let candidate_workspaces = multi_workspace
+            .workspaces()
+            .filter(|workspace| {
+                same_remote_connection_identity(
+                    workspace
+                        .read(cx)
+                        .project()
+                        .read(cx)
+                        .remote_connection_options(cx)
+                        .as_ref(),
+                    root.remote_connection.as_ref(),
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_visible_worktree = |workspace: &Entity<Workspace>, path: &Path, cx: &App| {
+            workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .any(|worktree| worktree.read(cx).abs_path().as_ref() == path)
+        };
+        let workspace = [root.root_path.as_path(), root.main_repo_path.as_path()]
+            .into_iter()
+            .find_map(|path| {
+                candidate_workspaces
+                    .iter()
+                    .find(|workspace| has_visible_worktree(workspace, path, cx))
+            })
+            .or_else(|| candidate_workspaces.first())
+            .cloned();
+        let Some(workspace) = workspace else {
+            log::warn!(
+                "No workspace available to run worktree removal hooks for {}",
+                root.root_path.display()
+            );
+            return Task::ready(Ok(()));
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.run_remove_worktree_tasks(
+                root.root_path.clone(),
+                Some(root.main_repo_path.clone()),
+                window,
+                cx,
+            )
+        })
+    })?;
+    hooks.await
 }
 
 /// Confirms that the worktree on disk is still the one Zed created, by

@@ -95,6 +95,9 @@ pub enum DebugArgsRequest {
 pub enum TaskHook {
     #[serde(alias = "create_git_worktree")]
     CreateWorktree,
+    /// Runs before a git worktree is removed. If any task fails, the worktree is kept.
+    #[serde(alias = "remove_git_worktree")]
+    RemoveWorktree,
 }
 
 /// What to do with the terminal pane and tab, after the command was started.

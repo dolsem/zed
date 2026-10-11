@@ -1,4 +1,4 @@
-use std::process::ExitStatus;
+use std::{path::PathBuf, process::ExitStatus};
 
 use anyhow::Result;
 use collections::HashSet;
@@ -11,7 +11,7 @@ use task::{
     TaskHook, TaskTemplate, TaskVariables, VariableName,
 };
 use ui::Window;
-use util::TryFutureExt;
+use util::{ResultExt, TryFutureExt};
 
 use crate::{SaveIntent, Toast, Workspace, notifications::NotificationId};
 
@@ -253,7 +253,7 @@ impl Workspace {
 
                 let templates: Vec<TaskTemplate> = inventory
                     .read(cx)
-                    .templates_with_hooks(&hooks, worktree_id)
+                    .templates_with_hooks(&hooks, Some(worktree_id))
                     .into_iter()
                     .map(|(_, template)| template)
                     .collect();
@@ -335,6 +335,110 @@ impl Workspace {
             anyhow::Ok(())
         });
         task.detach_and_log_err(cx);
+    }
+
+    /// Runs the `remove_worktree` hook tasks for the git worktree at `worktree_path`,
+    /// resolving to an error if any of them fails so the caller can keep the worktree.
+    pub fn run_remove_worktree_tasks(
+        &mut self,
+        worktree_path: PathBuf,
+        main_git_worktree_path: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let hooks = HashSet::from_iter([TaskHook::RemoveWorktree]);
+        let project = self.project().read(cx);
+        let Some(inventory) = project.task_store().read(cx).task_inventory().cloned() else {
+            return Task::ready(Ok(()));
+        };
+
+        // The worktree being removed is usually no longer open in this project, so fall
+        // back to the main worktree's tasks, which come from the same repository.
+        let source_worktree_id = [
+            Some(worktree_path.as_path()),
+            main_git_worktree_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|path| {
+            project
+                .visible_worktrees(cx)
+                .find(|worktree| worktree.read(cx).abs_path().as_ref() == path)
+                .map(|worktree| worktree.read(cx).id())
+        });
+
+        let templates: Vec<TaskTemplate> = inventory
+            .read(cx)
+            .templates_with_hooks(&hooks, source_worktree_id)
+            .into_iter()
+            .map(|(_, template)| template)
+            .collect();
+        if templates.is_empty() {
+            return Task::ready(Ok(()));
+        }
+
+        let mut task_variables = TaskVariables::default();
+        task_variables.insert(
+            VariableName::WorktreeRoot,
+            worktree_path.to_string_lossy().into_owned(),
+        );
+        if let Some(path) = &main_git_worktree_path {
+            task_variables.insert(
+                VariableName::MainGitWorktree,
+                path.to_string_lossy().into_owned(),
+            );
+        }
+        let task_context = TaskContext {
+            cwd: Some(worktree_path.clone()),
+            task_variables,
+            project_env: Default::default(),
+        };
+        let id_base = format!("worktree_teardown_{}", worktree_path.display());
+
+        cx.spawn_in(window, async move |workspace, cx| {
+            let result = async {
+                for task_template in templates {
+                    let Some(resolved) = task_template.resolve_task(&id_base, &task_context) else {
+                        continue;
+                    };
+                    let label = resolved.resolved.label.clone();
+
+                    let status = workspace.update_in(cx, |workspace, window, cx| {
+                        workspace.spawn_in_terminal(resolved.resolved, window, cx)
+                    })?;
+
+                    match status.await {
+                        Some(Ok(exit_status)) if exit_status.success() => {}
+                        Some(Ok(exit_status)) => anyhow::bail!(
+                            "Worktree removal task \"{label}\" failed with status: {:?}",
+                            exit_status.code()
+                        ),
+                        Some(Err(error)) => {
+                            return Err(
+                                error.context(format!("Worktree removal task \"{label}\" failed"))
+                            );
+                        }
+                        None => anyhow::bail!("Worktree removal task \"{label}\" was cancelled"),
+                    }
+                }
+                anyhow::Ok(())
+            }
+            .await;
+
+            if let Err(error) = &result {
+                log::error!("{error:#}");
+                workspace
+                    .update(cx, |workspace, cx| {
+                        let id = NotificationId::unique::<TaskHook>();
+                        workspace.show_toast(
+                            Toast::new(id, format!("{error:#}. The worktree was not removed.")),
+                            cx,
+                        );
+                    })
+                    .log_err();
+            }
+            result
+        })
     }
 }
 
@@ -568,6 +672,125 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.read(|cx| !fixture.item.read(cx).is_dirty));
         assert!(cx.read(|cx| inactive.read(cx).is_dirty));
+    }
+
+    struct ScriptedTerminalProvider {
+        spawned_labels: Arc<Mutex<Vec<String>>>,
+        results: Arc<Mutex<Vec<Option<Result<ExitStatus>>>>>,
+    }
+
+    impl TerminalProvider for ScriptedTerminalProvider {
+        fn spawn(
+            &self,
+            task: task::SpawnInTerminal,
+            _window: &mut ui::Window,
+            _cx: &mut App,
+        ) -> Task<Option<Result<ExitStatus>>> {
+            self.spawned_labels.lock().push(task.label);
+            let mut results = self.results.lock();
+            let result = if results.is_empty() {
+                Some(Ok(ExitStatus::default()))
+            } else {
+                results.remove(0)
+            };
+            Task::ready(result)
+        }
+    }
+
+    async fn run_remove_worktree_tasks_with_results(
+        results: Vec<Option<Result<ExitStatus>>>,
+        cx: &mut TestAppContext,
+    ) -> (Result<()>, Vec<String>) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            project::task_store::TaskStore::init(None);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), ["/root".as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        let spawned_labels = Arc::new(Mutex::new(Vec::new()));
+        workspace.update(cx, |workspace, cx| {
+            workspace.terminal_provider = Some(Box::new(ScriptedTerminalProvider {
+                spawned_labels: spawned_labels.clone(),
+                results: Arc::new(Mutex::new(results)),
+            }));
+
+            let worktree_id = project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .expect("project should have a worktree")
+                .read(cx)
+                .id();
+            let inventory = project
+                .read(cx)
+                .task_store()
+                .read(cx)
+                .task_inventory()
+                .cloned()
+                .expect("local project should have a task inventory");
+            inventory.update(cx, |inventory, _| {
+                inventory
+                    .update_file_based_tasks(
+                        project::task_store::TaskSettingsLocation::Worktree(
+                            settings::SettingsLocation {
+                                worktree_id,
+                                path: util::rel_path::rel_path(".zed"),
+                            },
+                        ),
+                        Some(
+                            r#"[
+                                {"label":"teardown 1","command":"echo","hooks":["remove_worktree"]},
+                                {"label":"teardown 2","command":"echo","hooks":["remove_worktree"]},
+                                {"label":"setup","command":"echo","hooks":["create_worktree"]}
+                            ]"#,
+                        ),
+                    )
+                    .expect("hook tasks should parse");
+            });
+        });
+
+        let task = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_remove_worktree_tasks(
+                "/worktrees/feature".into(),
+                Some("/root".into()),
+                window,
+                cx,
+            )
+        });
+        let result = task.await;
+        let spawned_labels = spawned_labels.lock().clone();
+        (result, spawned_labels)
+    }
+
+    #[gpui::test]
+    async fn test_run_remove_worktree_tasks_succeeds(cx: &mut TestAppContext) {
+        let (result, spawned_labels) = run_remove_worktree_tasks_with_results(Vec::new(), cx).await;
+        assert!(result.is_ok());
+        assert_eq!(spawned_labels, ["teardown 1", "teardown 2"]);
+    }
+
+    #[gpui::test]
+    async fn test_run_remove_worktree_tasks_stops_on_error(cx: &mut TestAppContext) {
+        let (result, spawned_labels) =
+            run_remove_worktree_tasks_with_results(vec![Some(Err(anyhow::anyhow!("boom")))], cx)
+                .await;
+        assert!(result.is_err());
+        assert_eq!(spawned_labels, ["teardown 1"]);
+    }
+
+    #[gpui::test]
+    async fn test_run_remove_worktree_tasks_fails_when_cancelled(cx: &mut TestAppContext) {
+        let (result, spawned_labels) =
+            run_remove_worktree_tasks_with_results(vec![Some(Ok(ExitStatus::default())), None], cx)
+                .await;
+        assert!(result.is_err());
+        assert_eq!(spawned_labels, ["teardown 1", "teardown 2"]);
     }
 
     struct TestTerminalProvider {
