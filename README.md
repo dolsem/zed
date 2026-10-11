@@ -7,6 +7,53 @@ Welcome to Zed, a high-performance, multiplayer code editor from the creators of
 
 ---
 
+### About this fork
+
+This is a personal fork of Zed, currently based on upstream **v1.23.2**. It adds the following on top of upstream:
+
+#### Git worktree navigation actions
+
+New actions for switching between the git worktrees of the active repository. They have no default bindings, so map them in your `keymap.json`:
+
+| Action                       | Switches to                                                    |
+| ---------------------------- | -------------------------------------------------------------- |
+| `git::OpenMainWorktree`      | The main worktree                                              |
+| `git::OpenLastWorktree`      | The worktree you were in before the last switch (like `cd -`)  |
+| `git::OpenNextWorktree`      | The next worktree, ordered by name (wraps around)              |
+| `git::OpenPreviousWorktree`  | The previous worktree, ordered by name (wraps around)          |
+
+#### Control over untracked files in the Git Panel
+
+The `git_panel.untracked_changes` setting (also in the Settings UI under **Panels**) controls how untracked files are shown and staged:
+
+| Value       | Untracked files are…                                              | Stage All / Commit include them? |
+| ----------- | ----------------------------------------------------------------- | -------------------------------- |
+| `classic`   | Shown in their own section (upstream behavior, the default)       | Stage All: yes; commit without staging: no |
+| `mixed`     | Shown alongside tracked changes                                   | Yes                              |
+| `separate`  | Shown in their own section                                        | No                               |
+| `hidden`    | Hidden from the Git Panel and the uncommitted-changes diff        | No                               |
+
+When untracked files are excluded, the bulk actions are labeled **Stage Tracked** / **Unstage Tracked**. In `separate` mode a **Stage Untracked** item (the `git::StageUntracked` action) is added to the changes menu.
+
+#### `ZED_THREAD_ID` in Terminal Threads
+
+Every Terminal Thread's shell gets a `ZED_THREAD_ID` environment variable holding the thread's stable id. The id is kept when the thread is restored after a restart or from Thread History, so scripts and the `agent.terminal_init_command` can use it to resume the same session (for example, to map a Terminal Thread to a CLI agent's conversation).
+
+#### Archiving Terminal Threads
+
+Terminal Threads are archived like agent threads instead of being deleted:
+
+- Hover a Terminal Thread in the Threads Sidebar to get **Rename** (pencil) and **Archive** buttons, and right-click it for **Rename Title** and **Archive Terminal**. `agent::ArchiveSelectedThread` archives the selected terminal.
+- A Terminal Thread is also archived when its shell exits.
+- Archived terminals are listed in Thread History. Clicking one restores it: a new shell starts with the same working directory, title and `ZED_THREAD_ID`, and the init command runs again. The trash icon deletes it permanently.
+- Archiving a Terminal Thread never removes its git worktree, so it can always be restored.
+
+#### `dolsem` release channel
+
+Builds from this fork use a separate `dolsem` release channel (`crates/zed/RELEASE_CHANNEL`). It runs as **Zed Dolsem**, with its own app icon, app identifier (`dev.zed.Zed-Dolsem`) and single-instance port. That lets it run side by side with an official Zed install. It never checks for or installs updates.
+
+---
+
 ### Installation
 
 On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
