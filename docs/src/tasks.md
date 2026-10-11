@@ -237,6 +237,7 @@ In addition to being spawned manually, tasks can be configured to run automatica
 The following hooks are currently supported:
 
 - `create_worktree` — runs after Zed creates a new linked Git worktree, either directly through the CLI or from the [worktree picker](./git.md#git-worktrees). The task is spawned with `ZED_WORKTREE_ROOT` pointing at the newly created worktree and `ZED_MAIN_GIT_WORKTREE` pointing at the original repository's working directory, which makes these hooks well-suited to copying untracked files (such as `.env` files) or running per-worktree setup commands.
+- `remove_worktree` — runs before Zed removes a linked Git worktree, either when deleting it from the [worktree picker](./git.md#git-worktrees) or when archiving the last thread that uses a Zed-created worktree. The task is spawned with `ZED_WORKTREE_ROOT` pointing at the worktree being removed and `ZED_MAIN_GIT_WORKTREE` pointing at the original repository's working directory. Tasks run one after another; if any of them fails or is cancelled, the worktree is not removed.
 
 Hook tasks are resolved from the same global and worktree-local `tasks.json` files as manually spawned tasks, and multiple tasks may register for the same hook; they all run when the hook fires. A hook task still benefits from the usual task configuration fields — `cwd`, `env`, `reveal`, `hide`, and so on — so you can control how much of the terminal UI is shown while it runs.
 

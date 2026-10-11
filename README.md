@@ -48,6 +48,20 @@ Terminal Threads are archived like agent threads instead of being deleted:
 - Archived terminals are listed in Thread History. Clicking one restores it: a new shell starts with the same working directory, title and `ZED_THREAD_ID`, and the init command runs again. The trash icon deletes it permanently.
 - Archiving a Terminal Thread never removes its git worktree, so it can always be restored.
 
+#### `remove_worktree` task hook
+
+Tasks with `"hooks": ["remove_worktree"]` run before Zed removes a linked git worktree, either when it's deleted from the worktree picker or when the last thread using a Zed-created worktree is archived. They get `ZED_WORKTREE_ROOT` (the worktree being removed) and `ZED_MAIN_GIT_WORKTREE` (the main repository), and run from inside the worktree. The tasks run one after another. If any of them fails or is cancelled, the rest are skipped and the worktree is kept. An archived thread is un-archived in that case.
+
+```json
+[
+  {
+    "label": "tear down worktree",
+    "command": "docker compose down",
+    "hooks": ["remove_worktree"]
+  }
+]
+```
+
 #### `dolsem` release channel
 
 Builds from this fork use a separate `dolsem` release channel (`crates/zed/RELEASE_CHANNEL`). It runs as **Zed Dolsem**, with its own app icon, app identifier (`dev.zed.Zed-Dolsem`) and single-instance port. That lets it run side by side with an official Zed install. It never checks for or installs updates.

@@ -5457,8 +5457,9 @@ impl Sidebar {
                         cx,
                     );
                 }
-                let in_flight = thread_id
-                    .and_then(|tid| this.start_archive_worktree_task(tid, roots_to_archive, cx));
+                let in_flight = thread_id.and_then(|tid| {
+                    this.start_archive_worktree_task(tid, roots_to_archive, window, cx)
+                });
                 this.archive_and_activate(
                     &session_id,
                     thread_id,
@@ -5568,6 +5569,7 @@ impl Sidebar {
         &self,
         thread_id: ThreadId,
         roots: Vec<thread_worktree_archive::RootPlan>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<(Task<()>, async_channel::Sender<()>)> {
         if roots.is_empty() {
@@ -5576,9 +5578,10 @@ impl Sidebar {
 
         self.delete_empty_drafts_for_archive_roots(&roots, cx);
 
+        let window_handle = window.window_handle().downcast::<MultiWorkspace>();
         let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
         let task = cx.spawn(async move |_this, cx| {
-            match Self::archive_worktree_roots(roots, cancel_rx, cx).await {
+            match Self::archive_worktree_roots(roots, window_handle, cancel_rx, cx).await {
                 Ok(ArchiveWorktreeOutcome::Success) => {
                     cx.update(|cx| {
                         ThreadMetadataStore::global(cx).update(cx, |store, _cx| {
@@ -5604,6 +5607,7 @@ impl Sidebar {
     fn start_detached_archive_worktree_task(
         &self,
         roots: Vec<thread_worktree_archive::RootPlan>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         if roots.is_empty() {
@@ -5612,9 +5616,10 @@ impl Sidebar {
 
         self.delete_empty_drafts_for_archive_roots(&roots, cx);
 
+        let window_handle = window.window_handle().downcast::<MultiWorkspace>();
         let (cancel_tx, cancel_rx) = async_channel::bounded::<()>(1);
         cx.spawn(async move |_this, cx| {
-            let outcome = Self::archive_worktree_roots(roots, cancel_rx, cx).await;
+            let outcome = Self::archive_worktree_roots(roots, window_handle, cancel_rx, cx).await;
             drop(cancel_tx);
             match outcome {
                 Ok(ArchiveWorktreeOutcome::Success | ArchiveWorktreeOutcome::Cancelled) => {}
@@ -5628,6 +5633,7 @@ impl Sidebar {
 
     async fn archive_worktree_roots(
         roots: Vec<thread_worktree_archive::RootPlan>,
+        window_handle: Option<WindowHandle<MultiWorkspace>>,
         cancel_rx: async_channel::Receiver<()>,
         cx: &mut gpui::AsyncApp,
     ) -> anyhow::Result<ArchiveWorktreeOutcome> {
@@ -5651,6 +5657,17 @@ impl Sidebar {
                     }
                     return Err(error);
                 }
+            }
+
+            if let Some(window_handle) = window_handle
+                && let Err(error) =
+                    thread_worktree_archive::run_remove_worktree_hooks(root, window_handle, cx)
+                        .await
+            {
+                for &(id, ref completed_root) in completed_persists.iter().rev() {
+                    thread_worktree_archive::rollback_persist(id, completed_root, cx).await;
+                }
+                return Err(error);
             }
 
             if cancel_rx.is_closed() {
@@ -6980,7 +6997,7 @@ impl Sidebar {
             });
         }
 
-        self.start_detached_archive_worktree_task(roots_to_archive, cx);
+        self.start_detached_archive_worktree_task(roots_to_archive, window, cx);
 
         if was_active {
             self.active_entry = None;

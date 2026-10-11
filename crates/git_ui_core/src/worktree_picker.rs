@@ -519,6 +519,11 @@ impl WorktreePickerDelegate {
         };
         let path = worktree.path.clone();
         let display_name = worktree.directory_name(self.worktree_name_anchor());
+        let main_worktree_path = self
+            .all_worktrees
+            .iter()
+            .find(|worktree| worktree.is_main)
+            .map(|worktree| worktree.path.clone());
         let workspace = self.workspace.clone();
 
         self.deleting_worktree_paths.insert(path.clone());
@@ -528,6 +533,25 @@ impl WorktreePickerDelegate {
         cx.notify();
 
         cx.spawn_in(window, async move |picker, cx| {
+            if let Some(workspace) = workspace.upgrade() {
+                let remove_hooks = workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.run_remove_worktree_tasks(
+                        path.clone(),
+                        main_worktree_path,
+                        window,
+                        cx,
+                    )
+                })?;
+                if remove_hooks.await.is_err() {
+                    picker.update_in(cx, |picker, _window, cx| {
+                        if picker.delegate.deleting_worktree_paths.remove(&path) {
+                            cx.notify();
+                        }
+                    })?;
+                    return Ok(());
+                }
+            }
+
             let initial_result = match repo
                 .update(cx, |repo, _| repo.remove_worktree(path.clone(), force))
                 .await
