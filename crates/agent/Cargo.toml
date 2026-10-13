@@ -56,6 +56,7 @@ prompt_store.workspace = true
 quick-xml.workspace = true
 rand.workspace = true
 regex.workspace = true
+remote.workspace = true
 sandbox.workspace = true
 schemars.workspace = true
 serde.workspace = true

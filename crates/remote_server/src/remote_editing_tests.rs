@@ -4412,6 +4412,115 @@ async fn test_remote_agent_fs_tool_calls(cx: &mut TestAppContext, server_cx: &mu
 }
 
 #[gpui::test]
+async fn test_remote_project_threads_are_stored_on_host(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    use agent_client_protocol::schema::v1 as acp;
+
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({ "a.txt": "A" }))
+        .await;
+
+    let (project, headless_project) = init_test(&fs, cx, server_cx).await;
+    cx.update(|cx| {
+        LanguageModelRegistry::test(cx);
+    });
+    let thread_store = cx.new(|cx| ThreadStore::new(cx));
+    let storage = thread_store
+        .update(cx, |store, cx| {
+            store.remote_storage_for_project(&project, cx)
+        })
+        .expect("a remote project's threads should be stored on the host");
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+
+    let session_id = acp::SessionId::new("remote-thread");
+    let db_thread = agent::DbThread {
+        title: "Remote thread".into(),
+        messages: Vec::new(),
+        updated_at: chrono::Utc::now(),
+        detailed_summary: None,
+        initial_project_snapshot: None,
+        cumulative_token_usage: Default::default(),
+        request_token_usage: Default::default(),
+        model: None,
+        profile: None,
+        subagent_context: None,
+        speed: None,
+        thinking_enabled: false,
+        thinking_effort: None,
+        draft_prompt: None,
+        ui_scroll_position: None,
+        sandboxed_terminal_temp_dir: None,
+        sandbox_grants: Default::default(),
+    };
+    let folder_paths = PathList::new(&[Path::new(path!("/project"))]);
+    storage
+        .save_thread(
+            session_id.clone(),
+            db_thread,
+            folder_paths.clone(),
+            &cx.executor(),
+        )
+        .await
+        .unwrap();
+
+    let threads = storage.list_threads().await.unwrap();
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].id, session_id);
+    assert_eq!(threads[0].title.as_ref(), "Remote thread");
+    assert_eq!(threads[0].folder_paths, folder_paths);
+
+    // The client's store isn't aware of the thread until the host announces
+    // that its threads changed.
+    assert!(thread_store.read_with(cx, |store, _| {
+        store.thread_from_session_id(&session_id).is_none()
+    }));
+    headless_project
+        .read_with(server_cx, |headless_project, _| {
+            headless_project.session.send(proto::AgentThreadsChanged {})
+        })
+        .unwrap();
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+    assert!(thread_store.read_with(cx, |store, _| {
+        store.thread_from_session_id(&session_id).is_some()
+    }));
+
+    let loaded = thread_store
+        .update(cx, |store, cx| store.load_thread(session_id.clone(), cx))
+        .await
+        .unwrap()
+        .expect("thread should load from the host");
+    assert_eq!(loaded.title.as_ref(), "Remote thread");
+
+    // The native agent loads threads of the remote project from the host.
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
+    let thread = agent
+        .update(cx, |agent, cx| {
+            agent.load_thread(session_id.clone(), project.clone(), cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        thread.read_with(cx, |thread, _| thread.title()),
+        Some("Remote thread".into())
+    );
+
+    thread_store
+        .update(cx, |store, cx| store.delete_thread(session_id.clone(), cx))
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    assert!(storage.list_threads().await.unwrap().is_empty());
+    assert!(thread_store.read_with(cx, |store, _| {
+        store.thread_from_session_id(&session_id).is_none()
+    }));
+}
+
+#[gpui::test]
 async fn test_adding_remote_skill(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     use acp_thread::AgentConnection as _;
 

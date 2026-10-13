@@ -52,6 +52,8 @@ use terminal::terminal_settings::TerminalSettings;
 use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 use worktree::Worktree;
 
+use crate::agent_threads::AgentThreadsHost;
+
 pub struct HeadlessProject {
     pub fs: Arc<dyn Fs>,
     pub session: AnyProtoClient,
@@ -74,6 +76,7 @@ pub struct HeadlessProject {
     // Local variant is used within LSP store, but that's a separate entity.
     pub _toolchain_store: Entity<ToolchainStore>,
     pub kernels: HashMap<String, Child>,
+    _agent_threads: Entity<AgentThreadsHost>,
 }
 
 pub struct HeadlessAppState {
@@ -330,6 +333,8 @@ impl HeadlessProject {
         session.add_request_handler(cx.weak_entity(), Self::handle_spawn_kernel);
         session.add_request_handler(cx.weak_entity(), Self::handle_kill_kernel);
 
+        let agent_threads = cx.new(|cx| AgentThreadsHost::new(session.clone(), fs.clone(), cx));
+
         BufferStore::init(&session);
         WorktreeStore::init(&session);
         SettingsObserver::init(&session);
@@ -363,6 +368,7 @@ impl HeadlessProject {
             profiling_collector: gpui::ProfilingCollector::new(startup_time),
             _toolchain_store: toolchain_store,
             kernels: Default::default(),
+            _agent_threads: agent_threads,
         }
     }
 

@@ -586,6 +586,7 @@ pub fn init(
     cx: &mut App,
 ) {
     agent::ThreadStore::init_global(cx);
+    agent::ThreadStore::start_syncing(&agent::ThreadStore::global(cx), fs.clone(), cx);
     prompt_store::init(cx);
 
     cx.set_global(agent_skills::SkillsUpdatedHook(std::rc::Rc::new(|cx| {

@@ -524,7 +524,19 @@ message Envelope {
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
     GetTerminalShell get_terminal_shell = 494;
-    GetTerminalShellResponse get_terminal_shell_response = 495; // current max
+    GetTerminalShellResponse get_terminal_shell_response = 495;
+
+    ListAgentThreads list_agent_threads = 496;
+    ListAgentThreadsResponse list_agent_threads_response = 497;
+    LoadAgentThread load_agent_thread = 498;
+    LoadAgentThreadResponse load_agent_thread_response = 499;
+    SaveAgentThread save_agent_thread = 500;
+    DeleteAgentThread delete_agent_thread = 501;
+    ListAgentThreadMetadata list_agent_thread_metadata = 502;
+    ListAgentThreadMetadataResponse list_agent_thread_metadata_response = 503;
+    SaveAgentThreadMetadata save_agent_thread_metadata = 504;
+    DeleteAgentThreadMetadata delete_agent_thread_metadata = 505;
+    AgentThreadsChanged agent_threads_changed = 506; // current max
   }
 
   reserved 87 to 88;

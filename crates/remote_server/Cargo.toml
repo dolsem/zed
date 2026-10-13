@@ -65,6 +65,7 @@ serde_json.workspace = true
 settings.workspace = true
 shellexpand.workspace = true
 smol.workspace = true
+sqlez.workspace = true
 sysinfo.workspace = true
 task.workspace = true
 telemetry.workspace = true
@@ -84,6 +85,7 @@ gpui = { workspace = true, features = ["windows-manifest"] }
 action_log.workspace = true
 agent = { workspace = true, features = ["test-support"] }
 agent-client-protocol.workspace = true
+chrono.workspace = true
 client = { workspace = true, features = ["test-support"] }
 clock = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }

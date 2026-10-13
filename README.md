@@ -62,6 +62,16 @@ Tasks with `"hooks": ["remove_worktree"]` run before Zed removes a linked git wo
 ]
 ```
 
+#### Threads of remote projects are stored on the remote host
+
+Agent threads of a project opened over a remote connection (SSH, WSL, Docker) are stored on the remote host, in the same databases the Zed installed there uses. A thread started remotely shows up in the sidebar of the host's own Zed, and threads started on the host show up when the project is opened remotely. Changes made on either side appear on the other while both are open.
+
+- This covers native agent threads (contents and sidebar entries) and the sidebar entries of external agents. External agents already keep their sessions on the host.
+- Both sides must run the same release channel, and Zed must have been run on the host at least once.
+- Threads of remote projects created before this change stay on the machine they were created on.
+- After restarting Zed, the client lists a host's threads only once a project on that host has been opened again.
+- If the same thread is open on both machines at once, the last save wins.
+
 #### `dolsem` release channel
 
 Builds from this fork use a separate `dolsem` release channel (`crates/zed/RELEASE_CHANNEL`). It runs as **Zed Dolsem**, with its own app icon, app identifier (`dev.zed.Zed-Dolsem`) and single-instance port. That lets it run side by side with an official Zed install. It never checks for or installs updates.

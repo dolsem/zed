@@ -1,3 +1,4 @@
+mod agent_threads;
 mod headless_project;
 
 #[cfg(test)]

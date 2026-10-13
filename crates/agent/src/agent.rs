@@ -3,6 +3,7 @@ mod legacy_thread;
 mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
+mod remote_thread_storage;
 mod sandboxing;
 mod templates;
 #[cfg(test)]
@@ -18,6 +19,7 @@ use itertools::Itertools;
 pub use native_agent_server::NativeAgentServer;
 use parking_lot::Mutex;
 pub use pattern_extraction::*;
+pub use remote_thread_storage::RemoteThreadStorage;
 pub use sandboxing::{
     ThreadSandbox, sandbox_worktree_writable_paths, settings_sandbox_policy,
     settings_thread_sandbox,
@@ -231,6 +233,8 @@ struct Session {
     acp_thread: WeakEntity<acp_thread::AcpThread>,
     subagents: Vec<Entity<acp_thread::AcpThread>>,
     project_id: EntityId,
+    /// Where the thread's content is persisted.
+    storage: ThreadStorage,
     /// Latest snapshot to persist. Overwritten in place on every save request;
     /// the single save worker drains it, coalescing bursts into one write.
     pending_save: Arc<Mutex<Option<PendingThreadSave>>>,
@@ -250,6 +254,28 @@ impl Session {
 
 struct PendingSession {
     task: Shared<Task<Result<Entity<AcpThread>, Arc<anyhow::Error>>>>,
+}
+
+/// Where a thread's content is persisted. Threads of remote projects are
+/// stored on the remote host, so that the Zed running there sees them too.
+#[derive(Clone)]
+enum ThreadStorage {
+    Local,
+    Remote(RemoteThreadStorage),
+}
+
+impl ThreadStorage {
+    fn for_project(
+        thread_store: &Entity<ThreadStore>,
+        project: &Entity<Project>,
+        cx: &mut App,
+    ) -> Self {
+        thread_store
+            .update(cx, |store, cx| {
+                store.remote_storage_for_project(project, cx)
+            })
+            .map_or(Self::Local, Self::Remote)
+    }
 }
 
 pub struct LanguageModels {
@@ -442,6 +468,9 @@ pub struct NativeAgent {
     sessions: HashMap<acp_v1::SessionId, Session>,
     pending_sessions: HashMap<acp_v1::SessionId, PendingSession>,
     thread_store: Entity<ThreadStore>,
+    /// Storage that loaded threads were found in, consumed when their session
+    /// is registered.
+    loaded_thread_storage: HashMap<acp_v1::SessionId, ThreadStorage>,
     /// Project-specific state keyed by project EntityId
     projects: HashMap<EntityId, ProjectState>,
     /// Shared templates for all threads
@@ -619,6 +648,7 @@ impl NativeAgent {
                 sessions: HashMap::default(),
                 pending_sessions: HashMap::default(),
                 thread_store,
+                loaded_thread_storage: HashMap::default(),
                 projects: HashMap::default(),
                 templates,
                 models: LanguageModels::new(cx),
@@ -807,7 +837,7 @@ impl NativeAgent {
         let prompt_capabilities_rx = thread.prompt_capabilities_rx.clone();
         let acp_thread = cx.new(|cx| {
             let mut acp_thread = acp_thread::AcpThread::new(
-                parent_session_id,
+                parent_session_id.clone(),
                 title,
                 None,
                 connection,
@@ -865,6 +895,18 @@ impl NativeAgent {
             }),
         ];
 
+        // Subagent threads are stored next to their parent thread.
+        let storage = match self.loaded_thread_storage.remove(&session_id) {
+            Some(storage) => storage,
+            None => match parent_session_id
+                .as_ref()
+                .and_then(|parent_session_id| self.sessions.get(parent_session_id))
+            {
+                Some(parent_session) => parent_session.storage.clone(),
+                None => ThreadStorage::for_project(&self.thread_store, &project, cx),
+            },
+        };
+
         let (save_wake, save_wake_rx) = watch::channel(());
         let pending_save: Arc<Mutex<Option<PendingThreadSave>>> = Arc::new(Mutex::new(None));
         let database_future = ThreadsDatabase::connect(cx);
@@ -872,11 +914,13 @@ impl NativeAgent {
         let save_worker = cx.spawn({
             let pending_save = pending_save.clone();
             let session_id = session_id.clone();
+            let storage = storage.clone();
             async move |_this, cx| {
                 Self::run_save_worker(
                     session_id,
                     save_wake_rx,
                     pending_save,
+                    storage,
                     database_future,
                     thread_store,
                     cx,
@@ -892,6 +936,7 @@ impl NativeAgent {
                 acp_thread: acp_thread.downgrade(),
                 subagents: Vec::new(),
                 project_id,
+                storage,
                 pending_save,
                 save_wake,
                 save_worker,
@@ -1645,14 +1690,36 @@ impl NativeAgent {
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Thread>>> {
         let database_future = ThreadsDatabase::connect(cx);
+        let remote_load = match ThreadStorage::for_project(&self.thread_store, &project, cx) {
+            ThreadStorage::Local => None,
+            ThreadStorage::Remote(remote) => Some((
+                remote.load_thread(id.clone(), cx.background_executor()),
+                remote,
+            )),
+        };
         cx.spawn(async move |this, cx| {
-            let database = database_future.await.map_err(|err| anyhow!(err))?;
-            let db_thread = database
-                .load_thread(id.clone())
-                .await?
-                .with_context(|| format!("no thread found with ID: {id:?}"))?;
+            // Threads of remote projects created before their threads were
+            // stored on the remote host are still in the local database.
+            let (db_thread, storage) = match remote_load {
+                Some((load, remote)) => match load.await? {
+                    Some(db_thread) => (Some(db_thread), ThreadStorage::Remote(remote)),
+                    None => (None, ThreadStorage::Local),
+                },
+                None => (None, ThreadStorage::Local),
+            };
+            let db_thread = match db_thread {
+                Some(db_thread) => db_thread,
+                None => {
+                    let database = database_future.await.map_err(|err| anyhow!(err))?;
+                    database
+                        .load_thread(id.clone())
+                        .await?
+                        .with_context(|| format!("no thread found with ID: {id:?}"))?
+                }
+            };
 
             this.update(cx, |this, cx| {
+                this.loaded_thread_storage.insert(id.clone(), storage);
                 let project_id = this.get_or_create_project_state(&project, cx);
                 let project_state = this
                     .projects
@@ -1816,7 +1883,7 @@ impl NativeAgent {
         let Some(session) = self.sessions.get(id) else {
             return;
         };
-        let Some((id, folder_paths, db_thread)) =
+        let Some((id, folder_paths, db_thread, _)) =
             self.thread_save_payload(session, draft_prompt, cx)
         else {
             return;
@@ -1836,6 +1903,7 @@ impl NativeAgent {
         id: acp_v1::SessionId,
         mut wake: watch::Receiver<()>,
         pending_save: Arc<Mutex<Option<PendingThreadSave>>>,
+        storage: ThreadStorage,
         database_future: Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>,
         thread_store: Entity<ThreadStore>,
         cx: &mut AsyncApp,
@@ -1847,18 +1915,41 @@ impl NativeAgent {
                 folder_paths,
                 db_thread,
             }) = payload
-                && let Some(database) = database_future
-                    .clone()
-                    .await
-                    .map_err(|err| anyhow!(err))
-                    .log_err()
             {
-                let db_thread = db_thread.await;
-                database
-                    .save_thread(id.clone(), db_thread, folder_paths)
-                    .await
-                    .log_err();
-                thread_store.update(cx, |store, cx| store.reload(cx));
+                match &storage {
+                    ThreadStorage::Local => {
+                        if let Some(database) = database_future
+                            .clone()
+                            .await
+                            .map_err(|err| anyhow!(err))
+                            .log_err()
+                        {
+                            let db_thread = db_thread.await;
+                            database
+                                .save_thread(id.clone(), db_thread, folder_paths)
+                                .await
+                                .log_err();
+                            thread_store.update(cx, |store, cx| store.reload(cx));
+                        }
+                    }
+                    ThreadStorage::Remote(remote) => {
+                        let db_thread = db_thread.await;
+                        let saved = remote
+                            .save_thread(
+                                id.clone(),
+                                db_thread,
+                                folder_paths,
+                                cx.background_executor(),
+                            )
+                            .await
+                            .log_err();
+                        if let Some(metadata) = saved {
+                            thread_store.update(cx, |store, cx| {
+                                store.record_remote_save(remote.host_id(), metadata, cx)
+                            });
+                        }
+                    }
+                }
             }
             if closed {
                 break;
@@ -1875,7 +1966,7 @@ impl NativeAgent {
         session: &Session,
         draft_prompt: Option<Vec<acp_v1::ContentBlock>>,
         cx: &mut App,
-    ) -> Option<(acp_v1::SessionId, PathList, Task<DbThread>)> {
+    ) -> Option<(acp_v1::SessionId, PathList, Task<DbThread>, ThreadStorage)> {
         if session.thread.read(cx).is_empty() {
             return None;
         }
@@ -1893,7 +1984,7 @@ impl NativeAgent {
             thread.set_draft_prompt(draft_prompt);
             thread.to_db(cx)
         });
-        Some((id, folder_paths, db_thread))
+        Some((id, folder_paths, db_thread, session.storage.clone()))
     }
 
     /// Commits every non-empty thread's content on shutdown so the async
@@ -1903,6 +1994,7 @@ impl NativeAgent {
         cx: &mut Context<Self>,
     ) -> impl Future<Output = ()> + use<> {
         let database_future = ThreadsDatabase::connect(cx);
+        let executor = cx.background_executor().clone();
 
         let mut saves = Vec::new();
         for session in self.sessions.values() {
@@ -1911,21 +2003,36 @@ impl NativeAgent {
         }
 
         async move {
-            let Some(database) = database_future.await.map_err(|err| anyhow!(err)).log_err() else {
-                return;
-            };
+            let database = database_future.await.map_err(|err| anyhow!(err)).log_err();
             // All quit observers share `gpui::SHUTDOWN_TIMEOUT`, so run the
             // saves concurrently instead of one at a time.
-            future::join_all(saves.into_iter().map(|(id, folder_paths, db_thread)| {
-                let database = database.clone();
-                async move {
-                    let db_thread = db_thread.await;
-                    database
-                        .save_thread(id, db_thread, folder_paths)
-                        .await
-                        .log_err();
-                }
-            }))
+            future::join_all(
+                saves
+                    .into_iter()
+                    .map(|(id, folder_paths, db_thread, storage)| {
+                        let database = database.clone();
+                        let executor = executor.clone();
+                        async move {
+                            let db_thread = db_thread.await;
+                            match storage {
+                                ThreadStorage::Local => {
+                                    if let Some(database) = database {
+                                        database
+                                            .save_thread(id, db_thread, folder_paths)
+                                            .await
+                                            .log_err();
+                                    }
+                                }
+                                ThreadStorage::Remote(remote) => {
+                                    remote
+                                        .save_thread(id, db_thread, folder_paths, &executor)
+                                        .await
+                                        .log_err();
+                                }
+                            }
+                        }
+                    }),
+            )
             .await;
         }
     }
