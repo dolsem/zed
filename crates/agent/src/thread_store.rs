@@ -1,9 +1,17 @@
-use crate::{DbThread, DbThreadMetadata, ThreadsDatabase};
+use crate::{DbThread, DbThreadMetadata, RemoteThreadStorage, ThreadsDatabase};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Result, anyhow};
-use futures::{FutureExt, future::Shared};
-use gpui::{App, Context, Entity, Global, Task, prelude::*};
+use client::proto;
+use collections::{HashMap, HashSet};
+use fs::Fs;
+use futures::{FutureExt, StreamExt as _, future::Shared};
+use gpui::{App, Context, Entity, EntityId, EventEmitter, Global, Subscription, Task, prelude::*};
+use project::Project;
+use remote::{RemoteClient, RemoteClientEvent};
+use std::{sync::Arc, time::Duration};
 use util::path_list::PathList;
+
+const CHANGES_WATCH_LATENCY: Duration = Duration::from_millis(300);
 
 struct GlobalThreadStore(Entity<ThreadStore>);
 
@@ -12,7 +20,31 @@ impl Global for GlobalThreadStore {}
 pub struct ThreadStore {
     threads: Vec<DbThreadMetadata>,
     reload_task: Shared<Task<()>>,
+    /// Remote hosts whose threads are stored in the host's own databases,
+    /// keyed by the entity id of their `RemoteClient`.
+    remote_hosts: HashMap<EntityId, RemoteThreadHost>,
+    _watch_local_changes: Option<Task<()>>,
 }
+
+struct RemoteThreadHost {
+    storage: RemoteThreadStorage,
+    threads: Vec<DbThreadMetadata>,
+    reload_task: Option<Task<()>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ThreadStoreEvent {
+    /// The threads stored on a remote host may have changed: the host was
+    /// added or reconnected, or a process on the host changed its threads.
+    RemoteHostChanged(EntityId),
+    RemoteHostRemoved(EntityId),
+    /// Another process on this machine (e.g. a remote server serving a client
+    /// connected to this machine) changed the local thread databases.
+    LocalThreadsChangedExternally,
+}
+
+impl EventEmitter<ThreadStoreEvent> for ThreadStore {}
 
 impl ThreadStore {
     pub fn init_global(cx: &mut App) {
@@ -33,7 +65,187 @@ impl ThreadStore {
         Self {
             threads: Vec::new(),
             reload_task,
+            remote_hosts: HashMap::default(),
+            _watch_local_changes: None,
         }
+    }
+
+    /// Keeps the store in sync with threads stored elsewhere: threads of
+    /// remote projects live on their remote host, and other processes on this
+    /// machine may write to the local databases.
+    pub fn start_syncing(this: &Entity<Self>, fs: Arc<dyn Fs>, cx: &mut App) {
+        let weak_store = this.downgrade();
+        cx.observe_new(move |project: &mut Project, _window, cx| {
+            let Some(remote_client) = project.remote_client() else {
+                return;
+            };
+            if project.is_via_collab() {
+                return;
+            }
+            weak_store
+                .update(cx, |store, cx| {
+                    store.register_remote_host(&remote_client, cx)
+                })
+                .ok();
+        })
+        .detach();
+
+        this.update(cx, |this, cx| {
+            this._watch_local_changes = Some(cx.spawn(async move |this, cx| {
+                let changes_dir = paths::agent_threads_changes_dir();
+                if let Err(error) = fs.create_dir(changes_dir).await {
+                    log::warn!("failed to create agent threads changes directory: {error}");
+                    return;
+                }
+                let own_marker = changes_dir.join(std::process::id().to_string());
+                let (mut events, _watcher) = fs.watch(changes_dir, CHANGES_WATCH_LATENCY).await;
+                while let Some(events) = events.next().await {
+                    if events.iter().all(|event| event.path == own_marker) {
+                        continue;
+                    }
+                    let updated = this.update(cx, |this, cx| {
+                        this.reload(cx);
+                        cx.emit(ThreadStoreEvent::LocalThreadsChangedExternally);
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
+                }
+            }));
+        });
+    }
+
+    /// Returns where threads of the given project are stored, if the project
+    /// is remote. Threads of local projects are stored in the local database.
+    pub fn remote_storage_for_project(
+        &mut self,
+        project: &Entity<Project>,
+        cx: &mut Context<Self>,
+    ) -> Option<RemoteThreadStorage> {
+        let project = project.read(cx);
+        if project.is_via_collab() {
+            return None;
+        }
+        let remote_client = project.remote_client()?;
+        self.register_remote_host(&remote_client, cx);
+        Some(
+            self.remote_hosts
+                .get(&remote_client.entity_id())?
+                .storage
+                .clone(),
+        )
+    }
+
+    pub fn remote_storages(&self) -> impl Iterator<Item = &RemoteThreadStorage> + '_ {
+        self.remote_hosts.values().map(|host| &host.storage)
+    }
+
+    pub fn remote_storage(&self, host_id: EntityId) -> Option<&RemoteThreadStorage> {
+        self.remote_hosts.get(&host_id).map(|host| &host.storage)
+    }
+
+    fn register_remote_host(
+        &mut self,
+        remote_client: &Entity<RemoteClient>,
+        cx: &mut Context<Self>,
+    ) {
+        let host_id = remote_client.entity_id();
+        if self.remote_hosts.contains_key(&host_id) {
+            return;
+        }
+
+        let (client, connection_options) = {
+            let remote_client = remote_client.read(cx);
+            (
+                remote_client.proto_client(),
+                remote_client.connection_options(),
+            )
+        };
+        client.add_request_handler(
+            cx.weak_entity(),
+            move |this, _: client::TypedEnvelope<proto::AgentThreadsChanged>, mut cx| async move {
+                this.update(&mut cx, |this, cx| this.reload_remote_host(host_id, cx));
+                Ok(proto::Ack {})
+            },
+        );
+
+        let subscriptions = vec![
+            cx.subscribe(remote_client, move |this, _, event, cx| {
+                if let RemoteClientEvent::Reconnected = event {
+                    this.reload_remote_host(host_id, cx);
+                }
+            }),
+            cx.observe_release(remote_client, move |this, _, cx| {
+                if this.remote_hosts.remove(&host_id).is_some() {
+                    cx.emit(ThreadStoreEvent::RemoteHostRemoved(host_id));
+                    cx.notify();
+                }
+            }),
+        ];
+
+        self.remote_hosts.insert(
+            host_id,
+            RemoteThreadHost {
+                storage: RemoteThreadStorage::new(host_id, client, connection_options),
+                threads: Vec::new(),
+                reload_task: None,
+                _subscriptions: subscriptions,
+            },
+        );
+        self.reload_remote_host(host_id, cx);
+    }
+
+    fn reload_remote_host(&mut self, host_id: EntityId, cx: &mut Context<Self>) {
+        let Some(host) = self.remote_hosts.get_mut(&host_id) else {
+            return;
+        };
+        let list = host.storage.list_threads();
+        host.reload_task = Some(cx.spawn(async move |this, cx| {
+            let threads = list.await;
+            this.update(cx, |this, cx| {
+                let Some(host) = this.remote_hosts.get_mut(&host_id) else {
+                    return;
+                };
+                match threads {
+                    Ok(threads) => {
+                        host.threads = threads
+                            .into_iter()
+                            .filter(|thread| thread.parent_session_id.is_none())
+                            .collect();
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        log::error!("failed to list threads of remote host: {error:#}");
+                    }
+                }
+                cx.emit(ThreadStoreEvent::RemoteHostChanged(host_id));
+            })
+            .ok();
+        }));
+    }
+
+    /// Records a thread that was just saved on a remote host, without
+    /// re-fetching the host's thread list.
+    pub(crate) fn record_remote_save(
+        &mut self,
+        host_id: EntityId,
+        metadata: DbThreadMetadata,
+        cx: &mut Context<Self>,
+    ) {
+        if metadata.parent_session_id.is_some() {
+            return;
+        }
+        let Some(host) = self.remote_hosts.get_mut(&host_id) else {
+            return;
+        };
+        host.threads.retain(|thread| thread.id != metadata.id);
+        let ix = host
+            .threads
+            .iter()
+            .position(|thread| thread.updated_at <= metadata.updated_at)
+            .unwrap_or(host.threads.len());
+        host.threads.insert(ix, metadata);
+        cx.notify();
     }
 
     /// Resolves when the most recently initiated reload has completed.
@@ -44,7 +256,19 @@ impl ThreadStore {
     }
 
     pub fn thread_from_session_id(&self, session_id: &acp::SessionId) -> Option<&DbThreadMetadata> {
-        self.threads.iter().find(|thread| &thread.id == session_id)
+        self.threads
+            .iter()
+            .chain(self.remote_hosts.values().flat_map(|host| &host.threads))
+            .find(|thread| &thread.id == session_id)
+    }
+
+    fn remote_host_for_session(&self, session_id: &acp::SessionId) -> Option<&RemoteThreadHost> {
+        if self.threads.iter().any(|thread| &thread.id == session_id) {
+            return None;
+        }
+        self.remote_hosts
+            .values()
+            .find(|host| host.threads.iter().any(|thread| &thread.id == session_id))
     }
 
     pub fn load_thread(
@@ -52,6 +276,9 @@ impl ThreadStore {
         id: acp::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<DbThread>>> {
+        if let Some(host) = self.remote_host_for_session(&id) {
+            return host.storage.load_thread(id, cx.background_executor());
+        }
         let database_future = ThreadsDatabase::connect(cx);
         cx.background_spawn(async move {
             let database = database_future.await.map_err(|err| anyhow!(err))?;
@@ -79,6 +306,14 @@ impl ThreadStore {
         id: acp::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if let Some(host) = self.remote_host_for_session(&id) {
+            let host_id = host.storage.host_id();
+            let delete = host.storage.delete_thread(id);
+            return cx.spawn(async move |this, cx| {
+                delete.await?;
+                this.update(cx, |this, cx| this.reload_remote_host(host_id, cx))
+            });
+        }
         let database_future = ThreadsDatabase::connect(cx);
         cx.spawn(async move |this, cx| {
             let database = database_future.await.map_err(|err| anyhow!(err))?;
@@ -126,14 +361,34 @@ impl ThreadStore {
 
     pub fn is_empty(&self) -> bool {
         self.threads.is_empty()
+            && self
+                .remote_hosts
+                .values()
+                .all(|host| host.threads.is_empty())
     }
 
+    /// Returns the threads stored locally and on all connected remote hosts,
+    /// most recently updated first.
     pub fn entries(&self) -> impl Iterator<Item = DbThreadMetadata> + '_ {
+        let mut seen = HashSet::default();
+        let mut entries = self
+            .threads
+            .iter()
+            .chain(self.remote_hosts.values().flat_map(|host| &host.threads))
+            .filter(|thread| seen.insert(thread.id.clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
+        entries.into_iter()
+    }
+
+    /// Returns the threads stored in the local database.
+    pub fn local_entries(&self) -> impl Iterator<Item = DbThreadMetadata> + '_ {
         self.threads.iter().cloned()
     }
 
     pub fn entry_ids(&self) -> impl Iterator<Item = acp::SessionId> + '_ {
-        self.threads.iter().map(|t| t.id.clone())
+        self.entries().map(|t| t.id)
     }
 }
 

@@ -69,3 +69,76 @@ message NewExternalAgentVersionAvailable {
   string name = 2;
   string version = 3;
 }
+
+// Agent thread storage shared with the remote host. Thread contents and sidebar
+// metadata for remote projects live in the host's databases, so that the Zed
+// running on the host sees the same threads.
+
+message AgentThreadSummary {
+  string id = 1;
+  optional string parent_id = 2;
+  optional string folder_paths = 3;
+  optional string folder_paths_order = 4;
+  string summary = 5;
+  string updated_at = 6;
+  optional string created_at = 7;
+}
+
+message ListAgentThreads {}
+
+message ListAgentThreadsResponse {
+  repeated AgentThreadSummary threads = 1;
+}
+
+message LoadAgentThread {
+  string id = 1;
+}
+
+message LoadAgentThreadResponse {
+  optional string data_type = 1;
+  optional bytes data = 2;
+}
+
+message SaveAgentThread {
+  AgentThreadSummary summary = 1;
+  string data_type = 2;
+  bytes data = 3;
+}
+
+message DeleteAgentThread {
+  string id = 1;
+}
+
+message AgentThreadMetadata {
+  bytes thread_id = 1;
+  optional string session_id = 2;
+  optional string agent_id = 3;
+  string title = 4;
+  string updated_at = 5;
+  optional string created_at = 6;
+  optional string interacted_at = 7;
+  optional string folder_paths = 8;
+  optional string folder_paths_order = 9;
+  bool archived = 10;
+  optional string main_worktree_paths = 11;
+  optional string main_worktree_paths_order = 12;
+  optional string title_override = 13;
+}
+
+message ListAgentThreadMetadata {}
+
+message ListAgentThreadMetadataResponse {
+  repeated AgentThreadMetadata threads = 1;
+}
+
+message SaveAgentThreadMetadata {
+  AgentThreadMetadata metadata = 1;
+}
+
+message DeleteAgentThreadMetadata {
+  bytes thread_id = 1;
+}
+
+// Sent by the remote server when another process on the host changed the
+// agent thread databases.
+message AgentThreadsChanged {}

@@ -1,9 +1,10 @@
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use agent::{ThreadStore, ZED_AGENT_ID};
+use agent::{RemoteThreadStorage, ThreadStore, ThreadStoreEvent, ZED_AGENT_ID};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
@@ -19,8 +20,8 @@ use db::{
     sqlez_macros::sql,
 };
 use fs::Fs;
-use futures::{FutureExt, future::Shared};
-use gpui::{AppContext as _, Entity, Global, Subscription, Task, TaskExt};
+use futures::{FutureExt, channel::oneshot, future::Shared};
+use gpui::{AppContext as _, Entity, EntityId, Global, Subscription, Task, TaskExt};
 pub use project::WorktreePaths;
 use project::{AgentId, linked_worktree_short_name};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
@@ -118,7 +119,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
 
         let mut to_migrate = thread_store.read_with(cx, |store, _cx| {
             store
-                .entries()
+                .local_entries()
                 .filter_map(|entry| {
                     if existing_session_ids.contains(&entry.id.0) {
                         return None;
@@ -505,15 +506,56 @@ pub struct ThreadMetadataStore {
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
-    pending_thread_ops_tx: async_channel::Sender<DbOperation>,
+    pending_thread_ops_tx: async_channel::Sender<DbRequest>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
     _db_operations_task: Task<()>,
+    /// Threads whose metadata is stored on a remote host (so that the Zed
+    /// running there sees them too), with the connection to that host.
+    remote_threads: HashMap<ThreadId, RemoteConnectionOptions>,
+    /// Writes to remote hosts, applied in order by `_remote_operations_task`.
+    remote_operations: VecDeque<(RemoteConnectionOptions, RemoteDbOperation)>,
+    /// Writes to remote hosts that weren't connected, retried on reconnect.
+    stalled_remote_operations: Vec<(RemoteConnectionOptions, RemoteDbOperation)>,
+    remote_operations_tx: async_channel::Sender<()>,
+    _remote_operations_task: Task<()>,
+    /// Incremented on every in-memory change to a thread. Reloads use it to
+    /// tell which threads changed after the reloaded rows were requested, so
+    /// that they don't revert changes that hadn't been written yet.
+    mutation_count: u64,
+    last_mutation: HashMap<ThreadId, u64>,
+    _thread_store_subscription: Option<Subscription>,
 }
 
 #[derive(Debug, PartialEq)]
 enum DbOperation {
     Upsert(ThreadMetadata),
     Delete(ThreadId),
+}
+
+enum DbRequest {
+    Operation(DbOperation),
+    /// Lists all rows once the operations requested before it were applied.
+    List(oneshot::Sender<anyhow::Result<Vec<ThreadMetadata>>>),
+}
+
+enum RemoteDbOperation {
+    Upsert(ThreadMetadata),
+    Delete(ThreadId),
+    /// Re-fetches the host's threads. `mutation_count` is the store's
+    /// mutation count when the list was requested.
+    List {
+        mutation_count: u64,
+    },
+}
+
+impl RemoteDbOperation {
+    fn thread_id(&self) -> Option<ThreadId> {
+        match self {
+            RemoteDbOperation::Upsert(metadata) => Some(metadata.thread_id),
+            RemoteDbOperation::Delete(thread_id) => Some(*thread_id),
+            RemoteDbOperation::List { .. } => None,
+        }
+    }
 }
 
 impl DbOperation {
@@ -655,28 +697,28 @@ impl ThreadMetadataStore {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
-        let db = self.db.clone();
         self.reload_task.take();
 
-        let list_task = cx
-            .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
+        let (tx, rx) = oneshot::channel();
+        self.pending_thread_ops_tx
+            .try_send(DbRequest::List(tx))
+            .log_err();
+        let mutation_count = self.mutation_count;
 
         let reload_task = cx
             .spawn(async move |this, cx| {
-                let Some(rows) = list_task.await.log_err() else {
+                let Some(rows) = rx
+                    .await
+                    .context("thread metadata database worker stopped")
+                    .and_then(|rows| rows)
+                    .context("Failed to fetch sidebar metadata")
+                    .log_err()
+                else {
                     return;
                 };
 
                 this.update(cx, |this, cx| {
-                    this.threads.clear();
-                    this.threads_by_paths.clear();
-                    this.threads_by_main_paths.clear();
-                    this.threads_by_session.clear();
-
-                    for row in rows {
-                        this.cache_thread_metadata(row);
-                    }
-
+                    this.apply_local_rows(rows, mutation_count);
                     cx.notify();
                 })
                 .ok();
@@ -686,15 +728,315 @@ impl ThreadMetadataStore {
         reload_task
     }
 
+    fn changed_since(&self, thread_id: ThreadId, mutation_count: u64) -> bool {
+        self.last_mutation
+            .get(&thread_id)
+            .is_some_and(|last_mutation| *last_mutation > mutation_count)
+    }
+
+    fn record_mutation(&mut self, thread_id: ThreadId) {
+        self.mutation_count += 1;
+        self.last_mutation.insert(thread_id, self.mutation_count);
+    }
+
+    fn rebuild_cache(&mut self, threads: HashMap<ThreadId, ThreadMetadata>) {
+        self.threads.clear();
+        self.threads_by_paths.clear();
+        self.threads_by_main_paths.clear();
+        self.threads_by_session.clear();
+        for thread in threads.into_values() {
+            self.cache_thread_metadata(thread);
+        }
+    }
+
+    /// Replaces the cached local threads with rows read from the local
+    /// database when `mutation_count` was current.
+    fn apply_local_rows(&mut self, rows: Vec<ThreadMetadata>, mutation_count: u64) {
+        let mut threads = HashMap::default();
+        for (thread_id, thread) in std::mem::take(&mut self.threads) {
+            if self.remote_threads.contains_key(&thread_id)
+                || self.changed_since(thread_id, mutation_count)
+            {
+                threads.insert(thread_id, thread);
+            }
+        }
+        for row in rows {
+            let thread_id = row.thread_id;
+            if self.remote_threads.contains_key(&thread_id)
+                || self.changed_since(thread_id, mutation_count)
+            {
+                continue;
+            }
+            threads.insert(thread_id, row);
+        }
+        self.rebuild_cache(threads);
+    }
+
+    /// Replaces the cached threads of a remote host with rows read from the
+    /// host when `mutation_count` was current.
+    fn apply_remote_rows(
+        &mut self,
+        connection: &RemoteConnectionOptions,
+        rows: Vec<ThreadMetadata>,
+        mutation_count: u64,
+    ) {
+        let on_host = |thread_connection: &RemoteConnectionOptions| {
+            same_remote_connection_identity(Some(thread_connection), Some(connection))
+        };
+        let mut threads = HashMap::default();
+        for (thread_id, thread) in std::mem::take(&mut self.threads) {
+            let is_on_host = self
+                .remote_threads
+                .get(&thread_id)
+                .is_some_and(|thread_connection| on_host(thread_connection));
+            if !is_on_host || self.changed_since(thread_id, mutation_count) {
+                threads.insert(thread_id, thread);
+            }
+        }
+        self.remote_threads.retain(|thread_id, thread_connection| {
+            !on_host(thread_connection) || threads.contains_key(thread_id)
+        });
+        for mut row in rows {
+            let thread_id = row.thread_id;
+            if self.changed_since(thread_id, mutation_count) {
+                continue;
+            }
+            // A thread kept in the local database takes precedence.
+            if threads.contains_key(&thread_id) && !self.remote_threads.contains_key(&thread_id) {
+                continue;
+            }
+            row.remote_connection = Some(connection.clone());
+            self.remote_threads.insert(thread_id, connection.clone());
+            threads.insert(thread_id, row);
+        }
+        self.rebuild_cache(threads);
+    }
+
+    fn remote_storage(
+        connection: &RemoteConnectionOptions,
+        cx: &App,
+    ) -> Option<RemoteThreadStorage> {
+        ThreadStore::try_global(cx)?
+            .read(cx)
+            .remote_storages()
+            .find(|storage| {
+                same_remote_connection_identity(
+                    Some(storage.connection_options()),
+                    Some(connection),
+                )
+            })
+            .cloned()
+    }
+
+    /// Returns the remote host the metadata should be written to, if any.
+    ///
+    /// Threads keep living where they were first persisted. New threads of
+    /// remote projects are stored on the host once they stop being drafts, as
+    /// long as the host is connected.
+    fn remote_connection_for_write(
+        &mut self,
+        metadata: &ThreadMetadata,
+        cx: &App,
+    ) -> Option<RemoteConnectionOptions> {
+        let thread_id = metadata.thread_id;
+        if let Some(connection) = self.remote_threads.get(&thread_id) {
+            return Some(connection.clone());
+        }
+        if metadata.is_draft()
+            || self
+                .threads
+                .get(&thread_id)
+                .is_some_and(|thread| !thread.is_draft())
+        {
+            return None;
+        }
+        let connection = metadata.remote_connection.as_ref()?;
+        Self::remote_storage(connection, cx)?;
+
+        self.remote_threads.insert(thread_id, connection.clone());
+        // Drop the row the thread had in the local database while it was a draft.
+        self.pending_thread_ops_tx
+            .try_send(DbRequest::Operation(DbOperation::Delete(thread_id)))
+            .log_err();
+        Some(connection.clone())
+    }
+
+    fn enqueue_write(&mut self, operation: DbOperation, cx: &App) {
+        let thread_id = match &operation {
+            DbOperation::Upsert(metadata) => metadata.thread_id,
+            DbOperation::Delete(thread_id) => *thread_id,
+        };
+        self.record_mutation(thread_id);
+
+        let remote_connection = match &operation {
+            DbOperation::Upsert(metadata) => self.remote_connection_for_write(metadata, cx),
+            DbOperation::Delete(thread_id) => self.remote_threads.remove(thread_id),
+        };
+        match remote_connection {
+            Some(connection) => {
+                let operation = match operation {
+                    DbOperation::Upsert(metadata) => RemoteDbOperation::Upsert(metadata),
+                    DbOperation::Delete(thread_id) => RemoteDbOperation::Delete(thread_id),
+                };
+                self.remote_operations.push_back((connection, operation));
+                self.remote_operations_tx.try_send(()).log_err();
+            }
+            None => {
+                self.pending_thread_ops_tx
+                    .try_send(DbRequest::Operation(operation))
+                    .log_err();
+            }
+        }
+    }
+
+    /// Takes the next remote operation whose host is connected.
+    fn next_remote_operation(
+        &mut self,
+        cx: &App,
+    ) -> Option<(
+        RemoteConnectionOptions,
+        RemoteDbOperation,
+        RemoteThreadStorage,
+    )> {
+        while let Some((connection, operation)) = self.remote_operations.pop_front() {
+            // A later write to the same thread supersedes this one.
+            if let Some(thread_id) = operation.thread_id()
+                && self
+                    .remote_operations
+                    .iter()
+                    .any(|(_, later)| later.thread_id() == Some(thread_id))
+            {
+                continue;
+            }
+            match Self::remote_storage(&connection, cx) {
+                Some(storage) => return Some((connection, operation, storage)),
+                None => {
+                    if operation.thread_id().is_some() {
+                        self.stalled_remote_operations.push((connection, operation));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    async fn run_remote_operations(
+        this: gpui::WeakEntity<Self>,
+        wake: async_channel::Receiver<()>,
+        cx: &mut gpui::AsyncApp,
+    ) {
+        while wake.recv().await.is_ok() {
+            loop {
+                let Ok(Some((connection, operation, storage))) =
+                    this.update(cx, |this, cx| this.next_remote_operation(cx))
+                else {
+                    break;
+                };
+                let client = storage.client().clone();
+                let result = match &operation {
+                    RemoteDbOperation::Upsert(metadata) => client
+                        .request(proto::SaveAgentThreadMetadata {
+                            metadata: Some(metadata_to_proto(metadata)),
+                        })
+                        .await
+                        .map(|_| ()),
+                    RemoteDbOperation::Delete(thread_id) => client
+                        .request(proto::DeleteAgentThreadMetadata {
+                            thread_id: thread_id.0.as_bytes().to_vec(),
+                        })
+                        .await
+                        .map(|_| ()),
+                    RemoteDbOperation::List { mutation_count } => {
+                        let mutation_count = *mutation_count;
+                        let Some(response) = client
+                            .request(proto::ListAgentThreadMetadata {})
+                            .await
+                            .context("failed to list thread metadata of remote host")
+                            .log_err()
+                        else {
+                            continue;
+                        };
+                        let rows = response
+                            .threads
+                            .into_iter()
+                            .filter_map(|row| metadata_from_proto(row).log_err())
+                            .collect();
+                        this.update(cx, |this, cx| {
+                            this.apply_remote_rows(&connection, rows, mutation_count);
+                            cx.notify();
+                        })
+                        .ok();
+                        continue;
+                    }
+                };
+                if let Err(error) = result {
+                    log::error!("failed to write thread metadata to remote host: {error:#}");
+                    // Retry once the host reconnects.
+                    this.update(cx, |this, _| {
+                        this.stalled_remote_operations.push((connection, operation));
+                    })
+                    .ok();
+                }
+            }
+        }
+    }
+
+    fn handle_thread_store_event(
+        &mut self,
+        thread_store: Entity<ThreadStore>,
+        event: &ThreadStoreEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ThreadStoreEvent::RemoteHostChanged(host_id) => {
+                self.reload_remote_host(&thread_store, *host_id, cx);
+            }
+            ThreadStoreEvent::RemoteHostRemoved(_) => {}
+            ThreadStoreEvent::LocalThreadsChangedExternally => {
+                let _ = self.reload(cx);
+            }
+        }
+    }
+
+    fn reload_remote_host(
+        &mut self,
+        thread_store: &Entity<ThreadStore>,
+        host_id: EntityId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection) = thread_store
+            .read(cx)
+            .remote_storage(host_id)
+            .map(|storage| storage.connection_options().clone())
+        else {
+            return;
+        };
+        // Retry writes made while the host wasn't connected.
+        let (stalled, still_stalled) = std::mem::take(&mut self.stalled_remote_operations)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(stalled_connection, _)| {
+                same_remote_connection_identity(Some(stalled_connection), Some(&connection))
+            });
+        self.stalled_remote_operations = still_stalled;
+        self.remote_operations.extend(stalled);
+        self.remote_operations.push_back((
+            connection,
+            RemoteDbOperation::List {
+                mutation_count: self.mutation_count,
+            },
+        ));
+        self.remote_operations_tx.try_send(()).log_err();
+    }
+
     pub fn save_all(&mut self, metadata: Vec<ThreadMetadata>, cx: &mut Context<Self>) {
         for metadata in metadata {
-            self.save_internal(metadata);
+            self.save_internal(metadata, cx);
         }
         cx.notify();
     }
 
     pub fn save(&mut self, metadata: ThreadMetadata, cx: &mut Context<Self>) {
-        self.save_internal(metadata);
+        self.save_internal(metadata, cx);
         cx.notify();
     }
 
@@ -738,7 +1080,11 @@ impl ThreadMetadataStore {
         self.save(metadata, cx);
     }
 
-    fn save_internal(&mut self, metadata: ThreadMetadata) {
+    fn save_internal(&mut self, metadata: ThreadMetadata, cx: &App) {
+        // Route the write before caching, which changes whether the thread
+        // counts as already persisted.
+        self.enqueue_write(DbOperation::Upsert(metadata.clone()), cx);
+
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
             if thread.folder_paths() != metadata.folder_paths() {
                 if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
@@ -757,10 +1103,7 @@ impl ThreadMetadataStore {
             }
         }
 
-        self.cache_thread_metadata(metadata.clone());
-        self.pending_thread_ops_tx
-            .try_send(DbOperation::Upsert(metadata))
-            .log_err();
+        self.cache_thread_metadata(metadata);
     }
 
     fn cache_thread_metadata(&mut self, metadata: ThreadMetadata) {
@@ -797,14 +1140,17 @@ impl ThreadMetadataStore {
                 !thread.archived,
                 "update_working_directories called on archived thread"
             );
-            self.save_internal(ThreadMetadata {
-                worktree_paths: WorktreePaths::from_path_lists(
-                    thread.main_worktree_paths().clone(),
-                    work_dirs.clone(),
-                )
-                .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&work_dirs)),
-                ..thread.clone()
-            });
+            self.save_internal(
+                ThreadMetadata {
+                    worktree_paths: WorktreePaths::from_path_lists(
+                        thread.main_worktree_paths().clone(),
+                        work_dirs.clone(),
+                    )
+                    .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&work_dirs)),
+                    ..thread.clone()
+                },
+                cx,
+            );
             cx.notify();
         }
     }
@@ -829,10 +1175,13 @@ impl ThreadMetadataStore {
             if thread.archived {
                 continue;
             }
-            self.save_internal(ThreadMetadata {
-                worktree_paths: worktree_paths.clone(),
-                ..thread.clone()
-            });
+            self.save_internal(
+                ThreadMetadata {
+                    worktree_paths: worktree_paths.clone(),
+                    ..thread.clone()
+                },
+                cx,
+            );
             changed = true;
         }
         if changed {
@@ -847,10 +1196,13 @@ impl ThreadMetadataStore {
         cx: &mut Context<Self>,
     ) {
         if let Some(thread) = self.threads.get(thread_id) {
-            self.save_internal(ThreadMetadata {
-                interacted_at: Some(time),
-                ..thread.clone()
-            });
+            self.save_internal(
+                ThreadMetadata {
+                    interacted_at: Some(time),
+                    ..thread.clone()
+                },
+                cx,
+            );
             cx.notify();
         };
     }
@@ -931,14 +1283,17 @@ impl ThreadMetadataStore {
                 }
             }
             let new_folder_paths = PathList::new(&paths);
-            self.save_internal(ThreadMetadata {
-                worktree_paths: WorktreePaths::from_path_lists(
-                    thread.main_worktree_paths().clone(),
-                    new_folder_paths.clone(),
-                )
-                .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&new_folder_paths)),
-                ..thread
-            });
+            self.save_internal(
+                ThreadMetadata {
+                    worktree_paths: WorktreePaths::from_path_lists(
+                        thread.main_worktree_paths().clone(),
+                        new_folder_paths.clone(),
+                    )
+                    .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&new_folder_paths)),
+                    ..thread
+                },
+                cx,
+            );
             cx.notify();
         }
     }
@@ -959,14 +1314,17 @@ impl ThreadMetadataStore {
                 }
             }
             let new_folder_paths = PathList::new(&paths);
-            self.save_internal(ThreadMetadata {
-                worktree_paths: WorktreePaths::from_path_lists(
-                    thread.main_worktree_paths().clone(),
-                    new_folder_paths.clone(),
-                )
-                .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&new_folder_paths)),
-                ..thread
-            });
+            self.save_internal(
+                ThreadMetadata {
+                    worktree_paths: WorktreePaths::from_path_lists(
+                        thread.main_worktree_paths().clone(),
+                        new_folder_paths.clone(),
+                    )
+                    .unwrap_or_else(|_| WorktreePaths::from_folder_paths(&new_folder_paths)),
+                    ..thread
+                },
+                cx,
+            );
             cx.notify();
         }
     }
@@ -1035,9 +1393,8 @@ impl ThreadMetadataStore {
                     .or_default()
                     .insert(*thread_id);
 
-                self.pending_thread_ops_tx
-                    .try_send(DbOperation::Upsert(thread.clone()))
-                    .log_err();
+                let thread = thread.clone();
+                self.enqueue_write(DbOperation::Upsert(thread), cx);
             }
         }
 
@@ -1129,10 +1486,13 @@ impl ThreadMetadataStore {
 
     fn update_archived(&mut self, thread_id: ThreadId, archived: bool, cx: &mut Context<Self>) {
         if let Some(thread) = self.threads.get(&thread_id) {
-            self.save_internal(ThreadMetadata {
-                archived,
-                ..thread.clone()
-            });
+            self.save_internal(
+                ThreadMetadata {
+                    archived,
+                    ..thread.clone()
+                },
+                cx,
+            );
             cx.notify();
         }
     }
@@ -1155,9 +1515,7 @@ impl ThreadMetadataStore {
             }
         }
         self.threads.remove(&thread_id);
-        self.pending_thread_ops_tx
-            .try_send(DbOperation::Delete(thread_id))
-            .log_err();
+        self.enqueue_write(DbOperation::Delete(thread_id), cx);
         crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         cx.notify();
     }
@@ -1211,16 +1569,25 @@ impl ThreadMetadataStore {
         })
         .detach();
 
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = async_channel::unbounded::<DbRequest>();
         let _db_operations_task = cx.background_spawn({
             let db = db.clone();
             async move {
-                while let Ok(first_update) = rx.recv().await {
-                    let mut updates = vec![first_update];
-                    while let Ok(update) = rx.try_recv() {
-                        updates.push(update);
+                while let Ok(first_request) = rx.recv().await {
+                    let mut requests = vec![first_request];
+                    while let Ok(request) = rx.try_recv() {
+                        requests.push(request);
+                    }
+                    let mut updates = Vec::new();
+                    let mut list_requests = Vec::new();
+                    for request in requests {
+                        match request {
+                            DbRequest::Operation(operation) => updates.push(operation),
+                            DbRequest::List(tx) => list_requests.push(tx),
+                        }
                     }
                     let updates = Self::dedup_db_operations(updates);
+                    let wrote = !updates.is_empty();
                     for operation in updates {
                         match operation {
                             DbOperation::Upsert(metadata) => {
@@ -1231,9 +1598,23 @@ impl ThreadMetadataStore {
                             }
                         }
                     }
+                    if wrote && cfg!(not(any(test, feature = "test-support"))) {
+                        paths::touch_agent_threads_changed_marker().log_err();
+                    }
+                    for tx in list_requests {
+                        tx.send(db.list()).ok();
+                    }
                 }
             }
         });
+
+        let (remote_operations_tx, remote_operations_rx) = async_channel::unbounded();
+        let _remote_operations_task = cx.spawn(async move |this, cx| {
+            Self::run_remote_operations(this, remote_operations_rx, cx).await
+        });
+
+        let _thread_store_subscription = ThreadStore::try_global(cx)
+            .map(|thread_store| cx.subscribe(&thread_store, Self::handle_thread_store_event));
 
         let mut this = Self {
             db,
@@ -1246,7 +1627,25 @@ impl ThreadMetadataStore {
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
             _db_operations_task,
+            remote_threads: HashMap::default(),
+            remote_operations: VecDeque::new(),
+            stalled_remote_operations: Vec::new(),
+            remote_operations_tx,
+            _remote_operations_task,
+            mutation_count: 0,
+            last_mutation: HashMap::default(),
+            _thread_store_subscription,
         };
+        if let Some(thread_store) = ThreadStore::try_global(cx) {
+            let host_ids = thread_store
+                .read(cx)
+                .remote_storages()
+                .map(|storage| storage.host_id())
+                .collect::<Vec<_>>();
+            for host_id in host_ids {
+                this.reload_remote_host(&thread_store, host_id, cx);
+            }
+        }
         let _ = this.reload(cx);
         this
     }
@@ -1791,6 +2190,107 @@ impl Column for ThreadMetadata {
             next,
         ))
     }
+}
+
+/// Converts metadata to the form it is stored in on a remote host. Mirrors
+/// [`ThreadMetadataDb::save`]; the host stores no remote connection, since
+/// the thread is local to it.
+fn metadata_to_proto(metadata: &ThreadMetadata) -> proto::AgentThreadMetadata {
+    let serialize_paths = |paths: &PathList| {
+        if paths.is_empty() {
+            (None, None)
+        } else {
+            let serialized = paths.serialize();
+            (Some(serialized.paths), Some(serialized.order))
+        }
+    };
+    let (folder_paths, folder_paths_order) = serialize_paths(metadata.folder_paths());
+    let (main_worktree_paths, main_worktree_paths_order) =
+        serialize_paths(metadata.main_worktree_paths());
+    proto::AgentThreadMetadata {
+        thread_id: metadata.thread_id.0.as_bytes().to_vec(),
+        session_id: metadata
+            .session_id
+            .as_ref()
+            .map(|session_id| session_id.0.to_string()),
+        agent_id: if metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref() {
+            None
+        } else {
+            Some(metadata.agent_id.to_string())
+        },
+        title: metadata
+            .title
+            .as_ref()
+            .map(|title| title.to_string())
+            .unwrap_or_default(),
+        updated_at: metadata.updated_at.to_rfc3339(),
+        created_at: metadata.created_at.map(|dt| dt.to_rfc3339()),
+        interacted_at: metadata.interacted_at.map(|dt| dt.to_rfc3339()),
+        folder_paths,
+        folder_paths_order,
+        archived: metadata.archived,
+        main_worktree_paths,
+        main_worktree_paths_order,
+        title_override: metadata
+            .title_override
+            .as_ref()
+            .map(|title| title.to_string()),
+    }
+}
+
+/// Converts metadata stored on a remote host. Mirrors the [`Column`]
+/// implementation of [`ThreadMetadata`].
+fn metadata_from_proto(row: proto::AgentThreadMetadata) -> anyhow::Result<ThreadMetadata> {
+    let parse_timestamp = |value: &str| -> anyhow::Result<DateTime<Utc>> {
+        Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
+    };
+    let deserialize_paths = |paths: Option<String>, order: Option<String>| {
+        paths
+            .map(|paths| {
+                PathList::deserialize(&util::path_list::SerializedPathList {
+                    paths,
+                    order: order.unwrap_or_default(),
+                })
+            })
+            .unwrap_or_default()
+    };
+
+    let thread_id = ThreadId(
+        uuid::Uuid::from_slice(&row.thread_id).context("invalid thread id from remote host")?,
+    );
+    let folder_paths = deserialize_paths(row.folder_paths, row.folder_paths_order);
+    let main_worktree_paths =
+        deserialize_paths(row.main_worktree_paths, row.main_worktree_paths_order);
+    let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
+        .unwrap_or_else(|_| WorktreePaths::default());
+
+    Ok(ThreadMetadata {
+        thread_id,
+        session_id: row.session_id.map(acp::SessionId::new),
+        agent_id: row
+            .agent_id
+            .map(AgentId::new)
+            .unwrap_or(ZED_AGENT_ID.clone()),
+        title: if row.title.is_empty() || row.title == DEFAULT_THREAD_TITLE {
+            None
+        } else {
+            Some(row.title.into())
+        },
+        title_override: row
+            .title_override
+            .filter(|title| !title.is_empty())
+            .map(SharedString::from),
+        updated_at: parse_timestamp(&row.updated_at)?,
+        created_at: row.created_at.as_deref().map(parse_timestamp).transpose()?,
+        interacted_at: row
+            .interacted_at
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?,
+        worktree_paths,
+        remote_connection: None,
+        archived: row.archived,
+    })
 }
 
 impl Column for ArchivedGitWorktree {

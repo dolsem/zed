@@ -242,6 +242,29 @@ pub fn remote_server_state_dir() -> &'static PathBuf {
     REMOTE_SERVER_STATE.get_or_init(|| data_dir().join("server_state"))
 }
 
+/// Returns the directory where processes sharing the agent thread databases
+/// (Zed and the remote server on the same host) record that they wrote to them.
+/// Each process touches a file named after its PID, so watchers can tell their
+/// own writes apart from writes made by other processes.
+pub fn agent_threads_changes_dir() -> &'static PathBuf {
+    static CHANGES_DIR: OnceLock<PathBuf> = OnceLock::new();
+    CHANGES_DIR.get_or_init(|| data_dir().join("threads").join("changes"))
+}
+
+/// Records that this process wrote to the agent thread databases.
+pub fn touch_agent_threads_changed_marker() -> std::io::Result<()> {
+    let dir = agent_threads_changes_dir();
+    std::fs::create_dir_all(dir)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::fs::write(
+        dir.join(std::process::id().to_string()),
+        timestamp.to_string(),
+    )
+}
+
 /// Returns the path to the `Zed.log` file.
 pub fn log_file() -> &'static PathBuf {
     static LOG_FILE: OnceLock<PathBuf> = OnceLock::new();

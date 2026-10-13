@@ -434,6 +434,17 @@ messages!(
     (KillKernel, Background),
     (GetRemoteProfilingData, Background),
     (GetRemoteProfilingDataResponse, Background),
+    (ListAgentThreads, Background),
+    (ListAgentThreadsResponse, Background),
+    (LoadAgentThread, Background),
+    (LoadAgentThreadResponse, Background),
+    (SaveAgentThread, Background),
+    (DeleteAgentThread, Background),
+    (ListAgentThreadMetadata, Background),
+    (ListAgentThreadMetadataResponse, Background),
+    (SaveAgentThreadMetadata, Background),
+    (DeleteAgentThreadMetadata, Background),
+    (AgentThreadsChanged, Foreground),
 );
 
 request_messages!(
@@ -674,6 +685,14 @@ request_messages!(
     (SpawnKernel, SpawnKernelResponse),
     (KillKernel, Ack),
     (GetRemoteProfilingData, GetRemoteProfilingDataResponse),
+    (ListAgentThreads, ListAgentThreadsResponse),
+    (LoadAgentThread, LoadAgentThreadResponse),
+    (SaveAgentThread, Ack),
+    (DeleteAgentThread, Ack),
+    (ListAgentThreadMetadata, ListAgentThreadMetadataResponse),
+    (SaveAgentThreadMetadata, Ack),
+    (DeleteAgentThreadMetadata, Ack),
+    (AgentThreadsChanged, Ack),
 );
 
 lsp_messages!(

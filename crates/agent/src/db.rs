@@ -367,31 +367,61 @@ pub enum DataType {
     Zstd,
 }
 
-impl Bind for DataType {
-    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        let value = match self {
+impl DataType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
             DataType::Json => "json",
             DataType::Zstd => "zstd",
-        };
-        value.bind(statement, start_index)
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "json" => Ok(DataType::Json),
+            "zstd" => Ok(DataType::Zstd),
+            _ => anyhow::bail!("Unknown data type: {}", value),
+        }
+    }
+}
+
+impl Bind for DataType {
+    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
+        self.as_str().bind(statement, start_index)
     }
 }
 
 impl Column for DataType {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (value, next_index) = String::column(statement, start_index)?;
-        let data_type = match value.as_str() {
-            "json" => DataType::Json,
-            "zstd" => DataType::Zstd,
-            _ => anyhow::bail!("Unknown data type: {}", value),
-        };
-        Ok((data_type, next_index))
+        Ok((DataType::parse(&value)?, next_index))
     }
+}
+
+/// Serializes a thread into the compressed form it is stored in.
+pub(crate) fn serialize_thread(thread: DbThread) -> Result<(DataType, Vec<u8>)> {
+    const COMPRESSION_LEVEL: i32 = 3;
+
+    #[derive(Serialize)]
+    struct SerializedThread {
+        #[serde(flatten)]
+        thread: DbThread,
+        version: &'static str,
+    }
+
+    let json_data = serde_json::to_string(&SerializedThread {
+        thread,
+        version: DbThread::VERSION,
+    })?;
+    let compressed = zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?;
+    Ok((DataType::Zstd, compressed))
 }
 
 pub(crate) struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
+    /// Whether writes are announced to other processes sharing the database
+    /// through [`paths::touch_agent_threads_changed_marker`].
+    announce_writes: bool,
     /// In production, saves take real time (serialization, zstd, disk I/O) while
     /// the user keeps typing, so new save requests routinely arrive mid-write.
     /// The test executor completes writes instantly, so tests use this gate to
@@ -427,6 +457,7 @@ impl ThreadsDatabase {
     }
 
     pub fn new(executor: BackgroundExecutor) -> Result<Self> {
+        let announce_writes = !*ZED_STATELESS && !cfg!(any(feature = "test-support", test));
         let connection = if *ZED_STATELESS {
             Connection::open_memory(Some("THREAD_FALLBACK_DB"))
         } else if cfg!(any(feature = "test-support", test)) {
@@ -487,11 +518,20 @@ impl ThreadsDatabase {
         let db = Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
+            announce_writes,
             #[cfg(test)]
             write_gate: Mutex::new(None),
         };
 
         Ok(db)
+    }
+
+    fn announce_write(announce_writes: bool) {
+        if announce_writes {
+            if let Err(error) = paths::touch_agent_threads_changed_marker() {
+                log::warn!("failed to touch agent threads change marker: {error}");
+            }
+        }
     }
 
     fn save_thread_sync(
@@ -500,15 +540,6 @@ impl ThreadsDatabase {
         thread: DbThread,
         folder_paths: &PathList,
     ) -> Result<()> {
-        const COMPRESSION_LEVEL: i32 = 3;
-
-        #[derive(Serialize)]
-        struct SerializedThread {
-            #[serde(flatten)]
-            thread: DbThread,
-            version: &'static str,
-        }
-
         let title = thread.title.to_string();
         let updated_at = thread.updated_at.to_rfc3339();
         let parent_id = thread
@@ -525,16 +556,9 @@ impl ThreadsDatabase {
                     Some(serialized_folder_paths.order),
                 )
             };
-        let json_data = serde_json::to_string(&SerializedThread {
-            thread,
-            version: DbThread::VERSION,
-        })?;
+        let (data_type, data) = serialize_thread(thread)?;
 
         let connection = connection.lock();
-
-        let compressed = zstd::encode_all(json_data.as_bytes(), COMPRESSION_LEVEL)?;
-        let data_type = DataType::Zstd;
-        let data = compressed;
 
         // Use the thread's updated_at as created_at for new threads.
         // This ensures the creation time reflects when the thread was conceptually
@@ -637,6 +661,7 @@ impl ThreadsDatabase {
         folder_paths: PathList,
     ) -> Task<Result<()>> {
         let connection = self.connection.clone();
+        let announce_writes = self.announce_writes;
         #[cfg(test)]
         let write_gate = self.write_gate.lock().clone();
 
@@ -645,7 +670,9 @@ impl ThreadsDatabase {
             if let Some(write_gate) = write_gate {
                 write_gate.await.ok();
             }
-            Self::save_thread_sync(&connection, id, thread, &folder_paths)
+            Self::save_thread_sync(&connection, id, thread, &folder_paths)?;
+            Self::announce_write(announce_writes);
+            Ok(())
         })
     }
 
@@ -654,7 +681,7 @@ impl ThreadsDatabase {
         *self.write_gate.lock() = Some(gate.shared());
     }
 
-    fn deserialize_thread(data_type: DataType, data: Vec<u8>) -> Result<DbThread> {
+    pub(crate) fn deserialize_thread(data_type: DataType, data: Vec<u8>) -> Result<DbThread> {
         let json_data = match data_type {
             DataType::Zstd => {
                 let decompressed = zstd::decode_all(&data[..])?;
@@ -690,6 +717,7 @@ impl ThreadsDatabase {
 
     pub fn delete_thread(&self, id: acp::SessionId) -> Task<Result<()>> {
         let connection = self.connection.clone();
+        let announce_writes = self.announce_writes;
 
         self.executor.spawn(async move {
             let sandboxed_terminal_temp_dirs = {
@@ -732,6 +760,7 @@ impl ThreadsDatabase {
 
                 sandboxed_terminal_temp_dirs
             };
+            Self::announce_write(announce_writes);
 
             for temp_dir in sandboxed_terminal_temp_dirs {
                 Self::remove_sandboxed_terminal_temp_dir(temp_dir);
@@ -743,6 +772,7 @@ impl ThreadsDatabase {
 
     pub fn delete_threads(&self) -> Task<Result<()>> {
         let connection = self.connection.clone();
+        let announce_writes = self.announce_writes;
 
         self.executor.spawn(async move {
             let sandboxed_terminal_temp_dirs = {
@@ -767,6 +797,7 @@ impl ThreadsDatabase {
 
                 sandboxed_terminal_temp_dirs
             };
+            Self::announce_write(announce_writes);
 
             for temp_dir in sandboxed_terminal_temp_dirs {
                 Self::remove_sandboxed_terminal_temp_dir(temp_dir);
