@@ -956,13 +956,34 @@ impl ThreadMetadataStore {
                         else {
                             continue;
                         };
+                        let row_count = response.threads.len();
                         let rows = response
                             .threads
                             .into_iter()
                             .filter_map(|row| metadata_from_proto(row).log_err())
-                            .collect();
+                            .collect::<Vec<_>>();
+                        let folder_paths = rows
+                            .iter()
+                            .map(|row| format!("{:?}", row.folder_paths().paths()))
+                            .collect::<std::collections::BTreeSet<_>>();
+                        log::info!(
+                            "listed {row_count} thread metadata rows on remote host {} ({} parsed), folder paths: {folder_paths:?}",
+                            connection.display_name(),
+                            rows.len(),
+                        );
                         this.update(cx, |this, cx| {
                             this.apply_remote_rows(&connection, rows, mutation_count);
+                            log::info!(
+                                "{} threads cached for remote host {}",
+                                this.remote_threads
+                                    .values()
+                                    .filter(|thread_connection| same_remote_connection_identity(
+                                        Some(thread_connection),
+                                        Some(&connection)
+                                    ))
+                                    .count(),
+                                connection.display_name(),
+                            );
                             cx.notify();
                         })
                         .ok();
@@ -1011,6 +1032,10 @@ impl ThreadMetadataStore {
         else {
             return;
         };
+        log::info!(
+            "requesting thread metadata of remote host {}",
+            connection.display_name()
+        );
         // Retry writes made while the host wasn't connected.
         let (stalled, still_stalled) = std::mem::take(&mut self.stalled_remote_operations)
             .into_iter()

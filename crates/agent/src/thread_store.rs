@@ -161,6 +161,10 @@ impl ThreadStore {
                 remote_client.connection_options(),
             )
         };
+        log::info!(
+            "storing threads of remote host {} on the host",
+            connection_options.display_name()
+        );
         client.add_request_handler(
             cx.weak_entity(),
             move |this, _: client::TypedEnvelope<proto::AgentThreadsChanged>, mut cx| async move {
@@ -208,6 +212,7 @@ impl ThreadStore {
                 };
                 match threads {
                     Ok(threads) => {
+                        log::info!("listed {} threads on remote host", threads.len());
                         host.threads = threads
                             .into_iter()
                             .filter(|thread| thread.parent_session_id.is_none())

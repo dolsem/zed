@@ -238,9 +238,10 @@ impl AgentThreadsHost {
                  WHERE remote_connection IS NULL AND thread_id IS NOT NULL \
                  ORDER BY updated_at DESC",
             )?()?;
-            Ok(rows.into_iter().map(|row| row.0).collect())
+            Ok(rows.into_iter().map(|row| row.0).collect::<Vec<_>>())
         })
         .await?;
+        log::info!("sending {} thread metadata rows to client", threads.len());
         Ok(proto::ListAgentThreadMetadataResponse { threads })
     }
 
