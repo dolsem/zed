@@ -15783,6 +15783,95 @@ async fn test_find_or_create_workspace_returns_the_created_remote_workspace(
     );
 }
 
+#[gpui::test]
+async fn test_restore_remote_workspaces_reopens_remote_groups_in_background(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let local_project = init_test_project("/local", cx).await;
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    server_cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(local_project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let local_workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree("/remote-project", serde_json::json!({ "src": {} }))
+        .await;
+    let (opts, server_session, _) = remote::RemoteClient::fake_server(cx, server_cx);
+    server_cx.update(remote_server::HeadlessProject::init);
+    let server_executor = server_cx.executor();
+    let _headless = server_cx.new(|cx| {
+        remote_server::HeadlessProject::new(
+            remote_server::HeadlessAppState {
+                session: server_session,
+                fs: server_fs.clone(),
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            false,
+            cx,
+        )
+    });
+    // As after launch: the remote group is remembered, but has no workspace.
+    let remote_key = ProjectGroupKey::new(
+        Some(opts),
+        PathList::new(&[PathBuf::from("/remote-project")]),
+    );
+    multi_workspace.update(cx, |mw, cx| {
+        mw.restore_project_groups(
+            vec![workspace::SerializedProjectGroupState {
+                key: remote_key.clone(),
+                expanded: true,
+            }],
+            cx,
+        );
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        workspace::Sidebar::restore_remote_workspaces(sidebar, window, cx);
+    });
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+
+    let remote_workspaces = multi_workspace.read_with(cx, |mw, cx| {
+        mw.workspaces_for_project_group(&remote_key, cx)
+    });
+    assert_eq!(
+        remote_workspaces.len(),
+        1,
+        "the remote group's workspace should be reopened"
+    );
+    assert_eq!(
+        multi_workspace.read_with(cx, |mw, _| mw.workspace().clone()),
+        local_workspace,
+        "reopening in the background should keep the active workspace"
+    );
+
+    // Restoring again (e.g. a second window restore) doesn't open duplicates.
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        workspace::Sidebar::restore_remote_workspaces(sidebar, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        multi_workspace
+            .read_with(cx, |mw, cx| mw
+                .workspaces_for_project_group(&remote_key, cx))
+            .len(),
+        1
+    );
+}
+
 fn set_sidebar_test_surface_alpha(alpha: f32, cx: &mut VisualTestContext) {
     cx.update(|window, cx| {
         let mut theme = cx.theme().as_ref().clone();

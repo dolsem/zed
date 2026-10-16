@@ -25,7 +25,7 @@ use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
-use crate::open_remote_project_with_existing_connection;
+use crate::open_remote_project_with_existing_connection_impl;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
     Panel, Workspace, WorkspaceId, client_side_decorations,
@@ -157,6 +157,10 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
         _cx: &mut Context<Self>,
     ) {
     }
+
+    /// Reopens, in the background, the workspaces of remote project groups
+    /// restored at launch, which are otherwise only reopened when visited.
+    fn restore_remote_workspaces(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 }
 
 pub trait SidebarHandle: 'static + Send + Sync {
@@ -177,6 +181,7 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn side(&self, cx: &App) -> SidebarSide;
     fn serialized_state(&self, cx: &App) -> Option<String>;
     fn restore_serialized_state(&self, state: &str, window: &mut Window, cx: &mut App);
+    fn restore_remote_workspaces(&self, window: &mut Window, cx: &mut App);
 }
 
 #[derive(Clone)]
@@ -265,6 +270,13 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
         self.update(cx, |this, cx| {
             this.restore_serialized_state(state, window, cx)
         })
+    }
+
+    fn restore_remote_workspaces(&self, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| this.restore_remote_workspaces(window, cx));
+        });
     }
 }
 
@@ -772,6 +784,19 @@ impl MultiWorkspace {
         ));
     }
 
+    /// Like [`Self::activate_provisional_workspace`], without activating it.
+    pub(crate) fn add_provisional_workspace(
+        &mut self,
+        workspace: Entity<Workspace>,
+        provisional_key: ProjectGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self.hold(workspace, window, cx);
+        self.pin(index, provisional_key, cx);
+        cx.notify();
+    }
+
     pub(crate) fn activate_provisional_workspace(
         &mut self,
         workspace: Entity<Workspace>,
@@ -1176,7 +1201,7 @@ impl MultiWorkspace {
             let window_handle =
                 window_handle.ok_or_else(|| anyhow::anyhow!("Window is not a MultiWorkspace"))?;
 
-            let (workspace, _items) = open_remote_project_with_existing_connection(
+            let (workspace, _items) = open_remote_project_with_existing_connection_impl(
                 connection_options,
                 new_project,
                 effective_paths_vec,
@@ -1184,6 +1209,7 @@ impl MultiWorkspace {
                 window_handle,
                 provisional_project_group_key,
                 source_workspace,
+                open_mode != OpenMode::Add,
                 cx,
             )
             .await?;

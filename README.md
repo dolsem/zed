@@ -69,7 +69,7 @@ Agent threads of a project opened over a remote connection (SSH, WSL, Docker) ar
 - This covers native agent threads (contents and sidebar entries) and the sidebar entries of external agents. External agents already keep their sessions on the host.
 - Both sides must run the same release channel, and Zed must have been run on the host at least once.
 - Threads of remote projects created before this change stay on the machine they were created on.
-- After restarting Zed, the client lists a host's threads only once a project on that host has been opened again.
+- When Zed starts, it reconnects to the remote projects in the sidebar in the background. That refreshes their threads and restores their unsaved changes. Until a host is reconnected, the client lists the threads it last saw there.
 - If the same thread is open on both machines at once, the last save wins.
 
 #### `dolsem` release channel

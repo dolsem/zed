@@ -7936,6 +7936,65 @@ impl WorkspaceSidebar for Sidebar {
         }
         cx.notify();
     }
+
+    fn restore_remote_workspaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let keys = multi_workspace
+            .read(cx)
+            .project_group_keys()
+            .into_iter()
+            .filter(|key| key.host().is_some())
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return;
+        }
+
+        // Reconnect one group at a time, since each connection may show a
+        // modal (e.g. to ask for a password) on the active workspace.
+        cx.spawn_in(window, async move |_this, cx| {
+            for key in keys {
+                let open = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+                    if !multi_workspace
+                        .workspaces_for_project_group(&key, cx)
+                        .is_empty()
+                    {
+                        return None;
+                    }
+                    let modal_workspace = multi_workspace.workspace().clone();
+                    let task = multi_workspace.find_or_create_workspace(
+                        key.path_list().clone(),
+                        key.host(),
+                        Some(key.clone()),
+                        {
+                            let modal_workspace = modal_workspace.clone();
+                            move |options, window, cx| {
+                                connect_remote(modal_workspace, options, window, cx)
+                            }
+                        },
+                        None,
+                        OpenMode::Add,
+                        None,
+                        window,
+                        cx,
+                    );
+                    Some((task, modal_workspace))
+                })?;
+                let Some((task, modal_workspace)) = open else {
+                    continue;
+                };
+                let result = task.await;
+                remote_connection::dismiss_connection_modal(&modal_workspace, cx);
+                anyhow::Context::with_context(result, || {
+                    format!("failed to reopen remote project {:?}", key.path_list())
+                })
+                .log_err();
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
 }
 
 impl gpui::EventEmitter<workspace::SidebarEvent> for Sidebar {}

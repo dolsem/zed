@@ -524,6 +524,18 @@ pub struct ThreadMetadataStore {
     mutation_count: u64,
     last_mutation: HashMap<ThreadId, u64>,
     _thread_store_subscription: Option<Subscription>,
+    _save_remote_threads_cache: Option<Task<()>>,
+}
+
+/// The threads of remote hosts as last seen, so they can be listed before the
+/// hosts are connected again (e.g. right after launch).
+const REMOTE_THREADS_CACHE_KEY: &str = "remote-thread-metadata-cache";
+const SAVE_REMOTE_THREADS_CACHE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedRemoteThreads {
+    connection: RemoteConnectionOptions,
+    threads: Vec<proto::AgentThreadMetadata>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -861,7 +873,8 @@ impl ThreadMetadataStore {
         Some(connection.clone())
     }
 
-    fn enqueue_write(&mut self, operation: DbOperation, cx: &App) {
+    /// Returns whether the write goes to a remote host.
+    fn enqueue_write(&mut self, operation: DbOperation, cx: &App) -> bool {
         let thread_id = match &operation {
             DbOperation::Upsert(metadata) => metadata.thread_id,
             DbOperation::Delete(thread_id) => *thread_id,
@@ -880,13 +893,76 @@ impl ThreadMetadataStore {
                 };
                 self.remote_operations.push_back((connection, operation));
                 self.remote_operations_tx.try_send(()).log_err();
+                true
             }
             None => {
                 self.pending_thread_ops_tx
                     .try_send(DbRequest::Operation(operation))
                     .log_err();
+                false
             }
         }
+    }
+
+    fn load_remote_threads_cache(&mut self, cx: &App) {
+        if let Some(cache) = KeyValueStore::global(cx)
+            .read_kvp(REMOTE_THREADS_CACHE_KEY)
+            .log_err()
+            .flatten()
+        {
+            self.apply_remote_threads_cache(&cache).log_err();
+        }
+    }
+
+    fn apply_remote_threads_cache(&mut self, cache: &str) -> anyhow::Result<()> {
+        for host in serde_json::from_str::<Vec<CachedRemoteThreads>>(cache)? {
+            let rows = host
+                .threads
+                .into_iter()
+                .filter_map(|row| metadata_from_proto(row).log_err())
+                .collect();
+            self.apply_remote_rows(&host.connection, rows, self.mutation_count);
+        }
+        Ok(())
+    }
+
+    /// Saves the threads of remote hosts as currently known, shortly after
+    /// they stop changing.
+    fn schedule_remote_threads_cache_save(&mut self, cx: &App) {
+        let Some(cache) = self.remote_threads_cache().log_err() else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        let executor = cx.background_executor().clone();
+        self._save_remote_threads_cache = Some(cx.background_spawn(async move {
+            executor.timer(SAVE_REMOTE_THREADS_CACHE_DELAY).await;
+            kvp.write_kvp(REMOTE_THREADS_CACHE_KEY.to_string(), cache)
+                .await
+                .log_err();
+        }));
+    }
+
+    fn remote_threads_cache(&self) -> anyhow::Result<String> {
+        let mut hosts: Vec<CachedRemoteThreads> = Vec::new();
+        for (thread_id, connection) in &self.remote_threads {
+            let Some(thread) = self.threads.get(thread_id) else {
+                continue;
+            };
+            let host_ix = match hosts.iter().position(|host| {
+                same_remote_connection_identity(Some(&host.connection), Some(connection))
+            }) {
+                Some(ix) => ix,
+                None => {
+                    hosts.push(CachedRemoteThreads {
+                        connection: connection.clone(),
+                        threads: Vec::new(),
+                    });
+                    hosts.len() - 1
+                }
+            };
+            hosts[host_ix].threads.push(metadata_to_proto(thread));
+        }
+        Ok(serde_json::to_string(&hosts)?)
     }
 
     /// Takes the next remote operation whose host is connected.
@@ -963,6 +1039,7 @@ impl ThreadMetadataStore {
                             .collect();
                         this.update(cx, |this, cx| {
                             this.apply_remote_rows(&connection, rows, mutation_count);
+                            this.schedule_remote_threads_cache_save(cx);
                             cx.notify();
                         })
                         .ok();
@@ -1083,7 +1160,7 @@ impl ThreadMetadataStore {
     fn save_internal(&mut self, metadata: ThreadMetadata, cx: &App) {
         // Route the write before caching, which changes whether the thread
         // counts as already persisted.
-        self.enqueue_write(DbOperation::Upsert(metadata.clone()), cx);
+        let is_remote = self.enqueue_write(DbOperation::Upsert(metadata.clone()), cx);
 
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
             if thread.folder_paths() != metadata.folder_paths() {
@@ -1104,6 +1181,9 @@ impl ThreadMetadataStore {
         }
 
         self.cache_thread_metadata(metadata);
+        if is_remote {
+            self.schedule_remote_threads_cache_save(cx);
+        }
     }
 
     fn cache_thread_metadata(&mut self, metadata: ThreadMetadata) {
@@ -1394,7 +1474,9 @@ impl ThreadMetadataStore {
                     .insert(*thread_id);
 
                 let thread = thread.clone();
-                self.enqueue_write(DbOperation::Upsert(thread), cx);
+                if self.enqueue_write(DbOperation::Upsert(thread), cx) {
+                    self.schedule_remote_threads_cache_save(cx);
+                }
             }
         }
 
@@ -1515,7 +1597,9 @@ impl ThreadMetadataStore {
             }
         }
         self.threads.remove(&thread_id);
-        self.enqueue_write(DbOperation::Delete(thread_id), cx);
+        if self.enqueue_write(DbOperation::Delete(thread_id), cx) {
+            self.schedule_remote_threads_cache_save(cx);
+        }
         crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         cx.notify();
     }
@@ -1635,7 +1719,9 @@ impl ThreadMetadataStore {
             mutation_count: 0,
             last_mutation: HashMap::default(),
             _thread_store_subscription,
+            _save_remote_threads_cache: None,
         };
+        this.load_remote_threads_cache(cx);
         if let Some(thread_store) = ThreadStore::try_global(cx) {
             let host_ids = thread_store
                 .read(cx)
@@ -3578,6 +3664,108 @@ mod tests {
                 .filter_map(|e| e.session_id.as_ref().map(|s| s.0.to_string()))
                 .collect();
             assert_eq!(archived, vec!["session-2"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_threads_listed_by_remote_host_are_found_by_path(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/Users/me/Projects/app")]);
+        let remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 1 });
+        let host_row = metadata_to_proto(&make_metadata(
+            "host-session",
+            "Host Thread",
+            Utc::now(),
+            paths.clone(),
+        ));
+        let row = metadata_from_proto(host_row).unwrap();
+        let thread_id = row.thread_id;
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.apply_remote_rows(&remote, vec![row], store.mutation_count);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+
+        let found = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let store = ThreadMetadataStore::global(cx);
+                let store = store.read(cx);
+                (
+                    store
+                        .entries_for_path(&paths, Some(&remote))
+                        .map(|thread| thread.thread_id)
+                        .collect::<Vec<_>>(),
+                    store
+                        .entries_for_main_worktree_path(&paths, Some(&remote))
+                        .map(|thread| thread.thread_id)
+                        .collect::<Vec<_>>(),
+                )
+            })
+        };
+        assert_eq!(found(cx), (vec![thread_id], vec![thread_id]));
+
+        // Reloading the local database keeps the host's threads.
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                let _ = store.reload(cx);
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(found(cx), (vec![thread_id], vec![thread_id]));
+    }
+
+    #[gpui::test]
+    async fn test_remote_threads_cache_lists_threads_before_host_connects(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/Users/me/Projects/app")]);
+        let remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 7 });
+        let mut host_thread =
+            make_metadata("host-session", "Host Thread", Utc::now(), paths.clone());
+        host_thread.remote_connection = Some(remote.clone());
+        let thread_id = host_thread.thread_id;
+
+        let cache = cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, _| {
+                store.apply_remote_rows(&remote, vec![host_thread], store.mutation_count);
+                store.remote_threads_cache().unwrap()
+            })
+        });
+
+        // A store started later (e.g. after relaunching) lists the cached
+        // thread, and writes to it are routed to the host once it connects.
+        let restored = cx.update(|cx| {
+            cx.new(|cx| {
+                let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+                    "test_remote_threads_cache_lists_threads_before_host_connects",
+                ));
+                let mut store = ThreadMetadataStore::new(ThreadMetadataDb(db), cx);
+                store.apply_remote_threads_cache(&cache).unwrap();
+                store
+            })
+        });
+        cx.run_until_parked();
+        restored.read_with(cx, |store, _| {
+            let thread = store
+                .entry(thread_id)
+                .expect("cached thread should be listed");
+            assert_eq!(
+                thread.title.as_ref().map(|t| t.as_ref()),
+                Some("Host Thread")
+            );
+            assert!(thread.matches_remote_connection(Some(&remote)));
+            assert_eq!(
+                store
+                    .entries_for_path(&paths, Some(&remote))
+                    .map(|thread| thread.thread_id)
+                    .collect::<Vec<_>>(),
+                vec![thread_id]
+            );
+            assert!(store.remote_threads.contains_key(&thread_id));
         });
     }
 

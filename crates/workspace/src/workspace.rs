@@ -10397,6 +10397,14 @@ pub async fn apply_restored_multiworkspace_state(
             })
             .ok();
     }
+
+    window_handle
+        .update(cx, |multi_workspace, window, cx| {
+            if let Some(sidebar) = multi_workspace.sidebar() {
+                sidebar.restore_remote_workspaces(window, cx);
+            }
+        })
+        .ok();
 }
 
 fn restore_native_window_state(
@@ -11462,6 +11470,7 @@ pub fn open_remote_project_with_new_connection(
             window,
             None,
             None,
+            true,
             cx,
         )
         .await?;
@@ -11479,6 +11488,32 @@ pub fn open_remote_project_with_existing_connection(
     source_workspace: Option<WeakEntity<Workspace>>,
     cx: &mut AsyncApp,
 ) -> Task<Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)>> {
+    open_remote_project_with_existing_connection_impl(
+        connection_options,
+        project,
+        paths,
+        app_state,
+        window,
+        provisional_project_group_key,
+        source_workspace,
+        true,
+        cx,
+    )
+}
+
+/// Like [`open_remote_project_with_existing_connection`], but only activates
+/// the opened workspace if `activate` is set.
+pub(crate) fn open_remote_project_with_existing_connection_impl(
+    connection_options: RemoteConnectionOptions,
+    project: Entity<Project>,
+    paths: Vec<PathBuf>,
+    app_state: Arc<AppState>,
+    window: WindowHandle<MultiWorkspace>,
+    provisional_project_group_key: Option<ProjectGroupKey>,
+    source_workspace: Option<WeakEntity<Workspace>>,
+    activate: bool,
+    cx: &mut AsyncApp,
+) -> Task<Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
         let (workspace_id, serialized_workspace) =
             deserialize_remote_project(connection_options.clone(), paths.clone(), cx).await?;
@@ -11492,6 +11527,7 @@ pub fn open_remote_project_with_existing_connection(
             window,
             provisional_project_group_key,
             source_workspace,
+            activate,
             cx,
         )
         .await
@@ -11507,6 +11543,7 @@ async fn open_remote_project_inner(
     window: WindowHandle<MultiWorkspace>,
     provisional_project_group_key: Option<ProjectGroupKey>,
     source_workspace: Option<WeakEntity<Workspace>>,
+    activate: bool,
     cx: &mut AsyncApp,
 ) -> Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)> {
     let mut project_paths_to_open = vec![];
@@ -11550,15 +11587,27 @@ async fn open_remote_project_inner(
             workspace
         });
 
-        if let Some(project_group_key) = provisional_project_group_key.clone() {
-            multi_workspace.activate_provisional_workspace(
-                new_workspace.clone(),
-                project_group_key,
-                window,
-                cx,
-            );
-        } else {
-            multi_workspace.activate(new_workspace.clone(), source_workspace, window, cx);
+        match (provisional_project_group_key.clone(), activate) {
+            (Some(project_group_key), true) => {
+                multi_workspace.activate_provisional_workspace(
+                    new_workspace.clone(),
+                    project_group_key,
+                    window,
+                    cx,
+                );
+            }
+            (Some(project_group_key), false) => {
+                multi_workspace.add_provisional_workspace(
+                    new_workspace.clone(),
+                    project_group_key,
+                    window,
+                    cx,
+                );
+            }
+            (None, true) => {
+                multi_workspace.activate(new_workspace.clone(), source_workspace, window, cx);
+            }
+            (None, false) => multi_workspace.add(new_workspace.clone(), window, cx),
         }
         new_workspace
     })?;
