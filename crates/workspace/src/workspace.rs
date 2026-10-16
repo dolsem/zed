@@ -7848,7 +7848,7 @@ impl Workspace {
         Ok(())
     }
 
-    pub(crate) fn enqueue_item_serialization(
+    pub fn enqueue_item_serialization(
         &mut self,
         item: Box<dyn SerializableItemHandle>,
     ) -> Result<()> {

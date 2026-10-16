@@ -16,7 +16,8 @@ use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
     Subscription, Task, WeakEntity, actions,
 };
-use language::Capability;
+use fs::MTime;
+use language::{Buffer, BufferSnapshot, Capability};
 use multi_buffer::MultiBuffer;
 use project::{
     Project, ProjectPath,
@@ -24,13 +25,16 @@ use project::{
         Repository,
         diff_buffer_list::{self, DiffBase},
     },
+    project_settings::ProjectSettings,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use settings::GitDiffBaseSetting;
+use settings::{GitDiffBaseSetting, Settings as _};
 use std::any::{Any, TypeId};
+use std::path::PathBuf;
 use std::sync::Arc;
 use ui::{DiffStat, Divider, Tooltip, prelude::*};
+use util::ResultExt as _;
 use workspace::{
     ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
@@ -70,8 +74,13 @@ pub struct ProjectDiff {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     diff: Entity<DiffMultibuffer>,
+    /// Buffers whose unsaved contents were restored from the database. The
+    /// buffer store only holds weak handles, so without these the restored
+    /// edits could be dropped before the diff loads the buffers.
+    _restored_buffers: Vec<Entity<Buffer>>,
     _diff_event_subscription: Subscription,
     _diff_observation: Subscription,
+    _multibuffer_subscription: Subscription,
 }
 
 impl ProjectDiff {
@@ -273,14 +282,68 @@ impl ProjectDiff {
             }
         });
         let diff_observation = cx.observe(&diff, |_, _, cx| cx.notify());
+        let multibuffer = diff.read(cx).multibuffer().clone();
+        let multibuffer_subscription =
+            cx.subscribe(&multibuffer, |this, _, event: &multi_buffer::Event, cx| {
+                if matches!(
+                    event,
+                    multi_buffer::Event::Edited { .. }
+                        | multi_buffer::Event::DirtyChanged
+                        | multi_buffer::Event::Saved
+                        | multi_buffer::Event::Reloaded
+                        | multi_buffer::Event::BuffersRemoved { .. }
+                ) {
+                    this.enqueue_serialization(cx);
+                }
+            });
 
         Self {
             project,
             workspace: workspace.downgrade(),
             diff,
+            _restored_buffers: Vec::new(),
             _diff_event_subscription: diff_event_subscription,
             _diff_observation: diff_observation,
+            _multibuffer_subscription: multibuffer_subscription,
         }
+    }
+
+    // Unsaved edits are persisted so they survive the project being reopened,
+    // e.g. when reconnecting to a remote server. Unlike singleton editors, this
+    // item doesn't emit buffer edit events, so serialization is requested here.
+    fn enqueue_serialization(&self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let item = Box::new(cx.entity());
+        workspace
+            .update(cx, |workspace, _| workspace.enqueue_item_serialization(item))
+            .log_err();
+    }
+
+    fn unsaved_buffers(&self, cx: &App) -> Vec<(PathBuf, BufferSnapshot, Option<MTime>)> {
+        let project = self.project.read(cx);
+        self.diff
+            .read(cx)
+            .multibuffer()
+            .read(cx)
+            .all_buffers_iter()
+            .filter_map(|buffer| {
+                let buffer = buffer.read(cx);
+                if !buffer.is_dirty() {
+                    return None;
+                }
+                let file = buffer.file()?;
+                let abs_path = project.absolute_path(
+                    &ProjectPath {
+                        worktree_id: file.worktree_id(cx),
+                        path: file.path().clone(),
+                    },
+                    cx,
+                )?;
+                Some((abs_path, buffer.snapshot(), buffer.saved_mtime()))
+            })
+            .collect()
     }
 
     pub fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
@@ -595,44 +658,127 @@ impl SerializableItem for ProjectDiff {
     }
 
     fn cleanup(
-        _: workspace::WorkspaceId,
-        _: Vec<workspace::ItemId>,
+        workspace_id: workspace::WorkspaceId,
+        alive_items: Vec<workspace::ItemId>,
         _: &mut Window,
-        _: &mut App,
+        cx: &mut App,
     ) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+        workspace::delete_unloaded_items(
+            alive_items,
+            workspace_id,
+            "project_diff_unsaved_buffers",
+            &persistence::ProjectDiffDb::global(cx),
+            cx,
+        )
     }
 
     fn deserialize(
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
-        _workspace_id: workspace::WorkspaceId,
-        _item_id: workspace::ItemId,
+        workspace_id: workspace::WorkspaceId,
+        item_id: workspace::ItemId,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
+        let db = persistence::ProjectDiffDb::global(cx);
         window.spawn(cx, async move |cx| {
+            let unsaved_buffers = db
+                .get_unsaved_buffers(item_id, workspace_id)
+                .log_err()
+                .unwrap_or_default();
+
+            // Restore contents before the diff is created, so that it loads the
+            // buffers with their unsaved edits and computes hunks against them.
+            let mut restored_buffers = Vec::with_capacity(unsaved_buffers.len());
+            for unsaved_buffer in unsaved_buffers {
+                let open_buffer = project.update(cx, |project, cx| {
+                    let (worktree, path) = project.find_worktree(&unsaved_buffer.abs_path, cx)?;
+                    Some(project.open_buffer(
+                        ProjectPath {
+                            worktree_id: worktree.read(cx).id(),
+                            path,
+                        },
+                        cx,
+                    ))
+                });
+                let Some(open_buffer) = open_buffer else {
+                    log::warn!(
+                        "no worktree found to restore unsaved changes for {:?}",
+                        unsaved_buffer.abs_path
+                    );
+                    continue;
+                };
+                let Some(buffer) = open_buffer
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "opening {:?} to restore unsaved changes",
+                            unsaved_buffer.abs_path
+                        )
+                    })
+                    .log_err()
+                else {
+                    continue;
+                };
+                buffer.update(cx, |buffer, cx| {
+                    editor::items::restore_serialized_buffer_contents(
+                        buffer,
+                        unsaved_buffer.contents,
+                        unsaved_buffer.mtime,
+                        cx,
+                    );
+                });
+                restored_buffers.push(buffer);
+            }
+
             cx.update(|window, cx| {
                 let git_store = project.read(cx).git_store().clone();
                 let branch_diff = cx.new(|cx| {
                     diff_buffer_list::DiffBufferList::new(DiffBase::Head, git_store, None, cx)
                 });
                 let workspace = workspace.upgrade().context("workspace gone")?;
-                anyhow::Ok(
-                    cx.new(|cx| ProjectDiff::new_impl(branch_diff, project, workspace, window, cx)),
-                )
+                anyhow::Ok(cx.new(|cx| {
+                    let mut project_diff =
+                        ProjectDiff::new_impl(branch_diff, project, workspace, window, cx);
+                    project_diff._restored_buffers = restored_buffers;
+                    project_diff
+                }))
             })?
         })
     }
 
     fn serialize(
         &mut self,
-        _: &mut Workspace,
-        _: workspace::ItemId,
-        _: bool,
-        _: &mut Context<Self>,
+        workspace: &mut Workspace,
+        item_id: workspace::ItemId,
+        _closing: bool,
+        cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
-        Some(Task::ready(Ok(())))
+        let workspace_id = workspace.database_id()?;
+        let unsaved_buffers = if ProjectSettings::get_global(cx)
+            .session
+            .restore_unsaved_buffers
+        {
+            self.unsaved_buffers(cx)
+        } else {
+            Vec::new()
+        };
+        let db = persistence::ProjectDiffDb::global(cx);
+        Some(cx.background_spawn(async move {
+            let unsaved_buffers = unsaved_buffers
+                .into_iter()
+                .map(
+                    |(abs_path, snapshot, mtime)| persistence::UnsavedBuffer {
+                        abs_path,
+                        contents: snapshot.text(),
+                        mtime,
+                    },
+                )
+                .collect();
+            db.save_unsaved_buffers(item_id, workspace_id, unsaved_buffers)
+                .await
+                .context("failed to save unsaved project diff buffers")
+        }))
     }
 
     fn should_serialize(&self, _: &Self::Event) -> bool {
@@ -647,7 +793,9 @@ pub(crate) mod persistence {
         sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
         sqlez_macros::sql,
     };
+    use fs::MTime;
     use project::git_store::diff_buffer_list::DiffBase;
+    use std::path::PathBuf;
     use workspace::{ItemId, WorkspaceDb, WorkspaceId};
 
     pub struct ProjectDiffDb(ThreadSafeConnection);
@@ -680,12 +828,104 @@ pub(crate) mod persistence {
                     AND project_diffs.diff_base LIKE '{"Merge"%'
                 );
             "#,
+            sql!(
+                CREATE TABLE project_diff_unsaved_buffers(
+                    workspace_id INTEGER NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    abs_path TEXT NOT NULL,
+                    contents TEXT NOT NULL,
+                    mtime_seconds INTEGER,
+                    mtime_nanos INTEGER,
+
+                    PRIMARY KEY(workspace_id, item_id, abs_path),
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                    ON DELETE CASCADE
+                ) STRICT;
+            ),
         ];
     }
 
     db::static_connection!(ProjectDiffDb, [WorkspaceDb]);
 
+    pub struct UnsavedBuffer {
+        pub abs_path: PathBuf,
+        pub contents: String,
+        pub mtime: Option<MTime>,
+    }
+
     impl ProjectDiffDb {
+        pub async fn save_unsaved_buffers(
+            &self,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+            unsaved_buffers: Vec<UnsavedBuffer>,
+        ) -> anyhow::Result<()> {
+            self.write(move |connection| {
+                connection.exec_bound::<(ItemId, WorkspaceId)>(sql!(
+                    DELETE FROM project_diff_unsaved_buffers WHERE item_id = ? AND workspace_id = ?
+                ))?((item_id, workspace_id))?;
+
+                let mut insert = connection.exec_bound::<(
+                    ItemId,
+                    WorkspaceId,
+                    String,
+                    String,
+                    Option<i64>,
+                    Option<i32>,
+                )>(sql!(
+                    INSERT INTO project_diff_unsaved_buffers(
+                        item_id, workspace_id, abs_path, contents, mtime_seconds, mtime_nanos
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                ))?;
+                for unsaved_buffer in unsaved_buffers {
+                    let (mtime_seconds, mtime_nanos) = unsaved_buffer
+                        .mtime
+                        .and_then(|mtime| mtime.to_seconds_and_nanos_for_persistence())
+                        .map(|(seconds, nanos)| (Some(seconds as i64), Some(nanos as i32)))
+                        .unwrap_or((None, None));
+                    insert((
+                        item_id,
+                        workspace_id,
+                        unsaved_buffer.abs_path.to_string_lossy().into_owned(),
+                        unsaved_buffer.contents,
+                        mtime_seconds,
+                        mtime_nanos,
+                    ))?;
+                }
+                Ok(())
+            })
+            .await
+        }
+
+        pub fn get_unsaved_buffers(
+            &self,
+            item_id: ItemId,
+            workspace_id: WorkspaceId,
+        ) -> anyhow::Result<Vec<UnsavedBuffer>> {
+            let rows = self.select_bound::<(ItemId, WorkspaceId), (
+                String,
+                String,
+                Option<i64>,
+                Option<i32>,
+            )>(sql!(
+                SELECT abs_path, contents, mtime_seconds, mtime_nanos
+                FROM project_diff_unsaved_buffers
+                WHERE item_id = ? AND workspace_id = ?
+            ))?((item_id, workspace_id))?;
+            Ok(rows
+                .into_iter()
+                .map(
+                    |(abs_path, contents, mtime_seconds, mtime_nanos)| UnsavedBuffer {
+                        abs_path: PathBuf::from(abs_path),
+                        contents,
+                        mtime: mtime_seconds.zip(mtime_nanos).map(|(seconds, nanos)| {
+                            MTime::from_seconds_and_nanos(seconds as u64, nanos as u32)
+                        }),
+                    },
+                )
+                .collect())
+        }
+
         pub async fn save_project_diff_base(
             &self,
             item_id: ItemId,
@@ -1950,6 +2190,107 @@ mod tests {
 
         let text = String::from_utf8(fs.read_file_sync("/project/foo.txt").unwrap()).unwrap();
         assert_eq!(text, "foo\n");
+    }
+
+    #[gpui::test]
+    async fn test_unsaved_changes_restored_on_deserialize(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "foo.txt": "FOO\n",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "foo\n".into())],
+            "deadbeef",
+        );
+        fs.set_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "foo\n".into())],
+        );
+
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace, window, cx)
+        });
+        cx.run_until_parked();
+
+        let buffer = diff.read_with(cx, |diff, cx| {
+            diff.multibuffer(cx)
+                .read(cx)
+                .all_buffers_iter()
+                .next()
+                .unwrap()
+        });
+        buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+        cx.run_until_parked();
+
+        let unsaved_buffers = diff.read_with(cx, |diff, cx| diff.unsaved_buffers(cx));
+        assert_eq!(unsaved_buffers.len(), 1);
+        let workspace_id = cx
+            .update(|_, cx| workspace::WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+        let item_id = 1;
+        let db = cx.update(|_, cx| persistence::ProjectDiffDb::global(cx));
+        db.save_unsaved_buffers(
+            item_id,
+            workspace_id,
+            unsaved_buffers
+                .into_iter()
+                .map(|(abs_path, snapshot, mtime)| persistence::UnsavedBuffer {
+                    abs_path,
+                    contents: snapshot.text(),
+                    mtime,
+                })
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+        // Simulates reopening the remote project after a disconnect: a fresh
+        // project with no knowledge of the previous buffers.
+        let new_project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (new_multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            MultiWorkspace::test_new(new_project.clone(), window, cx)
+        });
+        let new_workspace = new_multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let restored_diff = cx
+            .update(|window, cx| {
+                <ProjectDiff as SerializableItem>::deserialize(
+                    new_project.clone(),
+                    new_workspace.downgrade(),
+                    workspace_id,
+                    item_id,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let restored_buffer = restored_diff.read_with(cx, |diff, cx| {
+            diff.multibuffer(cx)
+                .read(cx)
+                .all_buffers_iter()
+                .next()
+                .unwrap()
+        });
+        restored_buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "unsaved FOO\n");
+            assert!(buffer.is_dirty());
+        });
     }
 
     #[gpui::test]
