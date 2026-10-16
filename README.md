@@ -66,7 +66,8 @@ Tasks with `"hooks": ["remove_worktree"]` run before Zed removes a linked git wo
 
 Agent threads of a project opened over a remote connection (SSH, WSL, Docker) are stored on the remote host, in the same databases the Zed installed there uses. A thread started remotely shows up in the sidebar of the host's own Zed, and threads started on the host show up when the project is opened remotely. Changes made on either side appear on the other while both are open.
 
-- This covers native agent threads (contents and sidebar entries) and the sidebar entries of external agents. External agents already keep their sessions on the host.
+- This covers native agent threads (contents and sidebar entries), the sidebar entries of external agents, and Terminal Threads. External agents already keep their sessions on the host.
+- A Terminal Thread's shell belongs to the Zed that started it. Opening one from the other machine starts a new shell on the host with the same `ZED_THREAD_ID` and runs the init command again, the same way an archived terminal is restored. To share one live session between both machines instead, run the init command inside `tmux new-session -A -s "zed-$ZED_THREAD_ID"`.
 - Both sides must run the same release channel, and Zed must have been run on the host at least once.
 - Threads of remote projects created before this change stay on the machine they were created on.
 - When Zed starts, it reconnects to the remote projects in the sidebar in the background. That refreshes their threads and restores their unsaved changes. Until a host is reconnected, the client lists the threads it last saw there.

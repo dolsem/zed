@@ -824,7 +824,8 @@ impl ThreadMetadataStore {
         self.rebuild_cache(threads);
     }
 
-    fn remote_storage(
+    /// Returns the storage of the connected remote host matching `connection`.
+    pub(crate) fn remote_storage(
         connection: &RemoteConnectionOptions,
         cx: &App,
     ) -> Option<RemoteThreadStorage> {

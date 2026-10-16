@@ -536,7 +536,11 @@ message Envelope {
     ListAgentThreadMetadataResponse list_agent_thread_metadata_response = 503;
     SaveAgentThreadMetadata save_agent_thread_metadata = 504;
     DeleteAgentThreadMetadata delete_agent_thread_metadata = 505;
-    AgentThreadsChanged agent_threads_changed = 506; // current max
+    AgentThreadsChanged agent_threads_changed = 506;
+    ListAgentTerminalThreads list_agent_terminal_threads = 507;
+    ListAgentTerminalThreadsResponse list_agent_terminal_threads_response = 508;
+    SaveAgentTerminalThread save_agent_terminal_thread = 509;
+    DeleteAgentTerminalThread delete_agent_terminal_thread = 510; // current max
   }
 
   reserved 87 to 88;

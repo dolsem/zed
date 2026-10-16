@@ -40,6 +40,9 @@ impl AgentThreadsHost {
         session.add_request_handler(cx.weak_entity(), Self::handle_list_metadata);
         session.add_request_handler(cx.weak_entity(), Self::handle_save_metadata);
         session.add_request_handler(cx.weak_entity(), Self::handle_delete_metadata);
+        session.add_request_handler(cx.weak_entity(), Self::handle_list_terminals);
+        session.add_request_handler(cx.weak_entity(), Self::handle_save_terminal);
+        session.add_request_handler(cx.weak_entity(), Self::handle_delete_terminal);
 
         let in_memory = fs.is_fake();
         let watch_changes = cx.background_spawn(async move {
@@ -313,6 +316,108 @@ impl AgentThreadsHost {
         Self::announce_write(&this, &cx);
         Ok(proto::Ack {})
     }
+
+    async fn handle_list_terminals(
+        this: Entity<Self>,
+        _: TypedEnvelope<proto::ListAgentTerminalThreads>,
+        cx: AsyncApp,
+    ) -> Result<proto::ListAgentTerminalThreadsResponse> {
+        let terminals = Self::with_metadata_db(&this, &cx, |db| {
+            ensure_terminal_threads_table(db)?;
+            // As with threads, only the host's local terminals are shared.
+            let rows = db.select::<TerminalThreadRow>(
+                "SELECT terminal_id, title, custom_title, created_at, working_directory, \
+                 folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, \
+                 archived \
+                 FROM sidebar_terminal_threads \
+                 WHERE remote_connection IS NULL \
+                 ORDER BY created_at DESC",
+            )?()?;
+            Ok(rows.into_iter().map(|row| row.0).collect())
+        })
+        .await?;
+        Ok(proto::ListAgentTerminalThreadsResponse { terminals })
+    }
+
+    async fn handle_save_terminal(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::SaveAgentTerminalThread>,
+        cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let row = envelope
+            .payload
+            .terminal
+            .context("missing terminal thread")?;
+        Self::with_metadata_db(&this, &cx, move |db| {
+            ensure_terminal_threads_table(db)?;
+            let mut statement = Statement::prepare(
+                db,
+                "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, archived) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10) \
+                 ON CONFLICT(terminal_id) DO UPDATE SET \
+                     title = excluded.title, \
+                     custom_title = excluded.custom_title, \
+                     created_at = excluded.created_at, \
+                     working_directory = excluded.working_directory, \
+                     folder_paths = excluded.folder_paths, \
+                     folder_paths_order = excluded.folder_paths_order, \
+                     main_worktree_paths = excluded.main_worktree_paths, \
+                     main_worktree_paths_order = excluded.main_worktree_paths_order, \
+                     remote_connection = NULL, \
+                     archived = excluded.archived",
+            )?;
+            let mut i = statement.bind(&row.terminal_id, 1)?;
+            i = statement.bind(&row.title, i)?;
+            i = statement.bind(&row.custom_title, i)?;
+            i = statement.bind(&row.created_at, i)?;
+            i = statement.bind(&row.working_directory, i)?;
+            i = statement.bind(&row.folder_paths, i)?;
+            i = statement.bind(&row.folder_paths_order, i)?;
+            i = statement.bind(&row.main_worktree_paths, i)?;
+            i = statement.bind(&row.main_worktree_paths_order, i)?;
+            statement.bind(&row.archived, i)?;
+            statement.exec()?;
+            Ok(())
+        })
+        .await?;
+        Self::announce_write(&this, &cx);
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_delete_terminal(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::DeleteAgentTerminalThread>,
+        cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let terminal_id = envelope.payload.terminal_id;
+        Self::with_metadata_db(&this, &cx, move |db| {
+            ensure_terminal_threads_table(db)?;
+            let mut statement = Statement::prepare(
+                db,
+                "DELETE FROM sidebar_terminal_threads WHERE terminal_id = ?",
+            )?;
+            statement.bind(&terminal_id, 1)?;
+            statement.exec()?;
+            Ok(())
+        })
+        .await?;
+        Self::announce_write(&this, &cx);
+        Ok(proto::Ack {})
+    }
+}
+
+/// Terminal threads only exist in this fork's builds of Zed, so the host's
+/// database may not have them even when it has thread metadata.
+fn ensure_terminal_threads_table(db: &Connection) -> Result<()> {
+    let has_table = db.select_row::<String>(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sidebar_terminal_threads'",
+    )?()?
+    .is_some();
+    anyhow::ensure!(
+        has_table,
+        "the Zed database on this host has no terminal threads"
+    );
+    Ok(())
 }
 
 fn open_existing(path: &PathBuf) -> Result<Connection> {
@@ -412,6 +517,38 @@ impl Column for ThreadSummaryRow {
                 summary,
                 updated_at,
                 created_at,
+            }),
+            next,
+        ))
+    }
+}
+
+struct TerminalThreadRow(proto::AgentTerminalThread);
+
+impl Column for TerminalThreadRow {
+    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
+        let (terminal_id, next) = Column::column(statement, start_index)?;
+        let (title, next) = Column::column(statement, next)?;
+        let (custom_title, next) = Column::column(statement, next)?;
+        let (created_at, next) = Column::column(statement, next)?;
+        let (working_directory, next) = Column::column(statement, next)?;
+        let (folder_paths, next) = Column::column(statement, next)?;
+        let (folder_paths_order, next) = Column::column(statement, next)?;
+        let (main_worktree_paths, next) = Column::column(statement, next)?;
+        let (main_worktree_paths_order, next) = Column::column(statement, next)?;
+        let (archived, next) = Column::column(statement, next)?;
+        Ok((
+            Self(proto::AgentTerminalThread {
+                terminal_id,
+                title,
+                custom_title,
+                created_at,
+                working_directory,
+                folder_paths,
+                folder_paths_order,
+                main_worktree_paths,
+                main_worktree_paths_order,
+                archived,
             }),
             next,
         ))

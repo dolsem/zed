@@ -142,3 +142,30 @@ message DeleteAgentThreadMetadata {
 // Sent by the remote server when another process on the host changed the
 // agent thread databases.
 message AgentThreadsChanged {}
+
+message AgentTerminalThread {
+  string terminal_id = 1;
+  string title = 2;
+  optional string custom_title = 3;
+  string created_at = 4;
+  optional string working_directory = 5;
+  optional string folder_paths = 6;
+  optional string folder_paths_order = 7;
+  optional string main_worktree_paths = 8;
+  optional string main_worktree_paths_order = 9;
+  bool archived = 10;
+}
+
+message ListAgentTerminalThreads {}
+
+message ListAgentTerminalThreadsResponse {
+  repeated AgentTerminalThread terminals = 1;
+}
+
+message SaveAgentTerminalThread {
+  AgentTerminalThread terminal = 1;
+}
+
+message DeleteAgentTerminalThread {
+  string terminal_id = 1;
+}

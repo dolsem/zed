@@ -445,6 +445,10 @@ messages!(
     (SaveAgentThreadMetadata, Background),
     (DeleteAgentThreadMetadata, Background),
     (AgentThreadsChanged, Foreground),
+    (ListAgentTerminalThreads, Background),
+    (ListAgentTerminalThreadsResponse, Background),
+    (SaveAgentTerminalThread, Background),
+    (DeleteAgentTerminalThread, Background),
 );
 
 request_messages!(
@@ -693,6 +697,9 @@ request_messages!(
     (SaveAgentThreadMetadata, Ack),
     (DeleteAgentThreadMetadata, Ack),
     (AgentThreadsChanged, Ack),
+    (ListAgentTerminalThreads, ListAgentTerminalThreadsResponse),
+    (SaveAgentTerminalThread, Ack),
+    (DeleteAgentTerminalThread, Ack),
 );
 
 lsp_messages!(

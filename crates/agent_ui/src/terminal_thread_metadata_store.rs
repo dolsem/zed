@@ -1,23 +1,42 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+};
 
+use agent::{ThreadStore, ThreadStoreEvent};
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
 use db::{
+    kvp::KeyValueStore,
     sqlez::{
         bindable::Column, domain::Domain, statement::Statement,
         thread_safe_connection::ThreadSafeConnection,
     },
     sqlez_macros::sql,
 };
-use futures::{FutureExt, future::Shared};
-use gpui::{AppContext as _, Entity, Global, Task};
+use futures::{FutureExt, channel::oneshot, future::Shared};
+use gpui::{AppContext as _, Entity, EntityId, Global, Subscription, Task};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::{App, Context, SharedString};
 use util::ResultExt as _;
 use workspace::PathList;
 
-use crate::{TerminalId, thread_metadata_store::WorktreePaths};
+use crate::{
+    TerminalId,
+    thread_metadata_store::{ThreadMetadataStore, WorktreePaths},
+};
+
+/// The terminal threads of remote hosts as last seen, so they can be listed
+/// before the hosts are connected again (e.g. right after launch).
+const REMOTE_TERMINALS_CACHE_KEY: &str = "remote-terminal-thread-cache";
+const SAVE_REMOTE_TERMINALS_CACHE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedRemoteTerminals {
+    connection: RemoteConnectionOptions,
+    terminals: Vec<proto::AgentTerminalThread>,
+}
 
 pub fn init(cx: &mut App) {
     TerminalThreadMetadataStore::init_global(cx);
@@ -159,19 +178,60 @@ pub fn terminal_title_prefix(title: &str) -> Option<&str> {
 }
 
 pub struct TerminalThreadMetadataStore {
-    db: TerminalThreadMetadataDb,
     terminals: HashMap<TerminalId, TerminalThreadMetadata>,
     terminals_by_paths: HashMap<PathList, HashSet<TerminalId>>,
     terminals_by_main_paths: HashMap<PathList, HashSet<TerminalId>>,
     reload_task: Option<Shared<Task<()>>>,
-    pending_terminal_ops_tx: async_channel::Sender<DbOperation>,
+    pending_terminal_ops_tx: async_channel::Sender<DbRequest>,
     _db_operations_task: Task<()>,
+    /// Terminals whose metadata is stored on a remote host (so that the Zed
+    /// running there sees them too), with the connection to that host.
+    remote_terminals: HashMap<TerminalId, RemoteConnectionOptions>,
+    /// Writes to remote hosts, applied in order by `_remote_operations_task`.
+    remote_operations: VecDeque<(RemoteConnectionOptions, RemoteDbOperation)>,
+    /// Writes to remote hosts that weren't connected, retried on reconnect.
+    stalled_remote_operations: Vec<(RemoteConnectionOptions, RemoteDbOperation)>,
+    remote_operations_tx: async_channel::Sender<()>,
+    _remote_operations_task: Task<()>,
+    /// Incremented on every in-memory change to a terminal. Reloads use it to
+    /// tell which terminals changed after the reloaded rows were requested, so
+    /// that they don't revert changes that hadn't been written yet.
+    mutation_count: u64,
+    last_mutation: HashMap<TerminalId, u64>,
+    _thread_store_subscription: Option<Subscription>,
+    _save_remote_terminals_cache: Option<Task<()>>,
 }
 
 #[derive(Debug, PartialEq)]
 enum DbOperation {
     Upsert(TerminalThreadMetadata),
     Delete(TerminalId),
+}
+
+enum DbRequest {
+    Operation(DbOperation),
+    /// Lists all rows once the operations requested before it were applied.
+    List(oneshot::Sender<anyhow::Result<Vec<TerminalThreadMetadata>>>),
+}
+
+enum RemoteDbOperation {
+    Upsert(TerminalThreadMetadata),
+    Delete(TerminalId),
+    /// Re-fetches the host's terminals. `mutation_count` is the store's
+    /// mutation count when the list was requested.
+    List {
+        mutation_count: u64,
+    },
+}
+
+impl RemoteDbOperation {
+    fn terminal_id(&self) -> Option<TerminalId> {
+        match self {
+            RemoteDbOperation::Upsert(metadata) => Some(metadata.terminal_id),
+            RemoteDbOperation::Delete(terminal_id) => Some(*terminal_id),
+            RemoteDbOperation::List { .. } => None,
+        }
+    }
 }
 
 impl DbOperation {
@@ -294,7 +354,7 @@ impl TerminalThreadMetadataStore {
     }
 
     pub fn save(&mut self, metadata: TerminalThreadMetadata, cx: &mut Context<Self>) {
-        self.save_internal(metadata);
+        self.save_internal(metadata, cx);
         cx.notify();
     }
 
@@ -313,7 +373,7 @@ impl TerminalThreadMetadataStore {
         }
 
         metadata.custom_title = custom_title;
-        self.save_internal(metadata);
+        self.save_internal(metadata, cx);
         cx.notify();
     }
 
@@ -334,7 +394,7 @@ impl TerminalThreadMetadataStore {
         }
 
         metadata.archived = archived;
-        self.save_internal(metadata);
+        self.save_internal(metadata, cx);
         cx.notify();
     }
 
@@ -368,14 +428,18 @@ impl TerminalThreadMetadataStore {
         for terminal_id in terminal_ids {
             if let Some(mut terminal) = self.terminals.get(&terminal_id).cloned() {
                 mutate(&mut terminal.worktree_paths);
-                self.save_internal(terminal);
+                self.save_internal(terminal, cx);
             }
         }
 
         cx.notify();
     }
 
-    fn save_internal(&mut self, metadata: TerminalThreadMetadata) {
+    fn save_internal(&mut self, metadata: TerminalThreadMetadata, cx: &App) {
+        // Route the write before caching, which changes whether the terminal
+        // counts as already persisted.
+        let is_remote = self.enqueue_write(DbOperation::Upsert(metadata.clone()), cx);
+
         if let Some(existing) = self.terminals.get(&metadata.terminal_id) {
             if existing.folder_paths() != metadata.folder_paths()
                 && let Some(ids) = self.terminals_by_paths.get_mut(existing.folder_paths())
@@ -392,10 +456,10 @@ impl TerminalThreadMetadataStore {
             }
         }
 
-        self.cache_terminal_metadata(metadata.clone());
-        self.pending_terminal_ops_tx
-            .try_send(DbOperation::Upsert(metadata))
-            .log_err();
+        self.cache_terminal_metadata(metadata);
+        if is_remote {
+            self.schedule_remote_terminals_cache_save(cx);
+        }
     }
 
     fn cache_terminal_metadata(&mut self, metadata: TerminalThreadMetadata) {
@@ -428,23 +492,31 @@ impl TerminalThreadMetadataStore {
                 ids.remove(&terminal_id);
             }
         }
-        self.pending_terminal_ops_tx
-            .try_send(DbOperation::Delete(terminal_id))
-            .log_err();
+        if self.enqueue_write(DbOperation::Delete(terminal_id), cx) {
+            self.schedule_remote_terminals_cache_save(cx);
+        }
         cx.notify();
     }
 
     fn new(db: TerminalThreadMetadataDb, cx: &mut Context<Self>) -> Self {
-        let (tx, rx) = async_channel::unbounded();
+        let (tx, rx) = async_channel::unbounded::<DbRequest>();
         let _db_operations_task = cx.background_spawn({
-            let db = db.clone();
             async move {
-                while let Ok(first_update) = rx.recv().await {
-                    let mut updates = vec![first_update];
-                    while let Ok(update) = rx.try_recv() {
-                        updates.push(update);
+                while let Ok(first_request) = rx.recv().await {
+                    let mut requests = vec![first_request];
+                    while let Ok(request) = rx.try_recv() {
+                        requests.push(request);
+                    }
+                    let mut updates = Vec::new();
+                    let mut list_requests = Vec::new();
+                    for request in requests {
+                        match request {
+                            DbRequest::Operation(operation) => updates.push(operation),
+                            DbRequest::List(tx) => list_requests.push(tx),
+                        }
                     }
                     let updates = Self::dedup_db_operations(updates);
+                    let wrote = !updates.is_empty();
                     for operation in updates {
                         match operation {
                             DbOperation::Upsert(metadata) => {
@@ -455,21 +527,387 @@ impl TerminalThreadMetadataStore {
                             }
                         }
                     }
+                    if wrote && cfg!(not(any(test, feature = "test-support"))) {
+                        paths::touch_agent_threads_changed_marker().log_err();
+                    }
+                    for tx in list_requests {
+                        tx.send(db.list()).ok();
+                    }
                 }
             }
         });
 
+        let (remote_operations_tx, remote_operations_rx) = async_channel::unbounded();
+        let _remote_operations_task = cx.spawn(async move |this, cx| {
+            Self::run_remote_operations(this, remote_operations_rx, cx).await
+        });
+
+        let _thread_store_subscription = ThreadStore::try_global(cx)
+            .map(|thread_store| cx.subscribe(&thread_store, Self::handle_thread_store_event));
+
         let mut this = Self {
-            db,
             terminals: HashMap::default(),
             terminals_by_paths: HashMap::default(),
             terminals_by_main_paths: HashMap::default(),
             reload_task: None,
             pending_terminal_ops_tx: tx,
             _db_operations_task,
+            remote_terminals: HashMap::default(),
+            remote_operations: VecDeque::new(),
+            stalled_remote_operations: Vec::new(),
+            remote_operations_tx,
+            _remote_operations_task,
+            mutation_count: 0,
+            last_mutation: HashMap::default(),
+            _thread_store_subscription,
+            _save_remote_terminals_cache: None,
         };
+        this.load_remote_terminals_cache(cx);
+        if let Some(thread_store) = ThreadStore::try_global(cx) {
+            let host_ids = thread_store
+                .read(cx)
+                .remote_storages()
+                .map(|storage| storage.host_id())
+                .collect::<Vec<_>>();
+            for host_id in host_ids {
+                this.reload_remote_host(&thread_store, host_id, cx);
+            }
+        }
         this.reload(cx);
         this
+    }
+
+    fn changed_since(&self, terminal_id: TerminalId, mutation_count: u64) -> bool {
+        self.last_mutation
+            .get(&terminal_id)
+            .is_some_and(|last_mutation| *last_mutation > mutation_count)
+    }
+
+    fn rebuild_cache(&mut self, terminals: HashMap<TerminalId, TerminalThreadMetadata>) {
+        self.terminals.clear();
+        self.terminals_by_paths.clear();
+        self.terminals_by_main_paths.clear();
+        for terminal in terminals.into_values() {
+            self.cache_terminal_metadata(terminal);
+        }
+    }
+
+    /// Replaces the cached local terminals with rows read from the local
+    /// database when `mutation_count` was current.
+    fn apply_local_rows(&mut self, rows: Vec<TerminalThreadMetadata>, mutation_count: u64) {
+        let mut terminals = HashMap::default();
+        for (terminal_id, terminal) in std::mem::take(&mut self.terminals) {
+            if self.remote_terminals.contains_key(&terminal_id)
+                || self.changed_since(terminal_id, mutation_count)
+            {
+                terminals.insert(terminal_id, terminal);
+            }
+        }
+        for row in rows {
+            let terminal_id = row.terminal_id;
+            if self.remote_terminals.contains_key(&terminal_id)
+                || self.changed_since(terminal_id, mutation_count)
+            {
+                continue;
+            }
+            terminals.insert(terminal_id, row);
+        }
+        self.rebuild_cache(terminals);
+    }
+
+    /// Replaces the cached terminals of a remote host with rows read from the
+    /// host when `mutation_count` was current.
+    fn apply_remote_rows(
+        &mut self,
+        connection: &RemoteConnectionOptions,
+        rows: Vec<TerminalThreadMetadata>,
+        mutation_count: u64,
+    ) {
+        let on_host = |terminal_connection: &RemoteConnectionOptions| {
+            same_remote_connection_identity(Some(terminal_connection), Some(connection))
+        };
+        let mut terminals = HashMap::default();
+        for (terminal_id, terminal) in std::mem::take(&mut self.terminals) {
+            let is_on_host = self
+                .remote_terminals
+                .get(&terminal_id)
+                .is_some_and(|terminal_connection| on_host(terminal_connection));
+            if !is_on_host || self.changed_since(terminal_id, mutation_count) {
+                terminals.insert(terminal_id, terminal);
+            }
+        }
+        self.remote_terminals
+            .retain(|terminal_id, terminal_connection| {
+                !on_host(terminal_connection) || terminals.contains_key(terminal_id)
+            });
+        for mut row in rows {
+            let terminal_id = row.terminal_id;
+            if self.changed_since(terminal_id, mutation_count) {
+                continue;
+            }
+            // A terminal kept in the local database takes precedence.
+            if terminals.contains_key(&terminal_id)
+                && !self.remote_terminals.contains_key(&terminal_id)
+            {
+                continue;
+            }
+            row.remote_connection = Some(connection.clone());
+            self.remote_terminals
+                .insert(terminal_id, connection.clone());
+            terminals.insert(terminal_id, row);
+        }
+        self.rebuild_cache(terminals);
+    }
+
+    /// Returns the remote host the metadata should be written to, if any.
+    ///
+    /// Terminals keep living where they were first persisted. New terminals of
+    /// remote projects are stored on the host, as long as it's connected.
+    fn remote_connection_for_write(
+        &mut self,
+        metadata: &TerminalThreadMetadata,
+        cx: &App,
+    ) -> Option<RemoteConnectionOptions> {
+        let terminal_id = metadata.terminal_id;
+        if let Some(connection) = self.remote_terminals.get(&terminal_id) {
+            return Some(connection.clone());
+        }
+        if self.terminals.contains_key(&terminal_id) {
+            return None;
+        }
+        let connection = metadata.remote_connection.as_ref()?;
+        ThreadMetadataStore::remote_storage(connection, cx)?;
+        self.remote_terminals
+            .insert(terminal_id, connection.clone());
+        Some(connection.clone())
+    }
+
+    /// Returns whether the write goes to a remote host.
+    fn enqueue_write(&mut self, operation: DbOperation, cx: &App) -> bool {
+        let terminal_id = operation.id();
+        self.mutation_count += 1;
+        self.last_mutation.insert(terminal_id, self.mutation_count);
+
+        let remote_connection = match &operation {
+            DbOperation::Upsert(metadata) => self.remote_connection_for_write(metadata, cx),
+            DbOperation::Delete(terminal_id) => self.remote_terminals.remove(terminal_id),
+        };
+        match remote_connection {
+            Some(connection) => {
+                let operation = match operation {
+                    DbOperation::Upsert(metadata) => RemoteDbOperation::Upsert(metadata),
+                    DbOperation::Delete(terminal_id) => RemoteDbOperation::Delete(terminal_id),
+                };
+                self.remote_operations.push_back((connection, operation));
+                self.remote_operations_tx.try_send(()).log_err();
+                true
+            }
+            None => {
+                self.pending_terminal_ops_tx
+                    .try_send(DbRequest::Operation(operation))
+                    .log_err();
+                false
+            }
+        }
+    }
+
+    /// Takes the next remote operation whose host is connected.
+    fn next_remote_operation(
+        &mut self,
+        cx: &App,
+    ) -> Option<(
+        RemoteConnectionOptions,
+        RemoteDbOperation,
+        agent::RemoteThreadStorage,
+    )> {
+        while let Some((connection, operation)) = self.remote_operations.pop_front() {
+            // A later write to the same terminal supersedes this one.
+            if let Some(terminal_id) = operation.terminal_id()
+                && self
+                    .remote_operations
+                    .iter()
+                    .any(|(_, later)| later.terminal_id() == Some(terminal_id))
+            {
+                continue;
+            }
+            match ThreadMetadataStore::remote_storage(&connection, cx) {
+                Some(storage) => return Some((connection, operation, storage)),
+                None => {
+                    if operation.terminal_id().is_some() {
+                        self.stalled_remote_operations.push((connection, operation));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    async fn run_remote_operations(
+        this: gpui::WeakEntity<Self>,
+        wake: async_channel::Receiver<()>,
+        cx: &mut gpui::AsyncApp,
+    ) {
+        while wake.recv().await.is_ok() {
+            loop {
+                let Ok(Some((connection, operation, storage))) =
+                    this.update(cx, |this, cx| this.next_remote_operation(cx))
+                else {
+                    break;
+                };
+                let client = storage.client().clone();
+                let result = match &operation {
+                    RemoteDbOperation::Upsert(metadata) => client
+                        .request(proto::SaveAgentTerminalThread {
+                            terminal: Some(terminal_to_proto(metadata)),
+                        })
+                        .await
+                        .map(|_| ()),
+                    RemoteDbOperation::Delete(terminal_id) => client
+                        .request(proto::DeleteAgentTerminalThread {
+                            terminal_id: terminal_id.to_key_string(),
+                        })
+                        .await
+                        .map(|_| ()),
+                    RemoteDbOperation::List { mutation_count } => {
+                        let mutation_count = *mutation_count;
+                        let Some(response) = client
+                            .request(proto::ListAgentTerminalThreads {})
+                            .await
+                            .context("failed to list terminal threads of remote host")
+                            .log_err()
+                        else {
+                            continue;
+                        };
+                        let rows = response
+                            .terminals
+                            .into_iter()
+                            .filter_map(|row| terminal_from_proto(row).log_err())
+                            .collect();
+                        this.update(cx, |this, cx| {
+                            this.apply_remote_rows(&connection, rows, mutation_count);
+                            this.schedule_remote_terminals_cache_save(cx);
+                            cx.notify();
+                        })
+                        .ok();
+                        continue;
+                    }
+                };
+                if let Err(error) = result {
+                    log::error!("failed to write terminal thread to remote host: {error:#}");
+                    // Retry once the host reconnects.
+                    this.update(cx, |this, _| {
+                        this.stalled_remote_operations.push((connection, operation));
+                    })
+                    .ok();
+                }
+            }
+        }
+    }
+
+    fn handle_thread_store_event(
+        &mut self,
+        thread_store: Entity<ThreadStore>,
+        event: &ThreadStoreEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ThreadStoreEvent::RemoteHostChanged(host_id) => {
+                self.reload_remote_host(&thread_store, *host_id, cx);
+            }
+            ThreadStoreEvent::RemoteHostRemoved(_) => {}
+            ThreadStoreEvent::LocalThreadsChangedExternally => self.reload(cx),
+        }
+    }
+
+    fn reload_remote_host(
+        &mut self,
+        thread_store: &Entity<ThreadStore>,
+        host_id: EntityId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(connection) = thread_store
+            .read(cx)
+            .remote_storage(host_id)
+            .map(|storage| storage.connection_options().clone())
+        else {
+            return;
+        };
+        // Retry writes made while the host wasn't connected.
+        let (stalled, still_stalled) = std::mem::take(&mut self.stalled_remote_operations)
+            .into_iter()
+            .partition::<Vec<_>, _>(|(stalled_connection, _)| {
+                same_remote_connection_identity(Some(stalled_connection), Some(&connection))
+            });
+        self.stalled_remote_operations = still_stalled;
+        self.remote_operations.extend(stalled);
+        self.remote_operations.push_back((
+            connection,
+            RemoteDbOperation::List {
+                mutation_count: self.mutation_count,
+            },
+        ));
+        self.remote_operations_tx.try_send(()).log_err();
+    }
+
+    fn load_remote_terminals_cache(&mut self, cx: &App) {
+        if let Some(cache) = KeyValueStore::global(cx)
+            .read_kvp(REMOTE_TERMINALS_CACHE_KEY)
+            .log_err()
+            .flatten()
+        {
+            self.apply_remote_terminals_cache(&cache).log_err();
+        }
+    }
+
+    fn apply_remote_terminals_cache(&mut self, cache: &str) -> anyhow::Result<()> {
+        for host in serde_json::from_str::<Vec<CachedRemoteTerminals>>(cache)? {
+            let rows = host
+                .terminals
+                .into_iter()
+                .filter_map(|row| terminal_from_proto(row).log_err())
+                .collect();
+            self.apply_remote_rows(&host.connection, rows, self.mutation_count);
+        }
+        Ok(())
+    }
+
+    /// Saves the terminals of remote hosts as currently known, shortly after
+    /// they stop changing.
+    fn schedule_remote_terminals_cache_save(&mut self, cx: &App) {
+        let Some(cache) = self.remote_terminals_cache().log_err() else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        let executor = cx.background_executor().clone();
+        self._save_remote_terminals_cache = Some(cx.background_spawn(async move {
+            executor.timer(SAVE_REMOTE_TERMINALS_CACHE_DELAY).await;
+            kvp.write_kvp(REMOTE_TERMINALS_CACHE_KEY.to_string(), cache)
+                .await
+                .log_err();
+        }));
+    }
+
+    fn remote_terminals_cache(&self) -> anyhow::Result<String> {
+        let mut hosts: Vec<CachedRemoteTerminals> = Vec::new();
+        for (terminal_id, connection) in &self.remote_terminals {
+            let Some(terminal) = self.terminals.get(terminal_id) else {
+                continue;
+            };
+            let host_ix = match hosts.iter().position(|host| {
+                same_remote_connection_identity(Some(&host.connection), Some(connection))
+            }) {
+                Some(ix) => ix,
+                None => {
+                    hosts.push(CachedRemoteTerminals {
+                        connection: connection.clone(),
+                        terminals: Vec::new(),
+                    });
+                    hosts.len() - 1
+                }
+            };
+            hosts[host_ix].terminals.push(terminal_to_proto(terminal));
+        }
+        Ok(serde_json::to_string(&hosts)?)
     }
 
     fn dedup_db_operations(operations: Vec<DbOperation>) -> Vec<DbOperation> {
@@ -484,27 +922,25 @@ impl TerminalThreadMetadataStore {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let db = self.db.clone();
+        let (tx, rx) = oneshot::channel();
+        self.pending_terminal_ops_tx
+            .try_send(DbRequest::List(tx))
+            .log_err();
+        let mutation_count = self.mutation_count;
         self.reload_task = Some(
             cx.spawn(async move |this, cx| {
-                let rows = cx
-                    .background_spawn(async move {
-                        db.list()
-                            .context("Failed to fetch terminal thread metadata")
-                    })
+                let Some(rows) = rx
                     .await
+                    .context("terminal thread metadata database worker stopped")
+                    .and_then(|rows| rows)
+                    .context("Failed to fetch terminal thread metadata")
                     .log_err()
-                    .unwrap_or_default();
+                else {
+                    return;
+                };
 
                 this.update(cx, |this, cx| {
-                    this.terminals.clear();
-                    this.terminals_by_paths.clear();
-                    this.terminals_by_main_paths.clear();
-
-                    for row in rows {
-                        this.cache_terminal_metadata(row);
-                    }
-
+                    this.apply_local_rows(rows, mutation_count);
                     cx.notify();
                 })
                 .ok();
@@ -512,6 +948,72 @@ impl TerminalThreadMetadataStore {
             .shared(),
         );
     }
+}
+
+/// Converts metadata to the form it is stored in on a remote host. Mirrors
+/// [`TerminalThreadMetadataDb::save`]; the host stores no remote connection,
+/// since the terminal is local to it.
+fn terminal_to_proto(metadata: &TerminalThreadMetadata) -> proto::AgentTerminalThread {
+    let serialize_paths = |paths: &PathList| {
+        if paths.is_empty() {
+            (None, None)
+        } else {
+            let serialized = paths.serialize();
+            (Some(serialized.paths), Some(serialized.order))
+        }
+    };
+    let (folder_paths, folder_paths_order) = serialize_paths(metadata.folder_paths());
+    let (main_worktree_paths, main_worktree_paths_order) =
+        serialize_paths(metadata.main_worktree_paths());
+    proto::AgentTerminalThread {
+        terminal_id: metadata.terminal_id.to_key_string(),
+        title: metadata.title.to_string(),
+        custom_title: metadata.custom_title.as_ref().map(ToString::to_string),
+        created_at: metadata.created_at.to_rfc3339(),
+        working_directory: metadata
+            .working_directory
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        folder_paths,
+        folder_paths_order,
+        main_worktree_paths,
+        main_worktree_paths_order,
+        archived: metadata.archived,
+    }
+}
+
+/// Converts metadata stored on a remote host. Mirrors the [`Column`]
+/// implementation of [`TerminalThreadMetadata`].
+fn terminal_from_proto(row: proto::AgentTerminalThread) -> anyhow::Result<TerminalThreadMetadata> {
+    let deserialize_paths = |paths: Option<String>, order: Option<String>| {
+        paths
+            .map(|paths| {
+                PathList::deserialize(&util::path_list::SerializedPathList {
+                    paths,
+                    order: order.unwrap_or_default(),
+                })
+            })
+            .unwrap_or_default()
+    };
+    let folder_paths = deserialize_paths(row.folder_paths, row.folder_paths_order);
+    let main_worktree_paths =
+        deserialize_paths(row.main_worktree_paths, row.main_worktree_paths_order);
+    let worktree_paths = WorktreePaths::from_path_lists(main_worktree_paths, folder_paths)
+        .unwrap_or_else(|_| WorktreePaths::default());
+
+    Ok(TerminalThreadMetadata {
+        terminal_id: TerminalId::from_key_string(&row.terminal_id)?,
+        title: SharedString::from(row.title),
+        custom_title: row
+            .custom_title
+            .filter(|title| !title.trim().is_empty())
+            .map(SharedString::from),
+        created_at: DateTime::parse_from_rfc3339(&row.created_at)?.with_timezone(&Utc),
+        worktree_paths,
+        remote_connection: None,
+        working_directory: row.working_directory.map(PathBuf::from),
+        archived: row.archived,
+    })
 }
 
 struct TerminalThreadMetadataDb(ThreadSafeConnection);
@@ -859,6 +1361,95 @@ mod tests {
         cx.update(|cx| {
             let store = TerminalThreadMetadataStore::global(cx);
             assert!(store.read(cx).entry(terminal_id).unwrap().archived);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminals_listed_by_remote_host_are_found_by_path(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/Users/me/Projects/app")]);
+        let remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 1 });
+        let row = terminal_from_proto(terminal_to_proto(&metadata(
+            "✳ Host Terminal",
+            WorktreePaths::from_folder_paths(&paths),
+        )))
+        .unwrap();
+        let terminal_id = row.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.apply_remote_rows(&remote, vec![row], store.mutation_count);
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+
+        let found = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let store = TerminalThreadMetadataStore::global(cx);
+                let store = store.read(cx);
+                (
+                    store
+                        .entries_for_path(&paths, Some(&remote))
+                        .map(|terminal| terminal.terminal_id)
+                        .collect::<Vec<_>>(),
+                    store
+                        .entries_for_path(&paths, None)
+                        .map(|terminal| terminal.terminal_id)
+                        .collect::<Vec<_>>(),
+                )
+            })
+        };
+        assert_eq!(found(cx), (vec![terminal_id], vec![]));
+
+        // Reloading the local database keeps the host's terminals.
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| store.reload(cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(found(cx), (vec![terminal_id], vec![]));
+    }
+
+    #[gpui::test]
+    async fn test_remote_terminals_cache_lists_terminals_before_host_connects(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/Users/me/Projects/app")]);
+        let remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 7 });
+        let host_terminal = metadata("✳ Host Terminal", WorktreePaths::from_folder_paths(&paths));
+        let terminal_id = host_terminal.terminal_id;
+
+        let cache = cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, _| {
+                store.apply_remote_rows(&remote, vec![host_terminal], store.mutation_count);
+                store.remote_terminals_cache().unwrap()
+            })
+        });
+
+        let restored = cx.update(|cx| {
+            cx.new(|cx| {
+                let db = gpui::block_on(db::open_test_db::<TerminalThreadMetadataDb>(
+                    "test_remote_terminals_cache_lists_terminals_before_host_connects",
+                ));
+                let mut store = TerminalThreadMetadataStore::new(TerminalThreadMetadataDb(db), cx);
+                store.apply_remote_terminals_cache(&cache).unwrap();
+                store
+            })
+        });
+        cx.run_until_parked();
+        restored.read_with(cx, |store, _| {
+            let terminal = store
+                .entry(terminal_id)
+                .expect("cached terminal should be listed");
+            assert_eq!(terminal.title.as_ref(), "✳ Host Terminal");
+            assert!(same_remote_connection_identity(
+                terminal.remote_connection.as_ref(),
+                Some(&remote)
+            ));
+            assert!(store.remote_terminals.contains_key(&terminal_id));
         });
     }
 
