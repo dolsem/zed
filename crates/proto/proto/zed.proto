@@ -540,7 +540,9 @@ message Envelope {
     ListAgentTerminalThreads list_agent_terminal_threads = 507;
     ListAgentTerminalThreadsResponse list_agent_terminal_threads_response = 508;
     SaveAgentTerminalThread save_agent_terminal_thread = 509;
-    DeleteAgentTerminalThread delete_agent_terminal_thread = 510; // current max
+    DeleteAgentTerminalThread delete_agent_terminal_thread = 510;
+    GetTerminalInitCommand get_terminal_init_command = 511;
+    GetTerminalInitCommandResponse get_terminal_init_command_response = 512; // current max
   }
 
   reserved 87 to 88;

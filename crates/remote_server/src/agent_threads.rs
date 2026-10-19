@@ -17,6 +17,7 @@ use futures::StreamExt as _;
 use gpui::{AppContext as _, AsyncApp, Context, Entity, Task};
 use release_channel::RELEASE_CHANNEL;
 use rpc::{AnyProtoClient, TypedEnvelope, proto};
+use settings::{SettingsFile, SettingsStore};
 use sqlez::{bindable::Column, connection::Connection, statement::Statement};
 use util::ResultExt as _;
 
@@ -43,6 +44,7 @@ impl AgentThreadsHost {
         session.add_request_handler(cx.weak_entity(), Self::handle_list_terminals);
         session.add_request_handler(cx.weak_entity(), Self::handle_save_terminal);
         session.add_request_handler(cx.weak_entity(), Self::handle_delete_terminal);
+        session.add_request_handler(cx.weak_entity(), Self::handle_get_terminal_init_command);
 
         let in_memory = fs.is_fake();
         let watch_changes = cx.background_spawn(async move {
@@ -403,6 +405,28 @@ impl AgentThreadsHost {
         .await?;
         Self::announce_write(&this, &cx);
         Ok(proto::Ack {})
+    }
+}
+
+impl AgentThreadsHost {
+    /// The server loads the host user's settings file, which is also the one
+    /// the Zed running on this host uses. Only that file is consulted: the
+    /// merged settings also contain the client's user settings, synced over.
+    async fn handle_get_terminal_init_command(
+        _: Entity<Self>,
+        _: TypedEnvelope<proto::GetTerminalInitCommand>,
+        cx: AsyncApp,
+    ) -> Result<proto::GetTerminalInitCommandResponse> {
+        let command = cx.update(|cx| {
+            cx.global::<SettingsStore>()
+                .get_content_for_file(SettingsFile::Server)?
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.terminal_init_command.clone())
+                // Matches how `AgentSettings` treats a blank command.
+                .filter(|command| !command.trim().is_empty())
+        });
+        Ok(proto::GetTerminalInitCommandResponse { command })
     }
 }
 

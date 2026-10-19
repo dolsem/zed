@@ -449,6 +449,8 @@ messages!(
     (ListAgentTerminalThreadsResponse, Background),
     (SaveAgentTerminalThread, Background),
     (DeleteAgentTerminalThread, Background),
+    (GetTerminalInitCommand, Background),
+    (GetTerminalInitCommandResponse, Background),
 );
 
 request_messages!(
@@ -700,6 +702,7 @@ request_messages!(
     (ListAgentTerminalThreads, ListAgentTerminalThreadsResponse),
     (SaveAgentTerminalThread, Ack),
     (DeleteAgentTerminalThread, Ack),
+    (GetTerminalInitCommand, GetTerminalInitCommandResponse),
 );
 
 lsp_messages!(

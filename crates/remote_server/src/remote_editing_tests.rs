@@ -4412,6 +4412,55 @@ async fn test_remote_agent_fs_tool_calls(cx: &mut TestAppContext, server_cx: &mu
 }
 
 #[gpui::test]
+async fn test_terminal_init_command_comes_from_remote_host(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/project"), json!({ "a.txt": "A" }))
+        .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+
+    cx.update_global(|settings_store: &mut SettingsStore, cx| {
+        settings_store.set_user_settings(
+            r#"{ "agent": { "terminal_init_command": "C:\\client\\init.cmd" } }"#,
+            cx,
+        )
+    })
+    .unwrap();
+    let client = project.read_with(cx, |project, cx| {
+        project.remote_client().unwrap().read(cx).proto_client()
+    });
+    let init_command = || {
+        let request = client.request(proto::GetTerminalInitCommand {});
+        async move { request.await.unwrap().command }
+    };
+
+    // Without a command configured on the host, none is run, even though
+    // the client has one.
+    let response = init_command();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    assert_eq!(response.await, None);
+
+    server_cx
+        .update_global(|settings_store: &mut SettingsStore, cx| {
+            settings_store.set_server_settings(
+                r#"{ "agent": { "terminal_init_command": "nu ~/scripts/zed-claude.nu" } }"#,
+                cx,
+            )
+        })
+        .unwrap();
+    let response = init_command();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    assert_eq!(
+        response.await.as_deref(),
+        Some("nu ~/scripts/zed-claude.nu")
+    );
+}
+
+#[gpui::test]
 async fn test_remote_project_threads_are_stored_on_host(
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,

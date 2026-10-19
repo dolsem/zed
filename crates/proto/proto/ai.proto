@@ -169,3 +169,11 @@ message SaveAgentTerminalThread {
 message DeleteAgentTerminalThread {
   string terminal_id = 1;
 }
+
+// Returns the terminal init command configured on the remote host, which
+// Terminal Threads of remote projects run instead of the client's.
+message GetTerminalInitCommand {}
+
+message GetTerminalInitCommandResponse {
+  optional string command = 1;
+}

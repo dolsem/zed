@@ -2052,7 +2052,7 @@ impl AgentPanel {
         // as empty and spawning a second, "initial" terminal on activation.
         self.pending_terminal_spawn = Some(terminal_id);
         let terminal_working_directory = working_directory.clone();
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = self.terminal_init_command(run_init_command, cx);
         // Expose the terminal thread's stable id to the shell (and thus to the
         // init command) so sessions can be correlated across restarts; the id is
         // persisted with the thread metadata and reused when the thread is restored.
@@ -2081,6 +2081,7 @@ impl AgentPanel {
                     return anyhow::Ok(());
                 }
             };
+            let init_command = init_command.await;
             this.update_in(cx, |this, window, cx| {
                 let terminal_for_init_command = terminal.clone();
                 let terminal_view = cx.new(|cx| {
@@ -2131,7 +2132,35 @@ impl AgentPanel {
         })
     }
 
-    fn terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
+    /// Terminals of remote projects run on the remote host, so they run the
+    /// init command configured there rather than the local one.
+    fn terminal_init_command(&self, run_init_command: bool, cx: &App) -> Task<Option<String>> {
+        if !run_init_command {
+            return Task::ready(None);
+        }
+        let project = self.project.read(cx);
+        let Some(remote_client) = project
+            .remote_client()
+            .filter(|_| !project.is_via_collab())
+        else {
+            return Task::ready(Self::local_terminal_init_command(run_init_command, cx));
+        };
+        let request = remote_client
+            .read(cx)
+            .proto_client()
+            .request(proto::GetTerminalInitCommand {});
+        cx.background_spawn(async move {
+            match request.await {
+                Ok(response) => response.command,
+                Err(error) => {
+                    log::error!("failed to get the remote host's terminal init command: {error:#}");
+                    None
+                }
+            }
+        })
+    }
+
+    fn local_terminal_init_command(run_init_command: bool, cx: &App) -> Option<String> {
         run_init_command
             .then(|| AgentSettings::get_global(cx).terminal_init_command.clone())
             .flatten()
@@ -6866,7 +6895,7 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let init_command = Self::terminal_init_command(run_init_command, cx);
+        let init_command = Self::local_terminal_init_command(run_init_command, cx);
         let terminal = self.build_display_only_terminal(cx);
         let terminal_for_init_command = terminal.clone();
         let terminal_view = cx.new(|cx| {
