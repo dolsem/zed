@@ -4515,6 +4515,15 @@ async fn test_remote_project_threads_are_stored_on_host(
         .await
         .unwrap();
 
+    // Once the host has the thread, no local copy is kept for it.
+    assert!(
+        storage
+            .upload_pending_threads(&cx.executor())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     let threads = storage.list_threads().await.unwrap();
     assert_eq!(threads.len(), 1);
     assert_eq!(threads[0].id, session_id);

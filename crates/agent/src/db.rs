@@ -416,6 +416,19 @@ pub(crate) fn serialize_thread(thread: DbThread) -> Result<(DataType, Vec<u8>)> 
     Ok((DataType::Zstd, compressed))
 }
 
+/// The content of a thread being saved on a remote host, kept locally until
+/// the host has it.
+#[derive(Clone)]
+pub(crate) struct PendingRemoteThread {
+    /// The remote host's connection identity, as a persistence key.
+    pub host: String,
+    /// Identifies the save, so that confirming it doesn't drop a newer one.
+    pub generation: String,
+    pub metadata: DbThreadMetadata,
+    pub data_type: DataType,
+    pub data: Vec<u8>,
+}
+
 pub(crate) struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
@@ -514,6 +527,25 @@ impl ThreadsDatabase {
                 "})?()?;
             }
         }
+
+        // Threads of remote projects are stored on the remote host. Their
+        // latest content is kept here until the host has it, so it isn't lost
+        // when Zed quits while the host is unreachable.
+        connection.exec(indoc! {"
+            CREATE TABLE IF NOT EXISTS pending_remote_threads (
+                id TEXT PRIMARY KEY,
+                host TEXT NOT NULL,
+                generation TEXT NOT NULL,
+                parent_id TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT,
+                summary TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data_type TEXT NOT NULL,
+                data BLOB NOT NULL
+            )
+        "})?()
+        .map_err(|e| e.context("Failed to create pending remote threads table"))?;
 
         let db = Self {
             executor,
@@ -673,6 +705,154 @@ impl ThreadsDatabase {
             Self::save_thread_sync(&connection, id, thread, &folder_paths)?;
             Self::announce_write(announce_writes);
             Ok(())
+        })
+    }
+
+    /// Keeps the content of a thread being saved on a remote host until the
+    /// host has it. `generation` identifies this save.
+    pub(crate) fn save_pending_remote_thread(
+        &self,
+        pending: PendingRemoteThread,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let PendingRemoteThread {
+                host,
+                generation,
+                metadata,
+                data_type,
+                data,
+            } = pending;
+            let serialized_folder_paths = metadata.folder_paths.serialize();
+            let (folder_paths, folder_paths_order) = if metadata.folder_paths.is_empty() {
+                (None, None)
+            } else {
+                (
+                    Some(serialized_folder_paths.paths),
+                    Some(serialized_folder_paths.order),
+                )
+            };
+            let connection = connection.lock();
+            let mut statement = Statement::prepare(
+                &connection,
+                indoc! {"
+                    INSERT OR REPLACE INTO pending_remote_threads
+                        (id, host, generation, parent_id, folder_paths, folder_paths_order, summary, updated_at, data_type, data)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "},
+            )?;
+            let mut i = statement.bind(&metadata.id.0, 1)?;
+            i = statement.bind(&host, i)?;
+            i = statement.bind(&generation, i)?;
+            i = statement.bind(&metadata.parent_session_id.map(|id| id.0), i)?;
+            i = statement.bind(&folder_paths, i)?;
+            i = statement.bind(&folder_paths_order, i)?;
+            i = statement.bind(&metadata.title.to_string(), i)?;
+            i = statement.bind(&metadata.updated_at.to_rfc3339(), i)?;
+            i = statement.bind(&data_type, i)?;
+            statement.bind(&data, i)?;
+            statement.exec()
+        })
+    }
+
+    pub(crate) fn load_pending_remote_thread(
+        &self,
+        id: acp::SessionId,
+    ) -> Task<Result<Option<DbThread>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let row = {
+                let connection = connection.lock();
+                connection.select_row_bound::<Arc<str>, (DataType, Vec<u8>)>(indoc! {"
+                    SELECT data_type, data FROM pending_remote_threads WHERE id = ?
+                "})?(id.0)?
+            };
+            row.map(|(data_type, data)| Self::deserialize_thread(data_type, data))
+                .transpose()
+        })
+    }
+
+    /// Returns the threads waiting to be saved on the given remote host.
+    pub(crate) fn pending_remote_threads(
+        &self,
+        host: String,
+    ) -> Task<Result<Vec<PendingRemoteThread>>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            let mut select = connection.select_bound::<String, (
+                Arc<str>,
+                String,
+                Option<Arc<str>>,
+                Option<String>,
+                Option<String>,
+                String,
+                String,
+                DataType,
+                Vec<u8>,
+            )>(indoc! {"
+                SELECT id, generation, parent_id, folder_paths, folder_paths_order, summary, updated_at, data_type, data
+                FROM pending_remote_threads WHERE host = ?
+            "})?;
+            let mut pending = Vec::new();
+            for (
+                id,
+                generation,
+                parent_id,
+                folder_paths,
+                folder_paths_order,
+                summary,
+                updated_at,
+                data_type,
+                data,
+            ) in select(host.clone())?
+            {
+                let folder_paths = folder_paths
+                    .map(|paths| {
+                        PathList::deserialize(&util::path_list::SerializedPathList {
+                            paths,
+                            order: folder_paths_order.unwrap_or_default(),
+                        })
+                    })
+                    .unwrap_or_default();
+                pending.push(PendingRemoteThread {
+                    host: host.clone(),
+                    generation,
+                    metadata: DbThreadMetadata {
+                        id: acp::SessionId::new(id),
+                        parent_session_id: parent_id.map(acp::SessionId::new),
+                        title: summary.into(),
+                        updated_at: DateTime::parse_from_rfc3339(&updated_at)?
+                            .with_timezone(&Utc),
+                        created_at: None,
+                        folder_paths,
+                    },
+                    data_type,
+                    data,
+                });
+            }
+            Ok(pending)
+        })
+    }
+
+    /// Forgets a pending thread once the remote host has it. When
+    /// `generation` is set, a newer save of the same thread is kept.
+    pub(crate) fn delete_pending_remote_thread(
+        &self,
+        id: acp::SessionId,
+        generation: Option<String>,
+    ) -> Task<Result<()>> {
+        let connection = self.connection.clone();
+        self.executor.spawn(async move {
+            let connection = connection.lock();
+            match generation {
+                Some(generation) => connection.exec_bound::<(Arc<str>, String)>(indoc! {"
+                    DELETE FROM pending_remote_threads WHERE id = ? AND generation = ?
+                "})?((id.0, generation)),
+                None => connection.exec_bound::<Arc<str>>(indoc! {"
+                    DELETE FROM pending_remote_threads WHERE id = ?
+                "})?(id.0),
+            }
         })
     }
 
@@ -858,6 +1038,85 @@ mod tests {
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
         }
+    }
+
+    #[gpui::test]
+    async fn test_pending_remote_threads_keep_newer_saves(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+        let id = session_id("remote-thread");
+        let pending = |title: &str, generation: &str| {
+            let thread = make_thread(title, Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap());
+            let (data_type, data) = serialize_thread(thread).unwrap();
+            PendingRemoteThread {
+                host: "ssh:me@host:".to_string(),
+                generation: generation.to_string(),
+                metadata: DbThreadMetadata {
+                    id: id.clone(),
+                    parent_session_id: None,
+                    title: title.to_string().into(),
+                    updated_at: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+                    created_at: None,
+                    folder_paths: PathList::new(&[std::path::Path::new("/project")]),
+                },
+                data_type,
+                data,
+            }
+        };
+
+        database
+            .save_pending_remote_thread(pending("First", "1"))
+            .await
+            .unwrap();
+        database
+            .save_pending_remote_thread(pending("Second", "2"))
+            .await
+            .unwrap();
+
+        // The host confirming the first save keeps the newer one.
+        database
+            .delete_pending_remote_thread(id.clone(), Some("1".to_string()))
+            .await
+            .unwrap();
+        let loaded = database
+            .load_pending_remote_thread(id.clone())
+            .await
+            .unwrap()
+            .expect("the newer save should be kept");
+        assert_eq!(loaded.title.as_ref(), "Second");
+
+        let listed = database
+            .pending_remote_threads("ssh:me@host:".to_string())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].generation, "2");
+        assert_eq!(listed[0].metadata.title.as_ref(), "Second");
+        assert_eq!(
+            listed[0].metadata.folder_paths,
+            PathList::new(&[std::path::Path::new("/project")])
+        );
+        assert!(
+            database
+                .pending_remote_threads("ssh:me@other:".to_string())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Pending copies aren't regular threads.
+        assert!(database.list_threads().await.unwrap().is_empty());
+
+        database
+            .delete_pending_remote_thread(id.clone(), Some("2".to_string()))
+            .await
+            .unwrap();
+        assert!(
+            database
+                .load_pending_remote_thread(id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[gpui::test]

@@ -1,19 +1,35 @@
-use crate::{DataType, DbThread, DbThreadMetadata, ThreadsDatabase, db::serialize_thread};
+use crate::{
+    DataType, DbThread, DbThreadMetadata, ThreadsDatabase,
+    db::{PendingRemoteThread, serialize_thread},
+};
 use agent_client_protocol::schema::v1 as acp;
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
 use client::{AnyProtoClient, proto};
+use futures::future::Shared;
 use gpui::{BackgroundExecutor, EntityId, Task};
 use remote::RemoteConnectionOptions;
-use util::path_list::{PathList, SerializedPathList};
+use std::sync::Arc;
+use util::{
+    ResultExt as _,
+    path_list::{PathList, SerializedPathList},
+};
+
+type DatabaseFuture = Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>;
 
 /// Native agent threads stored in the databases of a remote host, so that the
 /// Zed running on that host sees the same threads.
+///
+/// The content of a thread being saved is kept in the local database until the
+/// host has it, so that it survives Zed quitting while the host is unreachable.
 #[derive(Clone)]
 pub struct RemoteThreadStorage {
     host_id: EntityId,
     client: AnyProtoClient,
     connection_options: RemoteConnectionOptions,
+    /// The host's connection identity, as a persistence key.
+    host_key: String,
+    database: DatabaseFuture,
 }
 
 impl RemoteThreadStorage {
@@ -21,11 +37,15 @@ impl RemoteThreadStorage {
         host_id: EntityId,
         client: AnyProtoClient,
         connection_options: RemoteConnectionOptions,
+        database: DatabaseFuture,
     ) -> Self {
+        let host_key = remote::remote_connection_identity(&connection_options).persistence_key();
         Self {
             host_id,
             client,
             connection_options,
+            host_key,
+            database,
         }
     }
 
@@ -59,11 +79,19 @@ impl RemoteThreadStorage {
         id: acp::SessionId,
         executor: &BackgroundExecutor,
     ) -> Task<Result<Option<DbThread>>> {
-        let request = self.client.request(proto::LoadAgentThread {
-            id: id.0.to_string(),
-        });
+        let client = self.client.clone();
+        let database = self.database.clone();
         executor.spawn(async move {
-            let response = request.await?;
+            // A copy the host doesn't have yet is newer than the host's.
+            let database = database.await.map_err(|error| anyhow!(error))?;
+            if let Some(thread) = database.load_pending_remote_thread(id.clone()).await? {
+                return Ok(Some(thread));
+            }
+            let response = client
+                .request(proto::LoadAgentThread {
+                    id: id.0.to_string(),
+                })
+                .await?;
             let (Some(data_type), Some(data)) = (response.data_type, response.data) else {
                 return Ok(None);
             };
@@ -82,6 +110,8 @@ impl RemoteThreadStorage {
         executor: &BackgroundExecutor,
     ) -> Task<Result<DbThreadMetadata>> {
         let client = self.client.clone();
+        let database = self.database.clone();
+        let host = self.host_key.clone();
         executor.spawn(async move {
             let metadata = DbThreadMetadata {
                 id: id.clone(),
@@ -95,25 +125,87 @@ impl RemoteThreadStorage {
                 folder_paths,
             };
             let (data_type, data) = serialize_thread(thread)?;
-            client
-                .request(proto::SaveAgentThread {
-                    summary: Some(metadata_to_proto(&metadata)),
-                    data_type: data_type.as_str().to_string(),
-                    data,
-                })
-                .await?;
-            Ok(metadata)
+            let pending = PendingRemoteThread {
+                host,
+                generation: uuid::Uuid::new_v4().to_string(),
+                metadata,
+                data_type,
+                data,
+            };
+            let database = database.await.map_err(|error| anyhow!(error)).log_err();
+            if let Some(database) = &database {
+                database
+                    .save_pending_remote_thread(pending.clone())
+                    .await
+                    .context("keeping a local copy of a remote thread")
+                    .log_err();
+            }
+            Self::upload(&client, database.as_deref(), pending).await
         })
     }
 
-    pub fn delete_thread(&self, id: acp::SessionId) -> impl Future<Output = Result<()>> + use<> {
-        let request = self.client.request(proto::DeleteAgentThread {
-            id: id.0.to_string(),
-        });
-        async move {
-            request.await?;
-            Ok(())
+    /// Saves a pending thread on the remote host, then forgets the local copy.
+    async fn upload(
+        client: &AnyProtoClient,
+        database: Option<&ThreadsDatabase>,
+        pending: PendingRemoteThread,
+    ) -> Result<DbThreadMetadata> {
+        client
+            .request(proto::SaveAgentThread {
+                summary: Some(metadata_to_proto(&pending.metadata)),
+                data_type: pending.data_type.as_str().to_string(),
+                data: pending.data,
+            })
+            .await?;
+        if let Some(database) = database {
+            database
+                .delete_pending_remote_thread(pending.metadata.id.clone(), Some(pending.generation))
+                .await
+                .log_err();
         }
+        Ok(pending.metadata)
+    }
+
+    /// Saves the threads whose content the host doesn't have yet, e.g. because
+    /// Zed quit while the host was unreachable.
+    pub fn upload_pending_threads(
+        &self,
+        executor: &BackgroundExecutor,
+    ) -> Task<Result<Vec<DbThreadMetadata>>> {
+        let client = self.client.clone();
+        let database = self.database.clone();
+        let host = self.host_key.clone();
+        executor.spawn(async move {
+            let database = database.await.map_err(|error| anyhow!(error))?;
+            let mut uploaded = Vec::new();
+            for pending in database.pending_remote_threads(host).await? {
+                uploaded.push(Self::upload(&client, Some(&database), pending).await?);
+            }
+            Ok(uploaded)
+        })
+    }
+
+    pub fn delete_thread(
+        &self,
+        id: acp::SessionId,
+        executor: &BackgroundExecutor,
+    ) -> Task<Result<()>> {
+        let client = self.client.clone();
+        let database = self.database.clone();
+        executor.spawn(async move {
+            if let Some(database) = database.await.map_err(|error| anyhow!(error)).log_err() {
+                database
+                    .delete_pending_remote_thread(id.clone(), None)
+                    .await
+                    .log_err();
+            }
+            client
+                .request(proto::DeleteAgentThread {
+                    id: id.0.to_string(),
+                })
+                .await?;
+            Ok(())
+        })
     }
 }
 

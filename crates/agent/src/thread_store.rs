@@ -1,6 +1,6 @@
 use crate::{DbThread, DbThreadMetadata, RemoteThreadStorage, ThreadsDatabase};
 use agent_client_protocol::schema::v1 as acp;
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use client::proto;
 use collections::{HashMap, HashSet};
 use fs::Fs;
@@ -9,7 +9,7 @@ use gpui::{App, Context, Entity, EntityId, EventEmitter, Global, Subscription, T
 use project::Project;
 use remote::{RemoteClient, RemoteClientEvent};
 use std::{sync::Arc, time::Duration};
-use util::path_list::PathList;
+use util::{ResultExt as _, path_list::PathList};
 
 const CHANGES_WATCH_LATENCY: Duration = Duration::from_millis(300);
 
@@ -186,7 +186,12 @@ impl ThreadStore {
         self.remote_hosts.insert(
             host_id,
             RemoteThreadHost {
-                storage: RemoteThreadStorage::new(host_id, client, connection_options),
+                storage: RemoteThreadStorage::new(
+                    host_id,
+                    client,
+                    connection_options,
+                    ThreadsDatabase::connect(cx),
+                ),
                 threads: Vec::new(),
                 reload_task: None,
                 _subscriptions: subscriptions,
@@ -199,9 +204,15 @@ impl ThreadStore {
         let Some(host) = self.remote_hosts.get_mut(&host_id) else {
             return;
         };
-        let list = host.storage.list_threads();
+        let storage = host.storage.clone();
+        let upload = storage.upload_pending_threads(cx.background_executor());
         host.reload_task = Some(cx.spawn(async move |this, cx| {
-            let threads = list.await;
+            // Upload first, so that the host lists the uploaded threads.
+            upload
+                .await
+                .context("uploading threads to remote host")
+                .log_err();
+            let threads = storage.list_threads().await;
             this.update(cx, |this, cx| {
                 let Some(host) = this.remote_hosts.get_mut(&host_id) else {
                     return;
@@ -308,7 +319,7 @@ impl ThreadStore {
     ) -> Task<Result<()>> {
         if let Some(host) = self.remote_host_for_session(&id) {
             let host_id = host.storage.host_id();
-            let delete = host.storage.delete_thread(id);
+            let delete = host.storage.delete_thread(id, cx.background_executor());
             return cx.spawn(async move |this, cx| {
                 delete.await?;
                 this.update(cx, |this, cx| this.reload_remote_host(host_id, cx))

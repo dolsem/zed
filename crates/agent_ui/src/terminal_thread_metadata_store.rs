@@ -30,12 +30,22 @@ use crate::{
 /// The terminal threads of remote hosts as last seen, so they can be listed
 /// before the hosts are connected again (e.g. right after launch).
 const REMOTE_TERMINALS_CACHE_KEY: &str = "remote-terminal-thread-cache";
-const SAVE_REMOTE_TERMINALS_CACHE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// The writes to remote hosts that the hosts haven't confirmed yet, so they
+/// survive Zed quitting before the hosts are reachable again.
+const REMOTE_TERMINALS_OUTBOX_KEY: &str = "remote-terminal-thread-outbox";
+const PERSIST_REMOTE_STATE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedRemoteTerminals {
     connection: RemoteConnectionOptions,
     terminals: Vec<proto::AgentTerminalThread>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedRemoteWrite {
+    connection: RemoteConnectionOptions,
+    upsert: Option<proto::AgentTerminalThread>,
+    delete: Option<String>,
 }
 
 pub fn init(cx: &mut App) {
@@ -199,7 +209,11 @@ pub struct TerminalThreadMetadataStore {
     mutation_count: u64,
     last_mutation: HashMap<TerminalId, u64>,
     _thread_store_subscription: Option<Subscription>,
-    _save_remote_terminals_cache: Option<Task<()>>,
+    /// Writes to remote hosts that the host hasn't confirmed yet, with the
+    /// mutation count they were made at.
+    pending_remote_writes: HashMap<TerminalId, (RemoteConnectionOptions, RemoteWrite, u64)>,
+    _persist_remote_state: Option<Task<()>>,
+    _quit_subscription: Subscription,
 }
 
 #[derive(Debug, PartialEq)]
@@ -215,20 +229,32 @@ enum DbRequest {
 }
 
 enum RemoteDbOperation {
-    Upsert(TerminalThreadMetadata),
-    Delete(TerminalId),
+    /// A write, made when the store's mutation count was `mutation`.
+    Write { write: RemoteWrite, mutation: u64 },
     /// Re-fetches the host's terminals. `mutation_count` is the store's
     /// mutation count when the list was requested.
-    List {
-        mutation_count: u64,
-    },
+    List { mutation_count: u64 },
+}
+
+#[derive(Clone)]
+enum RemoteWrite {
+    Upsert(TerminalThreadMetadata),
+    Delete(TerminalId),
+}
+
+impl RemoteWrite {
+    fn terminal_id(&self) -> TerminalId {
+        match self {
+            RemoteWrite::Upsert(metadata) => metadata.terminal_id,
+            RemoteWrite::Delete(terminal_id) => *terminal_id,
+        }
+    }
 }
 
 impl RemoteDbOperation {
     fn terminal_id(&self) -> Option<TerminalId> {
         match self {
-            RemoteDbOperation::Upsert(metadata) => Some(metadata.terminal_id),
-            RemoteDbOperation::Delete(terminal_id) => Some(*terminal_id),
+            RemoteDbOperation::Write { write, .. } => Some(write.terminal_id()),
             RemoteDbOperation::List { .. } => None,
         }
     }
@@ -458,7 +484,7 @@ impl TerminalThreadMetadataStore {
 
         self.cache_terminal_metadata(metadata);
         if is_remote {
-            self.schedule_remote_terminals_cache_save(cx);
+            self.schedule_persist_remote_state(cx);
         }
     }
 
@@ -493,7 +519,7 @@ impl TerminalThreadMetadataStore {
             }
         }
         if self.enqueue_write(DbOperation::Delete(terminal_id), cx) {
-            self.schedule_remote_terminals_cache_save(cx);
+            self.schedule_persist_remote_state(cx);
         }
         cx.notify();
     }
@@ -560,9 +586,11 @@ impl TerminalThreadMetadataStore {
             mutation_count: 0,
             last_mutation: HashMap::default(),
             _thread_store_subscription,
-            _save_remote_terminals_cache: None,
+            pending_remote_writes: HashMap::default(),
+            _persist_remote_state: None,
+            _quit_subscription: cx.on_app_quit(Self::flush_remote_state_on_quit),
         };
-        this.load_remote_terminals_cache(cx);
+        this.load_remote_state(cx);
         if let Some(thread_store) = ThreadStore::try_global(cx) {
             let host_ids = thread_store
                 .read(cx)
@@ -694,12 +722,11 @@ impl TerminalThreadMetadataStore {
         };
         match remote_connection {
             Some(connection) => {
-                let operation = match operation {
-                    DbOperation::Upsert(metadata) => RemoteDbOperation::Upsert(metadata),
-                    DbOperation::Delete(terminal_id) => RemoteDbOperation::Delete(terminal_id),
+                let write = match operation {
+                    DbOperation::Upsert(metadata) => RemoteWrite::Upsert(metadata),
+                    DbOperation::Delete(terminal_id) => RemoteWrite::Delete(terminal_id),
                 };
-                self.remote_operations.push_back((connection, operation));
-                self.remote_operations_tx.try_send(()).log_err();
+                self.queue_remote_write(connection, write);
                 true
             }
             None => {
@@ -756,18 +783,30 @@ impl TerminalThreadMetadataStore {
                 };
                 let client = storage.client().clone();
                 let result = match &operation {
-                    RemoteDbOperation::Upsert(metadata) => client
-                        .request(proto::SaveAgentTerminalThread {
-                            terminal: Some(terminal_to_proto(metadata)),
-                        })
-                        .await
-                        .map(|_| ()),
-                    RemoteDbOperation::Delete(terminal_id) => client
-                        .request(proto::DeleteAgentTerminalThread {
-                            terminal_id: terminal_id.to_key_string(),
-                        })
-                        .await
-                        .map(|_| ()),
+                    RemoteDbOperation::Write { write, mutation } => {
+                        let result = match write {
+                            RemoteWrite::Upsert(metadata) => client
+                                .request(proto::SaveAgentTerminalThread {
+                                    terminal: Some(terminal_to_proto(metadata)),
+                                })
+                                .await
+                                .map(|_| ()),
+                            RemoteWrite::Delete(terminal_id) => client
+                                .request(proto::DeleteAgentTerminalThread {
+                                    terminal_id: terminal_id.to_key_string(),
+                                })
+                                .await
+                                .map(|_| ()),
+                        };
+                        if result.is_ok() {
+                            let (terminal_id, mutation) = (write.terminal_id(), *mutation);
+                            this.update(cx, |this, cx| {
+                                this.acknowledge_remote_write(terminal_id, mutation, cx)
+                            })
+                            .ok();
+                        }
+                        result
+                    }
                     RemoteDbOperation::List { mutation_count } => {
                         let mutation_count = *mutation_count;
                         let Some(response) = client
@@ -785,7 +824,7 @@ impl TerminalThreadMetadataStore {
                             .collect();
                         this.update(cx, |this, cx| {
                             this.apply_remote_rows(&connection, rows, mutation_count);
-                            this.schedule_remote_terminals_cache_save(cx);
+                            this.schedule_persist_remote_state(cx);
                             cx.notify();
                         })
                         .ok();
@@ -849,14 +888,121 @@ impl TerminalThreadMetadataStore {
         self.remote_operations_tx.try_send(()).log_err();
     }
 
-    fn load_remote_terminals_cache(&mut self, cx: &App) {
-        if let Some(cache) = KeyValueStore::global(cx)
-            .read_kvp(REMOTE_TERMINALS_CACHE_KEY)
+    /// Queues a write to a remote host, made at the current mutation count,
+    /// and keeps it in the outbox until the host confirms it.
+    fn queue_remote_write(&mut self, connection: RemoteConnectionOptions, write: RemoteWrite) {
+        let mutation = self.mutation_count;
+        self.pending_remote_writes.insert(
+            write.terminal_id(),
+            (connection.clone(), write.clone(), mutation),
+        );
+        self.remote_operations
+            .push_back((connection, RemoteDbOperation::Write { write, mutation }));
+        self.remote_operations_tx.try_send(()).log_err();
+    }
+
+    fn acknowledge_remote_write(&mut self, terminal_id: TerminalId, mutation: u64, cx: &App) {
+        if self
+            .pending_remote_writes
+            .get(&terminal_id)
+            .is_some_and(|(_, _, pending_mutation)| *pending_mutation == mutation)
+        {
+            self.pending_remote_writes.remove(&terminal_id);
+            self.schedule_persist_remote_state(cx);
+        }
+    }
+
+    fn load_remote_state(&mut self, cx: &App) {
+        // The key-value store is shared by all tests in a process.
+        if cfg!(any(test, feature = "test-support")) {
+            return;
+        }
+        let kvp = KeyValueStore::global(cx);
+        if let Some(cache) = kvp.read_kvp(REMOTE_TERMINALS_CACHE_KEY).log_err().flatten() {
+            self.apply_remote_terminals_cache(&cache).log_err();
+        }
+        if let Some(outbox) = kvp
+            .read_kvp(REMOTE_TERMINALS_OUTBOX_KEY)
             .log_err()
             .flatten()
         {
-            self.apply_remote_terminals_cache(&cache).log_err();
+            self.apply_remote_terminals_outbox(&outbox).log_err();
         }
+    }
+
+    /// Applies writes the hosts hadn't confirmed when Zed last quit, and
+    /// queues them to be sent once the hosts are connected.
+    fn apply_remote_terminals_outbox(&mut self, outbox: &str) -> anyhow::Result<()> {
+        for persisted in serde_json::from_str::<Vec<PersistedRemoteWrite>>(outbox)? {
+            let connection = persisted.connection;
+            let write = match (persisted.upsert, persisted.delete) {
+                (Some(row), _) => {
+                    let Some(mut metadata) = terminal_from_proto(row).log_err() else {
+                        continue;
+                    };
+                    metadata.remote_connection = Some(connection.clone());
+                    RemoteWrite::Upsert(metadata)
+                }
+                (None, Some(terminal_id)) => {
+                    let Some(terminal_id) = TerminalId::from_key_string(&terminal_id).log_err()
+                    else {
+                        continue;
+                    };
+                    RemoteWrite::Delete(terminal_id)
+                }
+                (None, None) => continue,
+            };
+            let terminal_id = write.terminal_id();
+            self.uncache_terminal(terminal_id);
+            match &write {
+                RemoteWrite::Upsert(metadata) => {
+                    self.remote_terminals
+                        .insert(terminal_id, connection.clone());
+                    self.cache_terminal_metadata(metadata.clone());
+                }
+                RemoteWrite::Delete(_) => {
+                    self.remote_terminals.remove(&terminal_id);
+                }
+            }
+            self.mutation_count += 1;
+            self.last_mutation.insert(terminal_id, self.mutation_count);
+            self.queue_remote_write(connection, write);
+        }
+        Ok(())
+    }
+
+    fn uncache_terminal(&mut self, terminal_id: TerminalId) {
+        let Some(terminal) = self.terminals.remove(&terminal_id) else {
+            return;
+        };
+        if let Some(ids) = self.terminals_by_paths.get_mut(terminal.folder_paths()) {
+            ids.remove(&terminal_id);
+        }
+        if let Some(ids) = self
+            .terminals_by_main_paths
+            .get_mut(terminal.main_worktree_paths())
+        {
+            ids.remove(&terminal_id);
+        }
+    }
+
+    fn remote_terminals_outbox(&self) -> anyhow::Result<String> {
+        let writes = self
+            .pending_remote_writes
+            .values()
+            .map(|(connection, write, _)| PersistedRemoteWrite {
+                connection: connection.clone(),
+                upsert: match write {
+                    RemoteWrite::Upsert(metadata) => Some(terminal_to_proto(metadata)),
+                    RemoteWrite::Delete(_) => None,
+                },
+                delete: match write {
+                    RemoteWrite::Upsert(_) => None,
+                    RemoteWrite::Delete(terminal_id) => Some(terminal_id.to_key_string()),
+                },
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_string(&writes)?)
     }
 
     fn apply_remote_terminals_cache(&mut self, cache: &str) -> anyhow::Result<()> {
@@ -871,20 +1017,55 @@ impl TerminalThreadMetadataStore {
         Ok(())
     }
 
-    /// Saves the terminals of remote hosts as currently known, shortly after
-    /// they stop changing.
-    fn schedule_remote_terminals_cache_save(&mut self, cx: &App) {
-        let Some(cache) = self.remote_terminals_cache().log_err() else {
-            return;
-        };
-        let kvp = KeyValueStore::global(cx);
+    /// Saves the terminals of remote hosts as currently known, and the writes
+    /// they haven't confirmed, shortly after they stop changing.
+    fn schedule_persist_remote_state(&mut self, cx: &App) {
+        let persist = self.persist_remote_state(cx);
         let executor = cx.background_executor().clone();
-        self._save_remote_terminals_cache = Some(cx.background_spawn(async move {
-            executor.timer(SAVE_REMOTE_TERMINALS_CACHE_DELAY).await;
-            kvp.write_kvp(REMOTE_TERMINALS_CACHE_KEY.to_string(), cache)
-                .await
-                .log_err();
+        self._persist_remote_state = Some(cx.background_spawn(async move {
+            executor.timer(PERSIST_REMOTE_STATE_DELAY).await;
+            persist.await;
         }));
+    }
+
+    fn persist_remote_state(&self, cx: &App) -> impl Future<Output = ()> + use<> {
+        let cache = self.remote_terminals_cache().log_err();
+        let outbox = self.remote_terminals_outbox().log_err();
+        let kvp = KeyValueStore::global(cx);
+        // The key-value store is shared by all tests in a process.
+        let skip = cfg!(any(test, feature = "test-support"));
+        async move {
+            if skip {
+                return;
+            }
+            if let Some(cache) = cache {
+                kvp.write_kvp(REMOTE_TERMINALS_CACHE_KEY.to_string(), cache)
+                    .await
+                    .log_err();
+            }
+            if let Some(outbox) = outbox {
+                kvp.write_kvp(REMOTE_TERMINALS_OUTBOX_KEY.to_string(), outbox)
+                    .await
+                    .log_err();
+            }
+        }
+    }
+
+    /// Writes any state still waiting for its debounce before Zed quits.
+    fn flush_remote_state_on_quit(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl Future<Output = ()> + use<> {
+        let pending = self
+            ._persist_remote_state
+            .take()
+            .is_some_and(|task| !task.is_ready());
+        let persist = pending.then(|| self.persist_remote_state(cx));
+        async move {
+            if let Some(persist) = persist {
+                persist.await;
+            }
+        }
     }
 
     fn remote_terminals_cache(&self) -> anyhow::Result<String> {
@@ -1409,6 +1590,53 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(found(cx), (vec![terminal_id], vec![]));
+    }
+
+    #[gpui::test]
+    async fn test_terminal_writes_to_disconnected_host_survive_relaunch(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/Users/me/Projects/app")]);
+        let remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 9 });
+        let host_terminal = metadata("✳ Host Terminal", WorktreePaths::from_folder_paths(&paths));
+        let terminal_id = host_terminal.terminal_id;
+
+        let (cache, outbox) = cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.apply_remote_rows(&remote, vec![host_terminal], store.mutation_count);
+                store.rename_terminal(terminal_id, "Renamed".into(), cx);
+                (
+                    store.remote_terminals_cache().unwrap(),
+                    store.remote_terminals_outbox().unwrap(),
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        let restored = cx.update(|cx| {
+            cx.new(|cx| {
+                let db = gpui::block_on(db::open_test_db::<TerminalThreadMetadataDb>(
+                    "test_terminal_writes_to_disconnected_host_survive_relaunch",
+                ));
+                let mut store = TerminalThreadMetadataStore::new(TerminalThreadMetadataDb(db), cx);
+                store.apply_remote_terminals_cache(&cache).unwrap();
+                store.apply_remote_terminals_outbox(&outbox).unwrap();
+                store
+            })
+        });
+        cx.run_until_parked();
+        restored.read_with(cx, |store, _| {
+            assert_eq!(
+                store.entry(terminal_id).unwrap().custom_title.as_deref(),
+                Some("Renamed")
+            );
+            assert!(store.pending_remote_writes.contains_key(&terminal_id));
+            assert!(matches!(
+                store.stalled_remote_operations.as_slice(),
+                [(_, RemoteDbOperation::Write { write: RemoteWrite::Upsert(metadata), .. })]
+                    if metadata.terminal_id == terminal_id
+            ));
+        });
     }
 
     #[gpui::test]

@@ -524,18 +524,32 @@ pub struct ThreadMetadataStore {
     mutation_count: u64,
     last_mutation: HashMap<ThreadId, u64>,
     _thread_store_subscription: Option<Subscription>,
-    _save_remote_threads_cache: Option<Task<()>>,
+    /// Writes to remote hosts that the host hasn't confirmed yet, with the
+    /// mutation count they were made at.
+    pending_remote_writes: HashMap<ThreadId, (RemoteConnectionOptions, RemoteWrite, u64)>,
+    _persist_remote_state: Option<Task<()>>,
+    _quit_subscription: Subscription,
 }
 
 /// The threads of remote hosts as last seen, so they can be listed before the
 /// hosts are connected again (e.g. right after launch).
 const REMOTE_THREADS_CACHE_KEY: &str = "remote-thread-metadata-cache";
-const SAVE_REMOTE_THREADS_CACHE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// The writes to remote hosts that the hosts haven't confirmed yet, so they
+/// survive Zed quitting before the hosts are reachable again.
+const REMOTE_THREADS_OUTBOX_KEY: &str = "remote-thread-metadata-outbox";
+const PERSIST_REMOTE_STATE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedRemoteThreads {
     connection: RemoteConnectionOptions,
     threads: Vec<proto::AgentThreadMetadata>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedRemoteWrite {
+    connection: RemoteConnectionOptions,
+    upsert: Option<proto::AgentThreadMetadata>,
+    delete: Option<ThreadId>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -551,20 +565,32 @@ enum DbRequest {
 }
 
 enum RemoteDbOperation {
-    Upsert(ThreadMetadata),
-    Delete(ThreadId),
+    /// A write, made when the store's mutation count was `mutation`.
+    Write { write: RemoteWrite, mutation: u64 },
     /// Re-fetches the host's threads. `mutation_count` is the store's
     /// mutation count when the list was requested.
-    List {
-        mutation_count: u64,
-    },
+    List { mutation_count: u64 },
+}
+
+#[derive(Clone)]
+enum RemoteWrite {
+    Upsert(ThreadMetadata),
+    Delete(ThreadId),
+}
+
+impl RemoteWrite {
+    fn thread_id(&self) -> ThreadId {
+        match self {
+            RemoteWrite::Upsert(metadata) => metadata.thread_id,
+            RemoteWrite::Delete(thread_id) => *thread_id,
+        }
+    }
 }
 
 impl RemoteDbOperation {
     fn thread_id(&self) -> Option<ThreadId> {
         match self {
-            RemoteDbOperation::Upsert(metadata) => Some(metadata.thread_id),
-            RemoteDbOperation::Delete(thread_id) => Some(*thread_id),
+            RemoteDbOperation::Write { write, .. } => Some(write.thread_id()),
             RemoteDbOperation::List { .. } => None,
         }
     }
@@ -888,12 +914,11 @@ impl ThreadMetadataStore {
         };
         match remote_connection {
             Some(connection) => {
-                let operation = match operation {
-                    DbOperation::Upsert(metadata) => RemoteDbOperation::Upsert(metadata),
-                    DbOperation::Delete(thread_id) => RemoteDbOperation::Delete(thread_id),
+                let write = match operation {
+                    DbOperation::Upsert(metadata) => RemoteWrite::Upsert(metadata),
+                    DbOperation::Delete(thread_id) => RemoteWrite::Delete(thread_id),
                 };
-                self.remote_operations.push_back((connection, operation));
-                self.remote_operations_tx.try_send(()).log_err();
+                self.queue_remote_write(connection, write);
                 true
             }
             None => {
@@ -905,14 +930,112 @@ impl ThreadMetadataStore {
         }
     }
 
-    fn load_remote_threads_cache(&mut self, cx: &App) {
-        if let Some(cache) = KeyValueStore::global(cx)
-            .read_kvp(REMOTE_THREADS_CACHE_KEY)
-            .log_err()
-            .flatten()
+    /// Queues a write to a remote host, made at the current mutation count,
+    /// and keeps it in the outbox until the host confirms it.
+    fn queue_remote_write(&mut self, connection: RemoteConnectionOptions, write: RemoteWrite) {
+        let mutation = self.mutation_count;
+        self.pending_remote_writes.insert(
+            write.thread_id(),
+            (connection.clone(), write.clone(), mutation),
+        );
+        self.remote_operations
+            .push_back((connection, RemoteDbOperation::Write { write, mutation }));
+        self.remote_operations_tx.try_send(()).log_err();
+    }
+
+    fn acknowledge_remote_write(&mut self, thread_id: ThreadId, mutation: u64, cx: &App) {
+        if self
+            .pending_remote_writes
+            .get(&thread_id)
+            .is_some_and(|(_, _, pending_mutation)| *pending_mutation == mutation)
         {
+            self.pending_remote_writes.remove(&thread_id);
+            self.schedule_persist_remote_state(cx);
+        }
+    }
+
+    fn load_remote_state(&mut self, cx: &App) {
+        // The key-value store is shared by all tests in a process.
+        if cfg!(any(test, feature = "test-support")) {
+            return;
+        }
+        let kvp = KeyValueStore::global(cx);
+        if let Some(cache) = kvp.read_kvp(REMOTE_THREADS_CACHE_KEY).log_err().flatten() {
             self.apply_remote_threads_cache(&cache).log_err();
         }
+        if let Some(outbox) = kvp.read_kvp(REMOTE_THREADS_OUTBOX_KEY).log_err().flatten() {
+            self.apply_remote_threads_outbox(&outbox).log_err();
+        }
+    }
+
+    /// Applies writes the hosts hadn't confirmed when Zed last quit, and
+    /// queues them to be sent once the hosts are connected.
+    fn apply_remote_threads_outbox(&mut self, outbox: &str) -> anyhow::Result<()> {
+        for persisted in serde_json::from_str::<Vec<PersistedRemoteWrite>>(outbox)? {
+            let connection = persisted.connection;
+            let write = match (persisted.upsert, persisted.delete) {
+                (Some(row), _) => {
+                    let Some(mut metadata) = metadata_from_proto(row).log_err() else {
+                        continue;
+                    };
+                    metadata.remote_connection = Some(connection.clone());
+                    RemoteWrite::Upsert(metadata)
+                }
+                (None, Some(thread_id)) => RemoteWrite::Delete(thread_id),
+                (None, None) => continue,
+            };
+            let thread_id = write.thread_id();
+            self.uncache_thread(thread_id);
+            match &write {
+                RemoteWrite::Upsert(metadata) => {
+                    self.remote_threads.insert(thread_id, connection.clone());
+                    self.cache_thread_metadata(metadata.clone());
+                }
+                RemoteWrite::Delete(_) => {
+                    self.remote_threads.remove(&thread_id);
+                }
+            }
+            self.record_mutation(thread_id);
+            self.queue_remote_write(connection, write);
+        }
+        Ok(())
+    }
+
+    fn uncache_thread(&mut self, thread_id: ThreadId) {
+        let Some(thread) = self.threads.remove(&thread_id) else {
+            return;
+        };
+        if let Some(session_id) = &thread.session_id {
+            self.threads_by_session.remove(session_id);
+        }
+        if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
+            thread_ids.remove(&thread_id);
+        }
+        if let Some(thread_ids) = self
+            .threads_by_main_paths
+            .get_mut(thread.main_worktree_paths())
+        {
+            thread_ids.remove(&thread_id);
+        }
+    }
+
+    fn remote_threads_outbox(&self) -> anyhow::Result<String> {
+        let writes = self
+            .pending_remote_writes
+            .values()
+            .map(|(connection, write, _)| PersistedRemoteWrite {
+                connection: connection.clone(),
+                upsert: match write {
+                    RemoteWrite::Upsert(metadata) => Some(metadata_to_proto(metadata)),
+                    RemoteWrite::Delete(_) => None,
+                },
+                delete: match write {
+                    RemoteWrite::Upsert(_) => None,
+                    RemoteWrite::Delete(thread_id) => Some(*thread_id),
+                },
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_string(&writes)?)
     }
 
     fn apply_remote_threads_cache(&mut self, cache: &str) -> anyhow::Result<()> {
@@ -927,20 +1050,55 @@ impl ThreadMetadataStore {
         Ok(())
     }
 
-    /// Saves the threads of remote hosts as currently known, shortly after
-    /// they stop changing.
-    fn schedule_remote_threads_cache_save(&mut self, cx: &App) {
-        let Some(cache) = self.remote_threads_cache().log_err() else {
-            return;
-        };
-        let kvp = KeyValueStore::global(cx);
+    /// Saves the threads of remote hosts as currently known, and the writes
+    /// they haven't confirmed, shortly after they stop changing.
+    fn schedule_persist_remote_state(&mut self, cx: &App) {
+        let persist = self.persist_remote_state(cx);
         let executor = cx.background_executor().clone();
-        self._save_remote_threads_cache = Some(cx.background_spawn(async move {
-            executor.timer(SAVE_REMOTE_THREADS_CACHE_DELAY).await;
-            kvp.write_kvp(REMOTE_THREADS_CACHE_KEY.to_string(), cache)
-                .await
-                .log_err();
+        self._persist_remote_state = Some(cx.background_spawn(async move {
+            executor.timer(PERSIST_REMOTE_STATE_DELAY).await;
+            persist.await;
         }));
+    }
+
+    fn persist_remote_state(&self, cx: &App) -> impl Future<Output = ()> + use<> {
+        let cache = self.remote_threads_cache().log_err();
+        let outbox = self.remote_threads_outbox().log_err();
+        let kvp = KeyValueStore::global(cx);
+        // The key-value store is shared by all tests in a process.
+        let skip = cfg!(any(test, feature = "test-support"));
+        async move {
+            if skip {
+                return;
+            }
+            if let Some(cache) = cache {
+                kvp.write_kvp(REMOTE_THREADS_CACHE_KEY.to_string(), cache)
+                    .await
+                    .log_err();
+            }
+            if let Some(outbox) = outbox {
+                kvp.write_kvp(REMOTE_THREADS_OUTBOX_KEY.to_string(), outbox)
+                    .await
+                    .log_err();
+            }
+        }
+    }
+
+    /// Writes any state still waiting for its debounce before Zed quits.
+    fn flush_remote_state_on_quit(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> impl Future<Output = ()> + use<> {
+        let pending = self
+            ._persist_remote_state
+            .take()
+            .is_some_and(|task| !task.is_ready());
+        let persist = pending.then(|| self.persist_remote_state(cx));
+        async move {
+            if let Some(persist) = persist {
+                persist.await;
+            }
+        }
     }
 
     fn remote_threads_cache(&self) -> anyhow::Result<String> {
@@ -1011,18 +1169,30 @@ impl ThreadMetadataStore {
                 };
                 let client = storage.client().clone();
                 let result = match &operation {
-                    RemoteDbOperation::Upsert(metadata) => client
-                        .request(proto::SaveAgentThreadMetadata {
-                            metadata: Some(metadata_to_proto(metadata)),
-                        })
-                        .await
-                        .map(|_| ()),
-                    RemoteDbOperation::Delete(thread_id) => client
-                        .request(proto::DeleteAgentThreadMetadata {
-                            thread_id: thread_id.0.as_bytes().to_vec(),
-                        })
-                        .await
-                        .map(|_| ()),
+                    RemoteDbOperation::Write { write, mutation } => {
+                        let result = match write {
+                            RemoteWrite::Upsert(metadata) => client
+                                .request(proto::SaveAgentThreadMetadata {
+                                    metadata: Some(metadata_to_proto(metadata)),
+                                })
+                                .await
+                                .map(|_| ()),
+                            RemoteWrite::Delete(thread_id) => client
+                                .request(proto::DeleteAgentThreadMetadata {
+                                    thread_id: thread_id.0.as_bytes().to_vec(),
+                                })
+                                .await
+                                .map(|_| ()),
+                        };
+                        if result.is_ok() {
+                            let (thread_id, mutation) = (write.thread_id(), *mutation);
+                            this.update(cx, |this, cx| {
+                                this.acknowledge_remote_write(thread_id, mutation, cx)
+                            })
+                            .ok();
+                        }
+                        result
+                    }
                     RemoteDbOperation::List { mutation_count } => {
                         let mutation_count = *mutation_count;
                         let Some(response) = client
@@ -1040,7 +1210,7 @@ impl ThreadMetadataStore {
                             .collect();
                         this.update(cx, |this, cx| {
                             this.apply_remote_rows(&connection, rows, mutation_count);
-                            this.schedule_remote_threads_cache_save(cx);
+                            this.schedule_persist_remote_state(cx);
                             cx.notify();
                         })
                         .ok();
@@ -1183,7 +1353,7 @@ impl ThreadMetadataStore {
 
         self.cache_thread_metadata(metadata);
         if is_remote {
-            self.schedule_remote_threads_cache_save(cx);
+            self.schedule_persist_remote_state(cx);
         }
     }
 
@@ -1476,7 +1646,7 @@ impl ThreadMetadataStore {
 
                 let thread = thread.clone();
                 if self.enqueue_write(DbOperation::Upsert(thread), cx) {
-                    self.schedule_remote_threads_cache_save(cx);
+                    self.schedule_persist_remote_state(cx);
                 }
             }
         }
@@ -1599,7 +1769,7 @@ impl ThreadMetadataStore {
         }
         self.threads.remove(&thread_id);
         if self.enqueue_write(DbOperation::Delete(thread_id), cx) {
-            self.schedule_remote_threads_cache_save(cx);
+            self.schedule_persist_remote_state(cx);
         }
         crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
         cx.notify();
@@ -1720,9 +1890,11 @@ impl ThreadMetadataStore {
             mutation_count: 0,
             last_mutation: HashMap::default(),
             _thread_store_subscription,
-            _save_remote_threads_cache: None,
+            pending_remote_writes: HashMap::default(),
+            _persist_remote_state: None,
+            _quit_subscription: cx.on_app_quit(Self::flush_remote_state_on_quit),
         };
-        this.load_remote_threads_cache(cx);
+        this.load_remote_state(cx);
         if let Some(thread_store) = ThreadStore::try_global(cx) {
             let host_ids = thread_store
                 .read(cx)
@@ -3717,6 +3889,61 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(found(cx), (vec![thread_id], vec![thread_id]));
+    }
+
+    #[gpui::test]
+    async fn test_writes_to_disconnected_host_survive_relaunch(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let paths = PathList::new(&[Path::new("/Users/me/Projects/app")]);
+        let remote = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 9 });
+        let mut host_thread = make_metadata("host-session", "Host Thread", Utc::now(), paths);
+        host_thread.remote_connection = Some(remote.clone());
+        let thread_id = host_thread.thread_id;
+
+        // The host isn't connected, so archiving the thread can't reach it.
+        let (cache, outbox) = cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.apply_remote_rows(&remote, vec![host_thread], store.mutation_count);
+                store.archive(thread_id, None, cx);
+                (
+                    store.remote_threads_cache().unwrap(),
+                    store.remote_threads_outbox().unwrap(),
+                )
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(store.pending_remote_writes.contains_key(&thread_id));
+            assert_eq!(store.stalled_remote_operations.len(), 1);
+        });
+
+        // After relaunching, the change is still there, and is sent once the
+        // host connects.
+        let restored = cx.update(|cx| {
+            cx.new(|cx| {
+                let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+                    "test_writes_to_disconnected_host_survive_relaunch",
+                ));
+                let mut store = ThreadMetadataStore::new(ThreadMetadataDb(db), cx);
+                store.apply_remote_threads_cache(&cache).unwrap();
+                store.apply_remote_threads_outbox(&outbox).unwrap();
+                store
+            })
+        });
+        cx.run_until_parked();
+        restored.read_with(cx, |store, _| {
+            assert!(store.entry(thread_id).unwrap().archived);
+            assert!(store.remote_threads.contains_key(&thread_id));
+            assert!(store.pending_remote_writes.contains_key(&thread_id));
+            assert!(matches!(
+                store.stalled_remote_operations.as_slice(),
+                [(_, RemoteDbOperation::Write { write: RemoteWrite::Upsert(metadata), .. })]
+                    if metadata.thread_id == thread_id && metadata.archived
+            ));
+        });
     }
 
     #[gpui::test]
