@@ -1,3 +1,5 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
@@ -73,6 +75,29 @@ Agent threads of a project opened over a remote connection (SSH, WSL, Docker) ar
 - When Zed starts, it reconnects to the remote projects in the sidebar in the background. That refreshes their threads and restores their unsaved changes. Until a host is reconnected, the client lists the threads it last saw there.
 - Changes made while a host is unreachable are kept on the client, also across restarts, and sent once the host is reachable again.
 - If the same thread is open on both machines at once, the last save wins.
+
+#### Mobile web app
+
+Zed can serve a web app that lets you control it from your phone. It works like an app when added to the home screen, including on iOS, and it can send push notifications when an agent finishes or needs permission.
+
+- **Threads:** the active threads of every project, including remote ones. Terminal Threads are listed but can't be opened yet. The **+** button starts a thread in a chosen project, worktree (or a new worktree) and agent.
+- **Thread:** the full chat, with tool calls, permission prompts, the plan, the message queue and the model/mode/profile/thinking/effort/fast-mode controls.
+- **Tabs:** the thread's workspace's editor tabs, plus its terminals along the bottom. **+** opens a file tree, and a git history whose first entry is the uncommitted changes. That view always includes untracked files, whatever `git_panel.untracked_changes` says.
+- **Editors** open full screen. They stay in sync with Zed's buffers, with syntax highlighting, diagnostics, completions, hover, go-to-definition, formatting and saving through Zed. Diffs and terminals also open full screen.
+
+To set it up:
+
+1. Enable the server. It listens on `127.0.0.1:7878` by default:
+   ```json
+   "mobile_server": { "enabled": true, "address": "127.0.0.1", "port": 7878 }
+   ```
+2. Expose it over HTTPS with a reverse proxy, e.g. `cloudflared tunnel --url http://127.0.0.1:7878`. Installing the app and receiving push notifications both need HTTPS.
+3. Open the URL on your phone and add it to the home screen. Run `mobile server: pair device` in Zed and enter the code it shows in the app. Do this from the installed app, because on iOS it doesn't share storage with Safari.
+4. Turn on notifications in the app's settings (the gear icon).
+
+Pushes follow the same rule as Zed's own popups: nothing is sent while the thread is on screen in an active Zed window. On top of that, they only go out when the phone was the last thing used to interact with Zed, unless the bell in the status bar is switched on (`mobile_server.always_notify`), which pushes whenever Zed would notify.
+
+`mobile server: unpair all devices` revokes every paired phone. The server is the separate `mobile_server` executable, which Zed starts and stops. Its state (paired devices, push keys) lives in Zed's data directory under `mobile_server/`.
 
 #### `dolsem` release channel
 

@@ -1,0 +1,37 @@
+{
+  "name": "zed-mobile-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "PWA for controlling Zed from a phone",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "mock": "node mock/server.mjs",
+    "mock:dist": "node mock/server.mjs --dist"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.4",
+    "@codemirror/collab": "^6.1.1",
+    "@codemirror/commands": "^6.11.1",
+    "@codemirror/language": "^6.13.1",
+    "@codemirror/lint": "^6.9.7",
+    "@codemirror/merge": "^6.12.3",
+    "@codemirror/search": "^6.7.2",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.15",
+    "@preact/signals": "^2.11.3",
+    "codemirror": "^6.0.2",
+    "dompurify": "^3.4.17",
+    "marked": "^18.1.1",
+    "preact": "^11.0.1"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4",
+    "ws": "^8.22.0"
+  }
+}

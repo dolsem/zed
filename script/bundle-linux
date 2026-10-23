@@ -79,7 +79,7 @@ fi
 export CC=${CC:-$(which clang)}
 
 # Build binary in release mode
-cargo --config .cargo/bundle-config.toml build --release --target "${target_triple}" --package zed --package cli
+cargo --config .cargo/bundle-config.toml build --release --target "${target_triple}" --package zed --package cli --package mobile_server
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
 if [[ "$remote_server_triple" == "$musl_triple" ]]; then
@@ -126,6 +126,7 @@ llvm-objcopy --only-keep-debug "${target_dir}/${target_triple}/release/zed" "${t
 llvm-objcopy --only-keep-debug "${target_dir}/${remote_server_triple}/release/remote_server" "${target_dir}/${remote_server_triple}/release/remote_server.dbg"
 llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/zed"
 llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/cli"
+llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/mobile_server"
 llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/release/remote_server"
 
 # Ensure that remote_server does not depend on libssl nor libcrypto, as we got rid of these deps.
@@ -151,6 +152,7 @@ zed_dir="${temp_dir}/zed$suffix.app"
 mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
 cp "${target_dir}/${target_triple}/release/zed" "${zed_dir}/libexec/zed-editor"
 cp "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/zed"
+cp "${target_dir}/${target_triple}/release/mobile_server" "${zed_dir}/libexec/mobile_server"
 
 # Libs
 # Bundle libstdc++ so older supported systems can run binaries built with our

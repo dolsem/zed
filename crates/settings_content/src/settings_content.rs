@@ -316,6 +316,9 @@ pub struct SettingsContent {
     /// Settings for the which-key popup.
     pub which_key: Option<WhichKeySettingsContent>,
 
+    /// Settings for the server that lets the mobile web app control Zed.
+    pub mobile_server: Option<MobileServerSettingsContent>,
+
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
 
@@ -408,7 +411,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
-        title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
+        title_bar, vim_mode, calls, which_key, mobile_server, vim, modeline_lines, feature_flags,
         instrumentation,
     },
     defaults: {},
@@ -1509,6 +1512,33 @@ pub struct WhichKeySettingsContent {
     ///
     /// Default: 1000
     pub delay_ms: Option<u64>,
+}
+
+/// Settings for the server that lets the mobile web app control Zed.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct MobileServerSettingsContent {
+    /// Whether to run the server for the mobile web app.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// The address to listen on. Keep this on localhost and expose the server
+    /// through a reverse proxy (e.g. a Cloudflare tunnel) that provides HTTPS,
+    /// which installing the app and push notifications require.
+    ///
+    /// Default: "127.0.0.1"
+    pub address: Option<String>,
+    /// The port to listen on.
+    ///
+    /// Default: 7878
+    pub port: Option<u16>,
+    /// Whether to push agent notifications to paired phones even when the
+    /// last interaction with Zed was on the desktop. When false, pushes are
+    /// only sent after the mobile app was the last thing used. Toggled by the
+    /// status bar item.
+    ///
+    /// Default: false
+    pub always_notify: Option<bool>,
 }
 
 // An ExtendingVec in the settings can only accumulate new values.

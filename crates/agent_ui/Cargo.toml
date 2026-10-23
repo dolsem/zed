@@ -74,6 +74,7 @@ lru.workspace = true
 lsp.workspace = true
 markdown.workspace = true
 menu.workspace = true
+mobile_protocol.workspace = true
 multi_buffer.workspace = true
 notifications.workspace = true
 ordered-float.workspace = true

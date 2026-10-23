@@ -929,6 +929,26 @@ impl TerminalPanel {
         })
     }
 
+    /// Adds a shell in the default working directory to the panel without
+    /// focusing it.
+    pub fn add_default_terminal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        let working_directory = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| default_working_directory(workspace.read(cx), cx));
+        self.add_terminal_shell(
+            false,
+            working_directory,
+            RevealStrategy::NoFocus,
+            window,
+            cx,
+        )
+    }
+
     fn add_terminal_shell(
         &mut self,
         force_local: bool,

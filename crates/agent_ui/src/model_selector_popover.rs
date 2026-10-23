@@ -32,6 +32,10 @@ impl ModelSelectorPopover {
         self.menu_handle.toggle(window, cx);
     }
 
+    pub(crate) fn selector(&self) -> &Entity<ModelSelector> {
+        &self.selector
+    }
+
     pub fn active_model<'a>(&self, cx: &'a App) -> Option<&'a AgentModelInfo> {
         self.selector.read(cx).delegate.active_model()
     }

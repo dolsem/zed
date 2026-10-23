@@ -180,6 +180,14 @@ impl Addon for CommitDiffAddon {
 const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
 
 impl CommitView {
+    pub fn commit(&self) -> &CommitDetails {
+        &self.commit
+    }
+
+    pub fn repository(&self) -> &Entity<Repository> {
+        &self.repository
+    }
+
     pub fn open(
         commit_sha: String,
         repo: WeakEntity<Repository>,

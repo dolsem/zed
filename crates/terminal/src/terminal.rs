@@ -2527,6 +2527,28 @@ impl Terminal {
         content_text(&term)
     }
 
+    /// Builds the visible screen's content straight from the grid. Unlike
+    /// `last_content`, which `sync` only refreshes while the terminal is
+    /// rendered, it's current even when the terminal isn't visible.
+    pub fn current_content(&self) -> Content {
+        let term = self.term.lock_unfair();
+        make_content(&term, &self.last_content)
+    }
+
+    /// Scrolls the viewport right away instead of on the next `sync`, for
+    /// callers that read the screen with `current_content`. Positive values
+    /// scroll up into the history.
+    pub fn scroll_viewport_by(&mut self, lines: i32, cx: &mut Context<Self>) {
+        scroll_display(&mut self.term.lock_unfair(), Scroll::Delta(lines));
+        cx.emit(Event::Wakeup);
+    }
+
+    /// Like `scroll_viewport_by`, but scrolls to the bottom.
+    pub fn scroll_viewport_to_bottom(&mut self, cx: &mut Context<Self>) {
+        scroll_display(&mut self.term.lock_unfair(), Scroll::Bottom);
+        cx.emit(Event::Wakeup);
+    }
+
     pub fn last_n_non_empty_lines(&self, n: usize) -> Vec<String> {
         let terminal = self.term.lock_unfair();
         last_non_empty_lines(&terminal, n)

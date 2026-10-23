@@ -133,6 +133,38 @@ impl ModelPickerDelegate {
         self.favorites.len()
     }
 
+    pub(crate) fn models(&self) -> Option<&AgentModelList> {
+        self.models.as_ref()
+    }
+
+    pub(crate) fn select_model_by_id(
+        &mut self,
+        model_id: &AgentModelId,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Result<()> {
+        let model_info = match &self.models {
+            Some(AgentModelList::Flat(models)) => {
+                models.iter().find(|model| &model.id == model_id)
+            }
+            Some(AgentModelList::Grouped(groups)) => groups
+                .values()
+                .flatten()
+                .find(|model| &model.id == model_id),
+            None => None,
+        }
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown model {model_id:?}"))?;
+        if let Some(reason) = &model_info.disabled {
+            anyhow::bail!("{} is unavailable: {reason:?}", model_info.name);
+        }
+        self.selector
+            .select_model(model_info.id.clone(), cx)
+            .detach_and_log_err(cx);
+        self.selected_model = Some(model_info);
+        cx.notify();
+        Ok(())
+    }
+
     pub fn cycle_favorite_models(&mut self, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         if self.favorites.is_empty() {
             return;

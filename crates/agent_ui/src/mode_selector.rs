@@ -62,6 +62,10 @@ impl ModeSelector {
         self.connection.current_mode()
     }
 
+    pub(crate) fn all_modes(&self) -> Vec<acp::SessionMode> {
+        self.connection.all_modes()
+    }
+
     pub fn set_mode(&mut self, mode: acp::SessionModeId, cx: &mut Context<Self>) {
         self.agent_server
             .set_default_mode(Some(mode.clone()), self.fs.clone(), cx);

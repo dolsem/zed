@@ -1,3 +1,4 @@
+pub mod mobile;
 mod thread_switcher;
 
 use acp_thread::ThreadStatus;

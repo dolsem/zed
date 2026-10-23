@@ -92,6 +92,10 @@ impl ProfileSelector {
         self.picker_handle.clone()
     }
 
+    pub(crate) fn provider(&self) -> &Arc<dyn ProfileProvider> {
+        &self.provider
+    }
+
     pub fn cycle_profile(&mut self, cx: &mut Context<Self>) {
         if !self.provider.profiles_supported(cx) {
             return;

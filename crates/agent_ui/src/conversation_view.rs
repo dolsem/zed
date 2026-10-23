@@ -162,6 +162,67 @@ pub(crate) enum ThreadError {
     },
 }
 
+impl ThreadError {
+    /// A plain-text description for surfaces that can't show the desktop
+    /// callouts (e.g. the mobile app).
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            Self::ZedPaymentRequired => "Your Zed plan doesn't cover this request.".to_string(),
+            Self::DataRetentionConsentRequired => {
+                "This model needs data retention consent. Confirm it in Zed on your desktop."
+                    .to_string()
+            }
+            Self::Refusal => "The model refused to respond to this request.".to_string(),
+            Self::AuthenticationRequired(message) => {
+                if message.is_empty() {
+                    "Authentication is required. Sign in from Zed on your desktop.".to_string()
+                } else {
+                    message.to_string()
+                }
+            }
+            Self::RateLimitExceeded { provider } => format!(
+                "{provider}'s rate limit was reached. Zed will retry automatically. \
+                 You can also wait a moment and try again."
+            ),
+            Self::ServerOverloaded { provider } => format!(
+                "{provider}'s servers are temporarily unavailable. Zed will retry \
+                 automatically. If the problem persists, check the provider's status page."
+            ),
+            Self::PromptTooLarge => {
+                "The prompt is too large for the model's context window.".to_string()
+            }
+            Self::NoCredentials { provider } => {
+                format!("No credentials are configured for {provider}.")
+            }
+            Self::StreamError { provider } => format!(
+                "The connection to {provider}'s API was interrupted. Zed will retry \
+                 automatically. If the problem persists, check your network connection."
+            ),
+            Self::AuthenticationFailed { provider } => {
+                format!("Could not authenticate with {provider}.")
+            }
+            Self::PermissionDenied { provider, message } => message
+                .as_ref()
+                .map(|message| message.to_string())
+                .unwrap_or_else(|| {
+                    format!("{provider} rejected the request due to insufficient permissions.")
+                }),
+            Self::ProviderRejection { message } => message.to_string(),
+            Self::MaxOutputTokens => "The model stopped because it reached its maximum output \
+                 length. You can ask it to continue where it left off."
+                .to_string(),
+            Self::NoModelSelected => {
+                "No model selected. Pick one with the Model control below.".to_string()
+            }
+            Self::ApiError { provider } => format!(
+                "{provider}'s API returned an unexpected error. \
+                 If the problem persists, try switching models or restarting Zed."
+            ),
+            Self::Other { message, .. } => message.to_string(),
+        }
+    }
+}
+
 impl From<anyhow::Error> for ThreadError {
     fn from(error: anyhow::Error) -> Self {
         if error.is::<MaxOutputTokensError>() {
@@ -632,6 +693,22 @@ pub enum AcpServerViewEvent {
 }
 
 impl EventEmitter<AcpServerViewEvent> for ConversationView {}
+
+/// Called for every agent notification (finished turn, waiting for
+/// permission, ...) regardless of whether Zed shows a popup for it, so it can
+/// be forwarded elsewhere (e.g. as a push notification to a phone).
+pub struct AgentNotificationObserver(pub Rc<dyn Fn(&AgentNotificationInfo, &mut App)>);
+
+impl gpui::Global for AgentNotificationObserver {}
+
+pub struct AgentNotificationInfo {
+    pub thread_id: ThreadId,
+    pub title: SharedString,
+    pub caption: SharedString,
+    /// Whether the thread is on screen in an active Zed window, in which case
+    /// Zed itself shows no popup either.
+    pub visible_on_desktop: bool,
+}
 
 pub struct ConversationView {
     agent: Rc<dyn AgentServer>,
@@ -1581,7 +1658,7 @@ impl ConversationView {
     /// User renames are stored in ThreadMetadataStore.
     /// Some agents can't set titles directly, so this should be checked
     /// when rendering the thread's title.
-    fn title_override(&self, cx: &App) -> Option<SharedString> {
+    pub(crate) fn title_override(&self, cx: &App) -> Option<SharedString> {
         ThreadMetadataStore::try_global(cx).and_then(|store| {
             store
                 .read(cx)
@@ -2961,6 +3038,27 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let caption = caption.into();
+        if let Some(observer) = cx.try_global::<AgentNotificationObserver>() {
+            let observer = observer.0.clone();
+            let title = self
+                .title_override(cx)
+                .or_else(|| {
+                    self.root_thread_view()
+                        .and_then(|thread_view| thread_view.read(cx).thread.read(cx).title())
+                })
+                .unwrap_or_else(|| self.agent.agent_id().0);
+            let visible_on_desktop = self.agent_status_visible(window, cx);
+            observer(
+                &AgentNotificationInfo {
+                    thread_id: self.thread_id,
+                    title,
+                    caption: caption.clone(),
+                    visible_on_desktop,
+                },
+                cx,
+            );
+        }
         #[cfg(feature = "audio")]
         self.play_notification_sound(window, cx);
         self.show_notification(caption, icon, window, cx);

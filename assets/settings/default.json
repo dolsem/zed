@@ -2853,6 +2853,22 @@
     // Delay in milliseconds before showing the which-key popup.
     "delay_ms": 1000,
   },
+  // Server for the mobile web app, which lets you control Zed from your phone.
+  // Pair a device with the `mobile server: pair device` action.
+  "mobile_server": {
+    // Whether to run the server.
+    "enabled": false,
+    // The address to listen on. Keep this on localhost and expose the server
+    // through a reverse proxy that provides HTTPS (e.g. a Cloudflare tunnel),
+    // which installing the app and push notifications require.
+    "address": "127.0.0.1",
+    // The port to listen on.
+    "port": 7878,
+    // Whether to push agent notifications to paired phones even when the last
+    // interaction with Zed was on the desktop. When false, pushes are only sent
+    // after the mobile app was the last thing used. Toggle it from the status bar.
+    "always_notify": false,
+  },
   // The server to connect to. If the environment variable
   // ZED_SERVER_URL is set, it will override this setting.
   "server_url": "https://zed.dev",

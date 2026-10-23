@@ -20,6 +20,7 @@ mod inline_prompt_editor;
 mod language_model_selector;
 mod mention_set;
 mod message_editor;
+pub mod mobile;
 mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
@@ -79,7 +80,9 @@ pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;
-pub use conversation_view::{ConversationView, StateChange};
+pub use conversation_view::{
+    AgentNotificationInfo, AgentNotificationObserver, ConversationView, StateChange,
+};
 pub use external_source_prompt::ExternalSourcePrompt;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;

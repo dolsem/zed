@@ -350,7 +350,7 @@ impl ProjectDiff {
         self.diff.read(cx).diff_base(cx)
     }
 
-    pub(crate) fn repo(&self, cx: &App) -> Option<Entity<Repository>> {
+    pub fn repo(&self, cx: &App) -> Option<Entity<Repository>> {
         self.diff.read(cx).repo(cx)
     }
 

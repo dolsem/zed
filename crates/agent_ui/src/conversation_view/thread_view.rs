@@ -5121,7 +5121,7 @@ impl ThreadView {
         }
     }
 
-    fn fast_mode_available(&self, cx: &Context<Self>) -> bool {
+    pub(crate) fn fast_mode_available(&self, cx: &App) -> bool {
         self.as_native_thread(cx)
             .and_then(|thread| thread.read(cx).model())
             .map(|model| model.supports_fast_mode())
@@ -5432,31 +5432,7 @@ impl ThreadView {
                 Tooltip::for_action_in(tooltip_label, &ToggleThinkingMode, &focus_handle, cx)
             })
             .on_click(cx.listener(move |this, _, _window, cx| {
-                if let Some(thread) = this.as_native_thread(cx) {
-                    thread.update(cx, |thread, cx| {
-                        let enable_thinking = !thread.thinking_enabled();
-                        thread.set_thinking_enabled(enable_thinking, cx);
-
-                        let favorite_key = thread
-                            .model()
-                            .map(|model| (model.provider_id.0.to_string(), model.id.0.to_string()));
-                        let fs = thread.project().read(cx).fs().clone();
-                        update_settings_file(fs, cx, move |settings, _| {
-                            if let Some(agent) = settings.agent.as_mut() {
-                                if let Some(default_model) = agent.default_model.as_mut() {
-                                    default_model.enable_thinking = enable_thinking;
-                                }
-                                if let Some((provider_id, model_id)) = &favorite_key {
-                                    agent.update_favorite_model(
-                                        provider_id,
-                                        model_id,
-                                        |favorite| favorite.enable_thinking = enable_thinking,
-                                    );
-                                }
-                            }
-                        });
-                    });
-                }
+                this.apply_thinking_enabled(!thinking, cx);
             }));
 
         if model.supported_effort_levels().is_empty() {
@@ -5590,47 +5566,10 @@ impl ThreadView {
                             let effort = effort_level.value.clone();
                             let weak_self = weak_self.clone();
                             move |_window, cx| {
-                                let effort = effort.clone();
+                                let effort = effort.to_string();
                                 weak_self
                                     .update(cx, |this, cx| {
-                                        if let Some(thread) = this.as_native_thread(cx) {
-                                            thread.update(cx, |thread, cx| {
-                                                thread.set_thinking_effort(
-                                                    Some(effort.to_string()),
-                                                    cx,
-                                                );
-
-                                                let favorite_key = thread.model().map(|model| {
-                                                    (
-                                                        model.provider_id().0.to_string(),
-                                                        model.id().0.to_string(),
-                                                    )
-                                                });
-                                                let fs = thread.project().read(cx).fs().clone();
-                                                update_settings_file(fs, cx, move |settings, _| {
-                                                    if let Some(agent) = settings.agent.as_mut() {
-                                                        if let Some(default_model) =
-                                                            agent.default_model.as_mut()
-                                                        {
-                                                            default_model.effort =
-                                                                Some(effort.to_string());
-                                                        }
-                                                        if let Some((provider_id, model_id)) =
-                                                            &favorite_key
-                                                        {
-                                                            agent.update_favorite_model(
-                                                                provider_id,
-                                                                model_id,
-                                                                |favorite| {
-                                                                    favorite.effort =
-                                                                        Some(effort.to_string())
-                                                                },
-                                                            );
-                                                        }
-                                                    }
-                                                });
-                                            });
-                                        }
+                                        this.apply_thinking_effort(effort, cx);
                                     })
                                     .ok();
                             }
@@ -12529,7 +12468,7 @@ impl ThreadView {
         self.apply_fast_mode_speed(new_speed, cx);
     }
 
-    fn apply_fast_mode_speed(&mut self, new_speed: Speed, cx: &mut Context<Self>) {
+    pub(crate) fn apply_fast_mode_speed(&mut self, new_speed: Speed, cx: &mut Context<Self>) {
         let Some(thread) = self.as_native_thread(cx) else {
             return;
         };
@@ -12586,9 +12525,16 @@ impl ThreadView {
             None => 0,
         };
         let next_effort = effort_levels[next_index].value.to_string();
+        self.apply_thinking_effort(next_effort, cx);
+    }
 
+    /// Sets the native agent's thinking effort and remembers it for the model.
+    pub(crate) fn apply_thinking_effort(&mut self, effort: String, cx: &mut Context<Self>) {
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
         thread.update(cx, |thread, cx| {
-            thread.set_thinking_effort(Some(next_effort.clone()), cx);
+            thread.set_thinking_effort(Some(effort.clone()), cx);
 
             let favorite_key = thread
                 .model()
@@ -12597,16 +12543,97 @@ impl ThreadView {
             update_settings_file(fs, cx, move |settings, _| {
                 if let Some(agent) = settings.agent.as_mut() {
                     if let Some(default_model) = agent.default_model.as_mut() {
-                        default_model.effort = Some(next_effort.clone());
+                        default_model.effort = Some(effort.clone());
                     }
                     if let Some((provider_id, model_id)) = &favorite_key {
                         agent.update_favorite_model(provider_id, model_id, |favorite| {
-                            favorite.effort = Some(next_effort)
+                            favorite.effort = Some(effort)
                         });
                     }
                 }
             });
         });
+    }
+
+    /// Enables or disables the native agent's thinking and remembers it for the model.
+    pub(crate) fn apply_thinking_enabled(&mut self, enable_thinking: bool, cx: &mut Context<Self>) {
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_thinking_enabled(enable_thinking, cx);
+
+            let favorite_key = thread
+                .model()
+                .map(|model| (model.provider_id.0.to_string(), model.id.0.to_string()));
+            let fs = thread.project().read(cx).fs().clone();
+            update_settings_file(fs, cx, move |settings, _| {
+                if let Some(agent) = settings.agent.as_mut() {
+                    if let Some(default_model) = agent.default_model.as_mut() {
+                        default_model.enable_thinking = enable_thinking;
+                    }
+                    if let Some((provider_id, model_id)) = &favorite_key {
+                        agent.update_favorite_model(provider_id, model_id, |favorite| {
+                            favorite.enable_thinking = enable_thinking
+                        });
+                    }
+                }
+            });
+        });
+    }
+
+    /// Sends a plain-text message that didn't come from the message editor
+    /// (e.g. from the mobile app), leaving any draft in the editor untouched.
+    pub(crate) fn send_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        cx.emit(AcpThreadViewEvent::Interacted);
+        let is_generating = self.thread.read(cx).status() != ThreadStatus::Idle;
+        let native_command =
+            leading_native_command(&text, self.session_capabilities.read().available_commands());
+
+        let mut content = vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+            text.clone(),
+        ))];
+        if is_generating {
+            self.add_to_queue(content, Vec::new(), window, cx);
+            return;
+        }
+
+        self.thread_error.take();
+        self.thread_feedback.clear();
+        self.editing_message.take();
+        self.message_queue.resume();
+
+        if let Some(command_name) = native_command {
+            let remainder = strip_leading_command(&text, &command_name);
+            if !remainder.trim().is_empty() {
+                content = vec![acp_v1::ContentBlock::Text(acp_v1::TextContent::new(
+                    remainder,
+                ))];
+                self.add_to_queue(content, Vec::new(), window, cx);
+            }
+            let command_block =
+                acp_v1::ContentBlock::Text(acp_v1::TextContent::new(format!("/{command_name}")));
+            self.send_content(
+                Task::ready(Ok(Some((vec![command_block], Vec::new())))),
+                true,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        self.send_content(Task::ready(Ok(Some((content, Vec::new())))), false, window, cx);
+    }
+
+    pub(crate) fn error_message(&self, cx: &App) -> Option<String> {
+        if let Some(markdown) = &self.thread_error_markdown {
+            return Some(markdown.read(cx).source().to_string());
+        }
+        self.thread_error.as_ref().map(ThreadError::summary)
     }
 }
 

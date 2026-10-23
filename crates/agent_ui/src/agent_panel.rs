@@ -165,7 +165,7 @@ impl TerminalId {
         Self(uuid::Uuid::new_v4())
     }
 
-    pub(crate) fn to_key_string(self) -> String {
+    pub fn to_key_string(self) -> String {
         self.0.hyphenated().to_string()
     }
 

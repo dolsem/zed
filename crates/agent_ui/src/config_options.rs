@@ -130,6 +130,28 @@ impl ConfigOptionsView {
         true
     }
 
+    pub(crate) fn options(&self) -> Vec<acp::SessionConfigOption> {
+        self.config_options.config_options()
+    }
+
+    /// Sets an option and remembers it as the agent's default, like picking it
+    /// in the UI does.
+    pub(crate) fn set_option(
+        &mut self,
+        config_id: acp::SessionConfigId,
+        value: acp::SessionConfigOptionValue,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        self.agent_server.set_default_config_option(
+            config_id.0.as_ref(),
+            setting_value_for_config_option_value(&value),
+            self.fs.clone(),
+            cx,
+        );
+        let task = self.config_options.set_config_option(config_id, value, cx);
+        cx.spawn(async move |_, _| task.await.map(|_| ()))
+    }
+
     fn first_config_option_id_matching(
         &self,
         category: acp::SessionConfigOptionCategory,
