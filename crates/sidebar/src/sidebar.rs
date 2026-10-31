@@ -8185,11 +8185,10 @@ fn all_thread_infos_for_workspace(
                 AgentThreadStatus::WaitingForConfirmation
             } else if thread.had_error() {
                 AgentThreadStatus::Error
+            } else if thread.is_busy() {
+                AgentThreadStatus::Running
             } else {
-                match thread.status() {
-                    ThreadStatus::Generating => AgentThreadStatus::Running,
-                    ThreadStatus::Idle => AgentThreadStatus::Completed,
-                }
+                AgentThreadStatus::Completed
             };
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);

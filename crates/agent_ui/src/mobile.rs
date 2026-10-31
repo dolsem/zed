@@ -140,7 +140,7 @@ pub fn thread_entry(
 pub fn thread_status(thread: &AcpThread) -> api::ThreadStatus {
     if thread.is_waiting_for_confirmation() {
         api::ThreadStatus::WaitingForConfirmation
-    } else if thread.status() == ThreadStatus::Generating {
+    } else if thread.is_busy() {
         api::ThreadStatus::Running
     } else if thread.had_error() {
         api::ThreadStatus::Error
@@ -941,7 +941,8 @@ pub fn build_run(
         }
     }
 
-    let is_generating = is_last && thread.status() == ThreadStatus::Generating;
+    // Background work (e.g. a command the agent left running) keeps the run going.
+    let is_generating = is_last && thread.is_busy();
     let error = is_last.then(|| thread_view.error_message(cx)).flatten();
     let status = if pending
         .iter()

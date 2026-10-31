@@ -412,6 +412,7 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
+                    | AcpThreadEvent::BackgroundWorkChanged
                     | AcpThreadEvent::PromptUpdated => {}
                 }
                 this.updated_at = Some(Instant::now());
@@ -670,7 +671,8 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::Error
         | AcpThreadEvent::LoadError(_)
         | AcpThreadEvent::Refusal
-        | AcpThreadEvent::WorkingDirectoriesUpdated => true,
+        | AcpThreadEvent::WorkingDirectoriesUpdated
+        | AcpThreadEvent::BackgroundWorkChanged => true,
         // --
         AcpThreadEvent::EntryUpdated(_)
         | AcpThreadEvent::StatusChanged
@@ -1944,8 +1946,8 @@ impl ConversationView {
 
                 // Skip notifying when a queued message was just auto-sent: the agent
                 // is not actually idle and a notification here would fire just before the
-                // next turn starts.
-                if !sent_queued_message {
+                // next turn starts. Background work notifies once it ends instead.
+                if !sent_queued_message && !thread.read(cx).has_background_work() {
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();
                     self.notify_with_sound(
                         if used_tools {
@@ -2100,6 +2102,21 @@ impl ConversationView {
                     self.schedule_draft_prompt_persist(cx);
                 }
                 cx.notify();
+            }
+            AcpThreadEvent::BackgroundWorkChanged => {
+                // The notification for the end of the turn waited for this.
+                let thread = thread.read(cx);
+                if !is_subagent
+                    && !thread.has_background_work()
+                    && thread.foreground_activity() == ForegroundActivity::Idle
+                {
+                    self.notify_with_sound(
+                        "Finished running background tasks",
+                        IconName::ZedAssistant,
+                        window,
+                        cx,
+                    );
+                }
             }
         }
         cx.notify();

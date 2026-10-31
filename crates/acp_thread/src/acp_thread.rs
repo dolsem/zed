@@ -3323,6 +3323,8 @@ pub struct AcpThread {
     pending_terminal_output: HashMap<acp_v1::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp_v1::TerminalId, acp_v1::TerminalExitStatus>,
     had_error: bool,
+    /// See [`AcpThread::has_background_work`].
+    has_background_work: bool,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp_v1::ContentBlock>>,
     /// The initial scroll position for the thread view, set during session registration.
@@ -3460,6 +3462,8 @@ pub enum AcpThreadEvent {
     ModeUpdated(acp_v1::SessionModeId),
     ConfigOptionsUpdated(Vec<acp_v1::SessionConfigOption>),
     WorkingDirectoriesUpdated,
+    /// [`AcpThread::has_background_work`] changed.
+    BackgroundWorkChanged,
 }
 
 impl EventEmitter<AcpThreadEvent> for AcpThread {}
@@ -3581,17 +3585,19 @@ impl AcpThread {
                 | AcpThreadEvent::ElicitationResponded(_) => {
                     this.sync_legacy_action_state(cx);
                     this.update_idle_sleep_prevention(cx);
+                    this.sync_background_work(cx);
                 }
+                AcpThreadEvent::NewEntry
+                | AcpThreadEvent::EntryUpdated(_)
+                | AcpThreadEvent::Stopped { .. } => this.sync_background_work(cx),
                 AcpThreadEvent::PromptUpdated
                 | AcpThreadEvent::SubmissionUpdated(_)
-                | AcpThreadEvent::NewEntry
                 | AcpThreadEvent::TitleUpdated
                 | AcpThreadEvent::NoticesUpdated
                 | AcpThreadEvent::TokenUsageUpdated
-                | AcpThreadEvent::EntryUpdated(_)
                 | AcpThreadEvent::Retry(_)
                 | AcpThreadEvent::SubagentSpawned(_)
-                | AcpThreadEvent::Stopped { .. }
+                | AcpThreadEvent::BackgroundWorkChanged
                 | AcpThreadEvent::Error
                 | AcpThreadEvent::LoadError(_)
                 | AcpThreadEvent::PromptCapabilitiesUpdated
@@ -3653,6 +3659,7 @@ impl AcpThread {
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
+            has_background_work: false,
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
@@ -3815,6 +3822,39 @@ impl AcpThread {
 
     pub fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    /// Whether work the agent started is still running even though its turn
+    /// may have ended, like a command it sent to the background. Such a
+    /// command's tool call completes as soon as it detaches, while the
+    /// terminal showing it only exits once the command does.
+    pub fn has_background_work(&self) -> bool {
+        self.has_background_work
+    }
+
+    /// Whether the agent is generating or still has background work running.
+    pub fn is_busy(&self) -> bool {
+        self.status() == ThreadStatus::Generating || self.has_background_work
+    }
+
+    fn sync_background_work(&mut self, cx: &mut Context<Self>) {
+        let has_background_work = self.entries.iter().any(|entry| {
+            let AgentThreadEntry::ToolCall(call) = entry else {
+                return false;
+            };
+            // Failed and cancelled calls may never report their terminal's exit.
+            matches!(
+                call.status(),
+                ToolCallStatus::Pending | ToolCallStatus::InProgress | ToolCallStatus::Completed
+            ) && call.content().iter().any(|content| {
+                matches!(content, ToolCallContent::Terminal { terminal, .. }
+                    if terminal.read(cx).output().is_none())
+            })
+        });
+        if has_background_work != self.has_background_work {
+            self.has_background_work = has_background_work;
+            cx.emit(AcpThreadEvent::BackgroundWorkChanged);
+        }
     }
 
     pub fn is_waiting_for_confirmation(&self) -> bool {
@@ -6751,6 +6791,10 @@ impl AcpThread {
                 cx,
             )
         });
+        // The process can outlive the turn, so its exit may be the last thing
+        // that happens in the thread.
+        cx.observe(&entity, |this, _, cx| this.sync_background_work(cx))
+            .detach();
         self.terminals.insert(terminal_id.clone(), entity.clone());
         entity
     }
@@ -9076,6 +9120,49 @@ mod tests {
             assert_eq!(output.content, lower.read(cx).get_content());
             assert_eq!(output.original_content_len, output.content.len());
             assert_eq!(output.content_line_count, lower.read(cx).total_lines());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_background_terminal_keeps_thread_busy(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let terminal_id = acp_v2::TerminalId::new("background-terminal");
+        // A backgrounded command's tool call completes while its terminal runs on.
+        thread
+            .update(cx, |thread, cx| {
+                thread.upsert_tool_call_patch(
+                    acp_v2::ToolCallUpdate::new("background-tool")
+                        .title("npm run dev")
+                        .kind(acp_v2::ToolKind::Execute)
+                        .status(acp_v2::ToolCallStatus::Completed)
+                        .content(vec![acp_v2::ToolCallContent::Terminal(
+                            acp_v2::Terminal::new(terminal_id.clone()),
+                        )]),
+                    cx,
+                )
+            })
+            .expect("the tool call is created");
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert!(thread.has_background_work());
+            assert!(thread.is_busy());
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Exit {
+                    terminal_id: acp_v1::TerminalId::new("background-terminal"),
+                    status: acp_v1::TerminalExitStatus::new(),
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        thread.read_with(cx, |thread, _| {
+            assert!(!thread.has_background_work());
+            assert!(!thread.is_busy());
         });
     }
 
