@@ -1,11 +1,9 @@
-//! Serves Zed's mobile PWA, pairs and authenticates devices, relays WebSocket
-//! frames between the PWA and Zed, and delivers Web Push notifications. Zed
+//! Serves Zed's HTTP API: authenticates clients with the API secret, relays
+//! their HTTP requests and WebSocket frames to Zed, and streams Zed's answers
+//! back. When enabled, also serves the web UI (see the `web_ui` crate). Zed
 //! spawns this process and drives it over stdio (see `mobile_protocol`).
 
-mod api;
-mod assets;
-mod store;
-mod web_push;
+mod relay;
 mod websocket;
 
 use std::collections::HashMap;
@@ -18,41 +16,43 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, HeaderValue, Method, Uri, header};
-use axum::response::Response;
-use axum::routing::{any, get, post};
-use mobile_protocol::{ClientId, HostMessage, ServerMessage};
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse as _, Response};
+use axum::routing::{any, get};
+use axum::{Json, middleware};
+use mobile_protocol::{ClientId, HostMessage, RequestId, ServerMessage};
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde_json::json;
+use subtle::ConstantTimeEq as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::{Semaphore, mpsc};
+use web_ui::WebUi;
 
-use crate::api::PendingPairing;
-use crate::assets::AssetSource;
-use crate::store::{PushSubscription, Store};
-use crate::websocket::{ClientHandle, CloseReason};
+use crate::relay::PendingRequest;
+use crate::websocket::ClientHandle;
 
-const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const HOST_QUEUE_CAPACITY: usize = 1024;
 const PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_NOTIFICATION_TITLE_CHARS: usize = 200;
 
 pub struct Server {
-    store: Mutex<Store>,
-    pairing: Mutex<Option<PendingPairing>>,
+    secret: String,
     clients: Mutex<HashMap<ClientId, ClientHandle>>,
     next_client_id: AtomicU64,
     pending_websockets: Arc<Semaphore>,
+    requests: Mutex<HashMap<RequestId, PendingRequest>>,
+    next_request_id: AtomicU64,
     host: mpsc::Sender<ServerMessage>,
-    http_client: reqwest::Client,
-    assets: AssetSource,
+    web_ui: Option<Arc<WebUi>>,
 }
 
 struct Arguments {
     address: String,
     port: u16,
     state_dir: PathBuf,
+    web_ui: bool,
 }
 
 fn main() -> ExitCode {
@@ -113,13 +113,33 @@ fn report_startup_failure(error: &anyhow::Error) {
 
 async fn run() -> Result<(), RunError> {
     let arguments = parse_arguments(std::env::args().skip(1)).map_err(RunError::Startup)?;
-    let store = Store::load_or_create(&arguments.state_dir).map_err(RunError::Startup)?;
-    let http_client = reqwest::Client::builder()
-        .use_preconfigured_tls(http_client_tls::tls_config())
-        .timeout(PUSH_REQUEST_TIMEOUT)
-        .build()
-        .context("failed to create HTTP client")
+    let secret = std::env::var(mobile_protocol::SECRET_ENV_VAR)
+        .ok()
+        .filter(|secret| !secret.trim().is_empty())
+        .with_context(|| format!("{} is not set", mobile_protocol::SECRET_ENV_VAR))
         .map_err(RunError::Startup)?;
+
+    let (host_sender, host_receiver) = mpsc::channel(HOST_QUEUE_CAPACITY);
+    let web_ui = if arguments.web_ui {
+        let http_client = reqwest::Client::builder()
+            .use_preconfigured_tls(http_client_tls::tls_config())
+            .timeout(PUSH_REQUEST_TIMEOUT)
+            .build()
+            .context("failed to create HTTP client")
+            .map_err(RunError::Startup)?;
+        Some(
+            WebUi::new(
+                &arguments.state_dir,
+                secret.clone(),
+                host_sender.clone(),
+                http_client,
+            )
+            .map_err(RunError::Startup)?,
+        )
+    } else {
+        None
+    };
+
     let listener = tokio::net::TcpListener::bind((arguments.address.as_str(), arguments.port))
         .await
         .with_context(|| {
@@ -134,16 +154,15 @@ async fn run() -> Result<(), RunError> {
         .context("failed to read the bound address")
         .map_err(RunError::Startup)?;
 
-    let (host_sender, host_receiver) = mpsc::channel(HOST_QUEUE_CAPACITY);
     let server = Arc::new(Server {
-        store: Mutex::new(store),
-        pairing: Mutex::new(None),
+        secret,
         clients: Mutex::new(HashMap::default()),
         next_client_id: AtomicU64::new(1),
         pending_websockets: Arc::new(Semaphore::new(websocket::MAX_PENDING_CONNECTIONS)),
+        requests: Mutex::new(HashMap::default()),
+        next_request_id: AtomicU64::new(1),
         host: host_sender,
-        http_client,
-        assets: AssetSource::from_environment(),
+        web_ui,
     });
 
     log::info!("listening on {local_address}");
@@ -171,6 +190,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
     let mut address = None;
     let mut port = None;
     let mut state_dir = None;
+    let mut web_ui = false;
 
     let mut arguments = arguments.into_iter();
     while let Some(flag) = arguments.next() {
@@ -187,6 +207,11 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
                 );
             }
             mobile_protocol::STATE_DIR_FLAG => state_dir = Some(PathBuf::from(value)),
+            mobile_protocol::WEB_UI_FLAG => {
+                web_ui = value
+                    .parse::<bool>()
+                    .with_context(|| format!("invalid value {value:?} for {flag}"))?;
+            }
             _ => bail!("unknown argument {flag:?}"),
         }
     }
@@ -197,33 +222,57 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
         port: port.with_context(|| format!("{} is required", mobile_protocol::PORT_FLAG))?,
         state_dir: state_dir
             .with_context(|| format!("{} is required", mobile_protocol::STATE_DIR_FLAG))?,
+        web_ui,
     })
 }
 
 fn build_router(server: Arc<Server>) -> Router {
-    Router::new()
-        .route("/api/pair", post(api::pair))
-        .route("/api/session", get(api::session))
-        .route("/api/unpair", post(api::unpair))
+    let api = Router::new()
+        .route("/api/session", get(session))
         .route("/api/ws", get(websocket::upgrade))
-        .route("/api/push/key", get(api::push_key))
-        .route("/api/push/subscribe", post(api::push_subscribe))
-        .route("/api/push/unsubscribe", post(api::push_unsubscribe))
-        .route("/api", any(api::not_found))
-        .route("/api/{*rest}", any(api::not_found))
-        .fallback(serve_asset)
+        .route("/api", any(relay::forward))
+        .route("/api/{*rest}", any(relay::forward))
+        .with_state(server.clone());
+
+    let router =
+        match &server.web_ui {
+            Some(web_ui) => {
+                api.merge(web_ui.authenticated_router().route_layer(
+                    middleware::from_fn_with_state(server.clone(), require_secret),
+                ))
+                .merge(web_ui.public_router())
+            }
+            None => api.fallback(not_found),
+        };
+    router
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        .layer(axum::middleware::map_response(add_security_headers))
-        .with_state(server)
+        .layer(middleware::map_response(add_security_headers))
 }
 
-async fn serve_asset(
+pub fn error_response(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({ "error": message }))).into_response()
+}
+
+async fn not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "not found")
+}
+
+async fn session(State(server): State<Arc<Server>>, headers: HeaderMap) -> Response {
+    if !server.is_authorized(&headers) {
+        return error_response(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    Json(json!({})).into_response()
+}
+
+async fn require_secret(
     State(server): State<Arc<Server>>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
+    request: Request,
+    next: Next,
 ) -> Response {
-    server.assets.respond(method, uri, headers).await
+    if !server.is_authorized(request.headers()) {
+        return error_response(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    next.run(request).await
 }
 
 async fn add_security_headers(mut response: Response) -> Response {
@@ -236,7 +285,7 @@ async fn add_security_headers(mut response: Response) -> Response {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    // API responses can carry tokens and must never be stored by proxies.
+    // API responses can carry secrets and must never be stored by proxies.
     if !headers.contains_key(header::CACHE_CONTROL) {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
@@ -275,18 +324,48 @@ impl Server {
         }
     }
 
+    fn is_authorized(&self, headers: &HeaderMap) -> bool {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                let (scheme, token) = value.split_once(' ')?;
+                scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+            })
+            .is_some_and(|token| self.is_secret(token))
+    }
+
+    fn is_secret(&self, candidate: &str) -> bool {
+        candidate.as_bytes().ct_eq(self.secret.as_bytes()).into()
+    }
+
     fn handle_host_message(self: &Arc<Self>, message: HostMessage) {
         match message {
             HostMessage::Send { client_id, message } => self.send_to_clients(client_id, message),
+            HostMessage::Respond {
+                request_id,
+                status,
+                body,
+            } => self.respond(request_id, status, body),
+            HostMessage::StartStream { request_id } => self.start_stream(request_id),
+            HostMessage::StreamEvent {
+                request_id,
+                event,
+                data,
+            } => self.send_stream_event(request_id, event, data),
+            HostMessage::EndStream { request_id } => self.end_stream(request_id),
             HostMessage::Notify {
                 title,
                 body,
                 tag,
                 url,
             } => {
-                let server = self.clone();
+                let Some(web_ui) = self.web_ui.clone() else {
+                    log::warn!("ignoring a notification because the web UI is disabled");
+                    return;
+                };
                 tokio::spawn(async move {
-                    if let Err(error) = server.notify_devices(title, body, tag, url).await {
+                    if let Err(error) = web_ui.notify(title, body, tag, url).await {
                         log::error!("failed to send notifications: {error:#}");
                     }
                 });
@@ -294,128 +373,16 @@ impl Server {
             HostMessage::StartPairing {
                 code,
                 expires_in_seconds,
-            } => match PendingPairing::new(&code, expires_in_seconds) {
-                Some(pending) => {
-                    log::info!("pairing armed for {expires_in_seconds}s");
-                    *self.pairing.lock() = Some(pending);
-                }
-                None => log::error!("ignoring StartPairing with an empty code"),
+            } => match &self.web_ui {
+                Some(web_ui) => web_ui.start_pairing(&code, expires_in_seconds),
+                None => log::warn!("ignoring StartPairing because the web UI is disabled"),
             },
             HostMessage::CancelPairing => {
-                log::info!("pairing cancelled");
-                *self.pairing.lock() = None;
-            }
-            HostMessage::UnpairAllDevices => {
-                // The store lock is held while disconnecting so that no client
-                // can authenticate with a revoked token in between.
-                let mut store = self.store.lock();
-                if let Err(error) = store.remove_all_devices() {
-                    log::error!("failed to persist removal of paired devices: {error:#}");
+                if let Some(web_ui) = &self.web_ui {
+                    web_ui.cancel_pairing();
                 }
-                self.disconnect_all_clients(CloseReason::UNAUTHORIZED);
-                log::info!("unpaired all devices");
             }
         }
-    }
-
-    async fn notify_devices(
-        &self,
-        title: String,
-        body: String,
-        tag: Option<String>,
-        url: Option<String>,
-    ) -> Result<()> {
-        let payload = notification_payload(&title, &body, tag.as_deref(), url.as_deref())?;
-        let (vapid_key, targets) = {
-            let store = self.store.lock();
-            let targets: Vec<(String, PushSubscription)> = store
-                .devices()
-                .iter()
-                .flat_map(|device| {
-                    device
-                        .push_subscriptions
-                        .iter()
-                        .map(|subscription| (device.id.clone(), subscription.clone()))
-                })
-                .collect();
-            (store.vapid_key().clone(), targets)
-        };
-        if targets.is_empty() {
-            log::info!("no push subscriptions to notify");
-            return Ok(());
-        }
-
-        let deliveries = targets.iter().map(|(_, subscription)| {
-            web_push::send(&self.http_client, &vapid_key, subscription, &payload)
-        });
-        let results = futures::future::join_all(deliveries).await;
-
-        let mut gone = Vec::new();
-        for ((device_id, subscription), result) in targets.iter().zip(results) {
-            match result {
-                Ok(web_push::DeliveryOutcome::Delivered) => {}
-                Ok(web_push::DeliveryOutcome::Gone) => {
-                    log::info!("removing expired push subscription");
-                    gone.push((device_id, &subscription.endpoint));
-                }
-                Err(error) => log::warn!("push delivery failed: {error:#}"),
-            }
-        }
-
-        if !gone.is_empty() {
-            let mut store = self.store.lock();
-            for (device_id, endpoint) in gone {
-                store.remove_push_subscription(device_id, endpoint)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Serializes the notification, shortening the body if needed to fit within
-/// what push services accept.
-fn notification_payload(
-    title: &str,
-    body: &str,
-    tag: Option<&str>,
-    url: Option<&str>,
-) -> Result<Vec<u8>> {
-    #[derive(Serialize)]
-    struct Payload<'a> {
-        title: &'a str,
-        body: &'a str,
-        tag: Option<&'a str>,
-        url: Option<&'a str>,
-    }
-
-    let title = truncate_chars(title, MAX_NOTIFICATION_TITLE_CHARS);
-    let mut body_chars = body.chars().count();
-    loop {
-        let body = truncate_chars(body, body_chars);
-        let payload = serde_json::to_vec(&Payload {
-            title: &title,
-            body: &body,
-            tag,
-            url,
-        })?;
-        if payload.len() <= web_push::MAX_PLAINTEXT_LENGTH {
-            return Ok(payload);
-        }
-        if body_chars == 0 {
-            bail!("notification is too large to deliver");
-        }
-        body_chars = body_chars * 3 / 4;
-    }
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    match text.char_indices().nth(max_chars) {
-        Some((byte_index, _)) => {
-            let mut truncated = text[..byte_index].to_string();
-            truncated.push('…');
-            truncated
-        }
-        None => text.to_string(),
     }
 }
 
@@ -433,6 +400,8 @@ mod tests {
                 "8080",
                 "--state-dir",
                 "/tmp/x",
+                "--web-ui",
+                "true",
             ]
             .map(String::from),
         )
@@ -440,25 +409,11 @@ mod tests {
         assert_eq!(arguments.address, "127.0.0.1");
         assert_eq!(arguments.port, 8080);
         assert_eq!(arguments.state_dir, PathBuf::from("/tmp/x"));
+        assert!(arguments.web_ui);
 
         assert!(parse_arguments(["--port", "8080"].map(String::from)).is_err());
         assert!(parse_arguments(["--port", "99999"].map(String::from)).is_err());
         assert!(parse_arguments(["--bogus", "1"].map(String::from)).is_err());
-    }
-
-    #[test]
-    fn test_notification_payload_fits() {
-        let payload = notification_payload("Title", &"é".repeat(10_000), Some("t"), None).unwrap();
-        assert!(payload.len() <= web_push::MAX_PLAINTEXT_LENGTH);
-        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(value["title"], "Title");
-        assert_eq!(value["tag"], "t");
-        assert!(value["url"].is_null());
-        assert!(value["body"].as_str().unwrap().ends_with('…'));
-
-        let payload = notification_payload("Hi", "short", None, Some("#/thread/1")).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&payload).unwrap();
-        assert_eq!(value["body"], "short");
-        assert_eq!(value["url"], "#/thread/1");
+        assert!(parse_arguments(["--web-ui", "yes"].map(String::from)).is_err());
     }
 }

@@ -13,7 +13,7 @@ use crate::api::{
     WorkspaceId, events,
 };
 use crate::workspace_items::find_item;
-use crate::{MobileBridge, Subscribers, css_color, find_workspace, to_json};
+use crate::{MobileBridge, css_color, find_workspace, to_json};
 
 const SCREEN_THROTTLE: Duration = Duration::from_millis(50);
 
@@ -26,27 +26,59 @@ pub(crate) struct TerminalsState {
 
 struct WatchedTerminal {
     view: WeakEntity<TerminalView>,
-    subscribers: Subscribers,
+    /// Each phone scrolls its own view of the history, independently of
+    /// the desktop's viewport.
+    subscribers: HashMap<ClientId, Subscriber>,
     last_sent: Option<Instant>,
     pending_screen: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
+struct Subscriber {
+    display_offset: usize,
+    columns: usize,
+    rows: usize,
+}
+
 impl TerminalsState {
-    pub fn remove_client(&mut self, client_id: ClientId) {
-        self.terminals.retain(|_, terminal| {
-            terminal.subscribers.remove(&client_id);
-            !terminal.subscribers.is_empty()
-        });
+    pub fn remove_client(&mut self, client_id: ClientId, cx: &mut App) {
+        let keys = self.terminals.keys().copied().collect::<Vec<_>>();
+        for key in keys {
+            self.unsubscribe(client_id, key.0, key.1, cx);
+        }
     }
 
-    pub fn unsubscribe(&mut self, client_id: ClientId, workspace_id: WorkspaceId, item_id: ItemId) {
+    pub fn unsubscribe(
+        &mut self,
+        client_id: ClientId,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        cx: &mut App,
+    ) {
         let key = (workspace_id, item_id);
-        if let Some(terminal) = self.terminals.get_mut(&key) {
-            terminal.subscribers.remove(&client_id);
-            if terminal.subscribers.is_empty() {
-                self.terminals.remove(&key);
-            }
+        let Some(terminal) = self.terminals.get_mut(&key) else {
+            return;
+        };
+        if terminal.subscribers.remove(&client_id).is_none() {
+            return;
+        }
+        if let Some(view) = terminal.view.upgrade() {
+            let terminal_entity = view.read(cx).terminal().clone();
+            terminal_entity.update(cx, |terminal_entity, cx| {
+                match terminal.subscribers.values().next() {
+                    // Another phone still has it open: its size applies now.
+                    Some(subscriber) => {
+                        terminal_entity.resize_now(subscriber.columns, subscriber.rows, cx)
+                    }
+                    None => {
+                        terminal_entity.set_remote_size_lock(false);
+                        cx.emit(terminal::Event::Wakeup);
+                    }
+                }
+            });
+        }
+        if terminal.subscribers.is_empty() {
+            self.terminals.remove(&key);
         }
     }
 }
@@ -57,9 +89,46 @@ impl MobileBridge {
         client_id: ClientId,
         workspace_id: WorkspaceId,
         item_id: ItemId,
+        columns: usize,
+        rows: usize,
         cx: &mut Context<Self>,
     ) -> Task<Result<serde_json::Value>> {
-        Task::ready(self.subscribe_terminal(client_id, workspace_id, item_id, cx))
+        Task::ready(self.subscribe_terminal(client_id, workspace_id, item_id, columns, rows, cx))
+    }
+
+    pub(crate) fn resize_terminal(
+        &mut self,
+        client_id: ClientId,
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        columns: usize,
+        rows: usize,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<serde_json::Value>> {
+        let key = (workspace_id, item_id);
+        let result = (|| {
+            let watched = self
+                .terminals
+                .terminals
+                .get_mut(&key)
+                .context("the terminal isn't open on this device")?;
+            let subscriber = watched
+                .subscribers
+                .get_mut(&client_id)
+                .context("the terminal isn't open on this device")?;
+            subscriber.columns = columns;
+            subscriber.rows = rows;
+            let view = watched
+                .view
+                .upgrade()
+                .context("the terminal is no longer open")?;
+            view.read(cx)
+                .terminal()
+                .clone()
+                .update(cx, |terminal, cx| terminal.resize_now(columns, rows, cx));
+            Ok(serde_json::Value::Null)
+        })();
+        Task::ready(result)
     }
 
     fn subscribe_terminal(
@@ -67,6 +136,8 @@ impl MobileBridge {
         client_id: ClientId,
         workspace_id: WorkspaceId,
         item_id: ItemId,
+        columns: usize,
+        rows: usize,
         cx: &mut Context<Self>,
     ) -> Result<serde_json::Value> {
         let view = find_terminal_view(workspace_id, item_id, cx)?;
@@ -89,14 +160,25 @@ impl MobileBridge {
             ];
             WatchedTerminal {
                 view: view.downgrade(),
-                subscribers: Subscribers::default(),
+                subscribers: HashMap::default(),
                 last_sent: None,
                 pending_screen: None,
                 _subscriptions: subscriptions,
             }
         });
-        watched.subscribers.insert(client_id);
-        to_json(terminal_screen(item_id, &view, cx))
+        watched.subscribers.insert(
+            client_id,
+            Subscriber {
+                display_offset: 0,
+                columns,
+                rows,
+            },
+        );
+        view.read(cx).terminal().clone().update(cx, |terminal, cx| {
+            terminal.set_remote_size_lock(true);
+            terminal.resize_now(columns, rows, cx);
+        });
+        to_json(terminal_screen(item_id, &view, 0, cx))
     }
 
     fn close_terminal(&mut self, key: TerminalKey) {
@@ -108,8 +190,8 @@ impl MobileBridge {
             workspace_id,
             item_id,
         };
-        for client_id in watched.subscribers {
-            self.send_event(client_id, events::TERMINAL_CLOSED, &event);
+        for client_id in watched.subscribers.keys() {
+            self.send_event(*client_id, events::TERMINAL_CLOSED, &event);
         }
     }
 
@@ -127,25 +209,29 @@ impl MobileBridge {
             if !delay.is_zero() {
                 cx.background_executor().timer(delay).await;
             }
-            this.update(cx, |this, cx| this.send_terminal_screen(key, cx))
+            this.update(cx, |this, cx| this.send_terminal_screens(key, cx))
                 .ok();
         }));
     }
 
-    fn send_terminal_screen(&mut self, key: TerminalKey, cx: &mut Context<Self>) {
+    /// Sends every subscriber its own view of the terminal.
+    fn send_terminal_screens(&mut self, key: TerminalKey, cx: &mut Context<Self>) {
         let Some(watched) = self.terminals.terminals.get_mut(&key) else {
             return;
         };
         watched.pending_screen = None;
         watched.last_sent = Some(Instant::now());
-        let view = watched.view.upgrade();
-        let subscribers = watched.subscribers.iter().copied().collect::<Vec<_>>();
-        let Some(view) = view else {
+        let Some(view) = watched.view.upgrade() else {
             self.close_terminal(key);
             return;
         };
-        let screen = terminal_screen(key.1, &view, cx);
-        for client_id in subscribers {
+        let subscribers = watched
+            .subscribers
+            .iter()
+            .map(|(client_id, subscriber)| (*client_id, subscriber.display_offset))
+            .collect::<Vec<_>>();
+        for (client_id, display_offset) in subscribers {
+            let screen = terminal_screen(key.1, &view, display_offset, cx);
             self.send_event(client_id, events::TERMINAL_SCREEN, &screen);
         }
     }
@@ -160,25 +246,54 @@ impl MobileBridge {
         let result = find_terminal(workspace_id, item_id, cx).map(|terminal| {
             terminal.update(cx, |terminal, cx| {
                 terminal.input(data.into_bytes());
-                terminal.scroll_viewport_to_bottom(cx);
+                cx.emit(terminal::Event::Wakeup);
             });
             serde_json::Value::Null
         });
+        // Typing jumps every phone's view back to the live output.
+        if let Some(watched) = self.terminals.terminals.get_mut(&(workspace_id, item_id)) {
+            for subscriber in watched.subscribers.values_mut() {
+                subscriber.display_offset = 0;
+            }
+        }
         Task::ready(result)
     }
 
     pub(crate) fn terminal_scroll(
         &mut self,
+        client_id: ClientId,
         workspace_id: WorkspaceId,
         item_id: ItemId,
         lines: i32,
         cx: &mut Context<Self>,
     ) -> Task<Result<serde_json::Value>> {
-        // Scrolling wakes the terminal, which sends the subscribers a fresh screen.
-        let result = find_terminal(workspace_id, item_id, cx).map(|terminal| {
-            terminal.update(cx, |terminal, cx| terminal.scroll_viewport_by(lines, cx));
-            serde_json::Value::Null
-        });
+        let key = (workspace_id, item_id);
+        let result = (|| {
+            let watched = self
+                .terminals
+                .terminals
+                .get_mut(&key)
+                .context("the terminal isn't open on this device")?;
+            let view = watched
+                .view
+                .upgrade()
+                .context("the terminal is no longer open")?;
+            let history_size = {
+                let content = view.read(cx).terminal().read(cx).current_content();
+                content.total_lines.saturating_sub(content.screen_lines)
+            };
+            let subscriber = watched
+                .subscribers
+                .get_mut(&client_id)
+                .context("the terminal isn't open on this device")?;
+            subscriber.display_offset = subscriber
+                .display_offset
+                .saturating_add_signed(lines as isize)
+                .min(history_size);
+            let screen = terminal_screen(item_id, &view, subscriber.display_offset, cx);
+            self.send_event(client_id, events::TERMINAL_SCREEN, &screen);
+            Ok(serde_json::Value::Null)
+        })();
         Task::ready(result)
     }
 }
@@ -213,10 +328,18 @@ struct RunStyle {
     strikethrough: bool,
 }
 
-fn terminal_screen(item_id: ItemId, view: &Entity<TerminalView>, cx: &App) -> TerminalScreen {
+fn terminal_screen(
+    item_id: ItemId,
+    view: &Entity<TerminalView>,
+    display_offset: usize,
+    cx: &App,
+) -> TerminalScreen {
     let view = view.read(cx);
     let title = view.tab_content_text(0, cx).to_string();
-    let content = view.terminal().read(cx).current_content();
+    let content = view
+        .terminal()
+        .read(cx)
+        .content_at_display_offset(display_offset);
     let theme = cx.theme();
     let default_foreground = css_color(theme.colors().terminal_foreground);
     let default_background = css_color(theme.colors().terminal_background);

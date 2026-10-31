@@ -69,11 +69,8 @@ export async function unpairDevice() {
   } catch (error) {
     console.warn("Couldn't unsubscribe from push", error);
   }
-  try {
-    await authedFetch("/api/unpair", { method: "POST", body: "{}" });
-  } catch (error) {
-    console.warn("Couldn't revoke this device's token", error);
-  }
+  // The secret is shared with every other client, so it can only be revoked
+  // by changing it in Zed; forgetting it here is all this device can do.
   conn.stop();
   setToken(null);
 }

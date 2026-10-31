@@ -8,7 +8,6 @@ import {
   type PairResponse,
   type Params,
   type Result,
-  type SessionResponse,
 } from "./protocol";
 
 // ---------------------------------------------------------------------------
@@ -75,8 +74,8 @@ export async function pairDevice(code: string, name: string): Promise<string> {
   });
   if (!response.ok) throw await errorFrom(response);
   const body = (await response.json()) as PairResponse;
-  if (typeof body.token !== "string" || !body.token) throw new HttpError("The server sent no token", 500);
-  return body.token;
+  if (typeof body.secret !== "string" || !body.secret) throw new HttpError("The server sent no secret", 500);
+  return body.secret;
 }
 
 /** Fetch with the bearer token. Throws `HttpError` on non-2xx responses. */
@@ -89,11 +88,11 @@ export async function authedFetch(path: string, init: RequestInit = {}): Promise
   return response;
 }
 
-/** `null` when the session couldn't be checked (e.g. offline). */
-export async function fetchSession(): Promise<SessionResponse | "unauthorized" | null> {
+/** Whether the stored secret is still valid; `null` when that couldn't be checked (e.g. offline). */
+export async function fetchSession(): Promise<"ok" | "unauthorized" | null> {
   try {
-    const response = await authedFetch("/api/session");
-    return (await response.json()) as SessionResponse;
+    await authedFetch("/api/session");
+    return "ok";
   } catch (error) {
     if (error instanceof HttpError && error.status === 401) return "unauthorized";
     return null;
@@ -288,7 +287,7 @@ export class Connection {
     socket.onopen = () => {
       if (this.socket !== socket) return;
       this.status.value = "authenticating";
-      socket.send(JSON.stringify({ type: "auth", token: currentToken }));
+      socket.send(JSON.stringify({ type: "auth", token: currentToken, device_name: deviceName.peek() }));
     };
     socket.onmessage = (message) => {
       if (this.socket !== socket || typeof message.data !== "string") return;

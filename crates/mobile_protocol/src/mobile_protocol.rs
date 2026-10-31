@@ -1,22 +1,35 @@
-//! Zed spawns the `mobile_server` executable and talks to it over stdio, one
-//! JSON message per line: [`HostMessage`]s go to the server's stdin and
+//! Zed spawns the `http_api` executable and talks to it over stdio, one JSON
+//! message per line: [`HostMessage`]s go to the server's stdin and
 //! [`ServerMessage`]s come back on its stdout. The server's stderr carries logs.
 //!
-//! The server owns everything HTTP-facing (static PWA assets, device pairing,
-//! authentication, Web Push), while Zed owns all editor state. WebSocket text
-//! frames are relayed verbatim in both directions, so the server never needs to
-//! understand the API spoken between the PWA and Zed, which lives in [`api`].
+//! The server owns everything HTTP-facing (authentication with the API secret,
+//! and when the web UI is enabled, its static assets, pairing and Web Push),
+//! while Zed owns all editor state. The server doesn't understand the APIs it
+//! relays: WebSocket text frames are forwarded verbatim in both directions (see
+//! [`api`] for what the web UI speaks over them), and authenticated HTTP
+//! requests under `/api/` are forwarded as [`ServerMessage::Request`] and
+//! answered with [`HostMessage::Respond`] or a stream of server-sent events
+//! (see [`rest`]).
 
 pub mod api;
+pub mod rest;
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 pub type ClientId = u64;
+pub type RequestId = u64;
 
 /// Command-line flags Zed passes when spawning the server.
 pub const ADDRESS_FLAG: &str = "--address";
 pub const PORT_FLAG: &str = "--port";
 pub const STATE_DIR_FLAG: &str = "--state-dir";
+/// `true` to also serve the web UI.
+pub const WEB_UI_FLAG: &str = "--web-ui";
+/// The secret clients authenticate with. Passed in the environment rather
+/// than as a flag so that other users can't read it from the process list.
+pub const SECRET_ENV_VAR: &str = "ZED_HTTP_API_SECRET";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -27,7 +40,28 @@ pub enum HostMessage {
         client_id: Option<ClientId>,
         message: String,
     },
-    /// Delivers a Web Push notification to every paired device.
+    /// Answers a [`ServerMessage::Request`] with a JSON body.
+    Respond {
+        request_id: RequestId,
+        status: u16,
+        body: serde_json::Value,
+    },
+    /// Answers a [`ServerMessage::Request`] with a `text/event-stream`
+    /// response, whose events follow as [`HostMessage::StreamEvent`]s.
+    StartStream {
+        request_id: RequestId,
+    },
+    StreamEvent {
+        request_id: RequestId,
+        event: String,
+        data: serde_json::Value,
+    },
+    /// Ends a stream started with [`HostMessage::StartStream`].
+    EndStream {
+        request_id: RequestId,
+    },
+    /// Delivers a Web Push notification to every device that subscribed to
+    /// them in the web UI.
     Notify {
         title: String,
         body: String,
@@ -37,14 +71,13 @@ pub enum HostMessage {
         /// when the notification is tapped.
         url: Option<String>,
     },
-    /// Allows exactly one device to pair using `code` until it expires.
+    /// Allows exactly one web UI client to obtain the API secret with `code`
+    /// until it expires.
     StartPairing {
         code: String,
         expires_in_seconds: u64,
     },
     CancelPairing,
-    /// Revokes every paired device and disconnects its clients.
-    UnpairAllDevices,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -59,7 +92,8 @@ pub enum ServerMessage {
     },
     ClientConnected {
         client_id: ClientId,
-        device_name: String,
+        /// The name the client gave itself, if any.
+        device_name: Option<String>,
     },
     ClientDisconnected {
         client_id: ClientId,
@@ -68,6 +102,23 @@ pub enum ServerMessage {
     Received {
         client_id: ClientId,
         message: String,
+    },
+    /// An authenticated HTTP request under `/api/`, which Zed must answer
+    /// with exactly one [`HostMessage::Respond`] or
+    /// [`HostMessage::StartStream`].
+    Request {
+        request_id: RequestId,
+        method: String,
+        /// The path without the `/api` prefix, e.g. `/threads/123`.
+        path: String,
+        query: BTreeMap<String, String>,
+        /// `None` when the request had no body.
+        body: Option<serde_json::Value>,
+    },
+    /// The client went away (or timed out) before its request was answered
+    /// or while it was streaming, so Zed can stop working on it.
+    RequestClosed {
+        request_id: RequestId,
     },
     DevicePaired {
         device_name: String,
@@ -100,5 +151,16 @@ mod tests {
         let line = encode(&message).unwrap();
         assert_eq!(line.matches('\n').count(), 1);
         assert_eq!(decode::<HostMessage>(&line).unwrap(), message);
+
+        let message = ServerMessage::Request {
+            request_id: 7,
+            method: "POST".into(),
+            path: "/threads".into(),
+            query: BTreeMap::from_iter([("detail".to_string(), "full".to_string())]),
+            body: Some(serde_json::json!({ "text": "hi\nthere" })),
+        };
+        let line = encode(&message).unwrap();
+        assert_eq!(line.matches('\n').count(), 1);
+        assert_eq!(decode::<ServerMessage>(&line).unwrap(), message);
     }
 }

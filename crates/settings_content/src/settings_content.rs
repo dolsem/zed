@@ -316,8 +316,11 @@ pub struct SettingsContent {
     /// Settings for the which-key popup.
     pub which_key: Option<WhichKeySettingsContent>,
 
-    /// Settings for the server that lets the mobile web app control Zed.
-    pub mobile_server: Option<MobileServerSettingsContent>,
+    /// Settings for the HTTP API, which lets other programs control Zed.
+    pub http_api: Option<HttpApiSettingsContent>,
+
+    /// Settings for the web UI, which lets you control Zed from your phone.
+    pub web_ui: Option<WebUiSettingsContent>,
 
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
@@ -411,7 +414,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
-        title_bar, vim_mode, calls, which_key, mobile_server, vim, modeline_lines, feature_flags,
+        title_bar, vim_mode, calls, which_key, http_api, web_ui, vim, modeline_lines, feature_flags,
         instrumentation,
     },
     defaults: {},
@@ -1514,17 +1517,18 @@ pub struct WhichKeySettingsContent {
     pub delay_ms: Option<u64>,
 }
 
-/// Settings for the server that lets the mobile web app control Zed.
+/// Settings for the HTTP API, which lets other programs and the web UI
+/// control Zed.
 #[with_fallible_options]
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
-pub struct MobileServerSettingsContent {
-    /// Whether to run the server for the mobile web app.
+pub struct HttpApiSettingsContent {
+    /// Whether to run the HTTP API server. Requires `secret`.
     ///
     /// Default: false
     pub enabled: Option<bool>,
     /// The address to listen on. Keep this on localhost and expose the server
     /// through a reverse proxy (e.g. a Cloudflare tunnel) that provides HTTPS,
-    /// which installing the app and push notifications require.
+    /// which the web UI needs to be installed and to send push notifications.
     ///
     /// Default: "127.0.0.1"
     pub address: Option<String>,
@@ -1532,10 +1536,27 @@ pub struct MobileServerSettingsContent {
     ///
     /// Default: 7878
     pub port: Option<u16>,
-    /// Whether to push agent notifications to paired phones even when the
-    /// last interaction with Zed was on the desktop. When false, pushes are
-    /// only sent after the mobile app was the last thing used. Toggled by the
-    /// status bar item.
+    /// The secret clients authenticate with, sent as
+    /// `Authorization: Bearer <secret>`. Paired web UI clients receive it.
+    /// Changing it revokes every client that had the old one.
+    ///
+    /// Default: null
+    pub secret: Option<String>,
+}
+
+/// Settings for the web UI, a web app for controlling Zed from a phone. It's
+/// served by the HTTP API, which must be enabled too.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct WebUiSettingsContent {
+    /// Whether to serve the web UI.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Whether to push agent notifications to devices with the web UI even
+    /// when the last interaction with Zed was on the desktop. When false,
+    /// pushes are only sent after the web UI was the last thing used. Toggled
+    /// by the status bar item.
     ///
     /// Default: false
     pub always_notify: Option<bool>,

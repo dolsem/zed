@@ -1217,15 +1217,27 @@ const handlers = {
     return null;
   },
 
-  "terminal.open": ({ item_id }, client) => {
+  "terminal.open": ({ item_id, columns, rows }, client) => {
     const terminal = terminals.get(item_id);
     if (!terminal) throw new MethodError(`No terminal ${item_id}`);
     client.terminals.add(item_id);
+    if (columns && rows) {
+      terminal.columns = columns;
+      terminal.rows = rows;
+    }
     if (terminal.has_bell) {
       terminal.has_bell = false;
       itemsChanged(workspaces.get(terminal.workspace_id));
     }
     return terminalScreen(terminal);
+  },
+  "terminal.resize": ({ item_id, columns, rows }) => {
+    const terminal = terminals.get(item_id);
+    if (!terminal) throw new MethodError(`No terminal ${item_id}`);
+    terminal.columns = columns;
+    terminal.rows = rows;
+    emitScreen(terminal);
+    return null;
   },
   "terminal.close": ({ item_id }, client) => {
     client.terminals.delete(item_id);
@@ -1312,11 +1324,11 @@ async function handleApi(request, response) {
       return json(response, 401, { error: "Invalid or expired pairing code" });
     }
     log(`paired "${body.device_name}" (code sent as ${JSON.stringify(body.code)})`);
-    return json(response, 200, { token: TOKEN });
+    return json(response, 200, { secret: TOKEN });
   }
   if (url.pathname === "/api/session" && request.method === "GET") {
     if (!authorized(request)) return json(response, 401, { error: "Unauthorized" });
-    return json(response, 200, { device_name: "iPhone (mock)" });
+    return json(response, 200, {});
   }
   if (url.pathname === "/api/push/key" && request.method === "GET") {
     if (!authorized(request)) return json(response, 401, { error: "Unauthorized" });

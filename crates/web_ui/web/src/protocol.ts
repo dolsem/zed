@@ -580,7 +580,14 @@ export interface Methods {
   "buffer.format": { params: { buffer: BufferHandle }; result: unknown };
   "buffer.save": { params: { buffer: BufferHandle }; result: unknown };
 
-  "terminal.open": { params: { workspace_id: WorkspaceId; item_id: ItemId }; result: TerminalScreen };
+  "terminal.open": {
+    params: { workspace_id: WorkspaceId; item_id: ItemId; columns: number; rows: number };
+    result: TerminalScreen;
+  };
+  "terminal.resize": {
+    params: { workspace_id: WorkspaceId; item_id: ItemId; columns: number; rows: number };
+    result: unknown;
+  };
   "terminal.close": { params: { workspace_id: WorkspaceId; item_id: ItemId }; result: unknown };
   "terminal.input": {
     params: { workspace_id: WorkspaceId; item_id: ItemId; data: string };
@@ -621,19 +628,16 @@ export interface Events {
 export type EventName = keyof Events;
 
 // ---------------------------------------------------------------------------
-// HTTP surface of the mobile server (same origin)
+// HTTP surface of the server (same origin)
 
 export interface PairRequest {
   code: string;
   device_name: string;
 }
 
+/** Pairing hands out the HTTP API's secret, which authenticates everything else. */
 export interface PairResponse {
-  token: string;
-}
-
-export interface SessionResponse {
-  device_name: string;
+  secret: string;
 }
 
 export interface PushKeyResponse {
@@ -651,8 +655,8 @@ export interface PushPayload {
 }
 
 /** WebSocket handshake frames, exchanged before the API frames. */
-export type AuthFrame = { type: "auth"; token: string };
+export type AuthFrame = { type: "auth"; token: string; device_name: string | null };
 export type AuthReply = { type: "auth_ok"; client_id: number };
 
-/** Close code the server uses when the token was revoked. */
+/** Close code the server uses when the secret is wrong (e.g. it was changed in Zed). */
 export const CLOSE_UNAUTHORIZED = 4001;

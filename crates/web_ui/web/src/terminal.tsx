@@ -5,10 +5,13 @@ import { closeOverlay, conn, errorMessage, reportError, theme, toast, type Overl
 import { terminalColor } from "./theme";
 import { CloseButton, EmptyState, haptic, Icon, keyboardOpen, Spinner } from "./ui";
 
-// Below this the grid is unreadable on a phone; wider terminals scroll sideways instead.
-const MIN_FONT_SIZE = 11;
-const MAX_FONT_SIZE = 15;
-const LINE_HEIGHT = 1.25;
+// The PTY is sized to the phone's screen at this font, so nothing is scaled.
+const FONT_SIZE = 13;
+const LINE_HEIGHT = 1.2;
+const GRID_PADDING = 4;
+const MIN_COLUMNS = 10;
+const MIN_ROWS = 3;
+const RESIZE_DEBOUNCE_MS = 150;
 
 let cachedRatio: { font: string; ratio: number } | null = null;
 
@@ -54,21 +57,53 @@ export function TerminalView({ target }: { target: Extract<OverlayTarget, { type
   const [error, setError] = useState<string | null>(null);
   const [ctrl, setCtrl] = useState(false);
   const [focused, setFocused] = useState(false);
-  const [width, setWidth] = useState(0);
+  const [area, setArea] = useState({ width: 0, height: 0 });
   const screenRef = useRef<TerminalScreen | null>(null);
   const ctrlRef = useRef(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const openedRef = useRef(false);
   screenRef.current = screen;
   ctrlRef.current = ctrl;
 
-  // Subscribe on show, re-subscribe after reconnects, unsubscribe on exit.
+  const ratio = cellRatio();
+  const fontSize = FONT_SIZE;
+  const charWidth = fontSize * ratio;
+  const rowHeight = Math.round(fontSize * LINE_HEIGHT * 100) / 100;
+  // The grid that fits the phone's screen; the PTY is resized to it.
+  const fit = {
+    columns: Math.max(MIN_COLUMNS, Math.floor((area.width - GRID_PADDING * 2) / charWidth)),
+    rows: Math.max(MIN_ROWS, Math.floor((area.height - GRID_PADDING * 2) / rowHeight)),
+  };
+  const fitRef = useRef(fit);
+  fitRef.current = fit;
+  const measured = area.width > 0 && area.height > 0;
+
+  useLayoutEffect(() => {
+    const element = contentRef.current;
+    if (!element) return;
+    const measure = () => setArea({ width: element.clientWidth, height: element.clientHeight });
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    measure();
+    return () => observer.disconnect();
+  }, []);
+
+  // Subscribe once the screen is measured, re-subscribe after reconnects,
+  // unsubscribe on exit.
   useEffect(() => {
+    if (!measured) return;
     let disposed = false;
     const open = async () => {
       try {
-        const result = await conn.request("terminal.open", { workspace_id: target.workspaceId, item_id: target.itemId });
+        const result = await conn.request("terminal.open", {
+          workspace_id: target.workspaceId,
+          item_id: target.itemId,
+          ...fitRef.current,
+        });
         if (!disposed) {
+          openedRef.current = true;
           setScreen(result);
           setError(null);
         }
@@ -96,16 +131,18 @@ export function TerminalView({ target }: { target: Extract<OverlayTarget, { type
         conn.request("terminal.close", { workspace_id: target.workspaceId, item_id: target.itemId }).catch(() => {});
       }
     };
-  }, []);
+  }, [measured]);
 
-  useLayoutEffect(() => {
-    const element = wrapRef.current;
-    if (!element) return;
-    const observer = new ResizeObserver(() => setWidth(element.clientWidth));
-    observer.observe(element);
-    setWidth(element.clientWidth);
-    return () => observer.disconnect();
-  }, [screen === null]);
+  // Follow the screen when the keyboard opens or the phone rotates.
+  useEffect(() => {
+    if (!openedRef.current) return;
+    const timer = setTimeout(() => {
+      conn
+        .request("terminal.resize", { workspace_id: target.workspaceId, item_id: target.itemId, ...fit })
+        .catch(reportError);
+    }, RESIZE_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [fit.columns, fit.rows]);
 
   const send = (data: string) => {
     if (!data) return;
@@ -235,12 +272,7 @@ export function TerminalView({ target }: { target: Extract<OverlayTarget, { type
     }, 40);
   };
 
-  const ratio = cellRatio();
-  const columns = Math.max(1, screen?.columns ?? 80);
-  const fittedSize = width > 0 ? (width - 8) / (columns * ratio) : 12;
-  const fontSize = Math.max(MIN_FONT_SIZE, Math.min(MAX_FONT_SIZE, fittedSize));
-  const charWidth = fontSize * ratio;
-  const rowHeight = Math.round(fontSize * LINE_HEIGHT * 100) / 100;
+  const columns = Math.max(1, screen?.columns ?? fit.columns);
 
   useEffect(() => {
     const element = wrapRef.current;
@@ -323,7 +355,7 @@ export function TerminalView({ target }: { target: Extract<OverlayTarget, { type
           </div>
         )}
       </header>
-      <div class="overlay-content terminal-content">
+      <div class="overlay-content terminal-content" ref={contentRef}>
         {!screen ? (
           error ? (
             <EmptyState icon="alert" title="Couldn't open the terminal">

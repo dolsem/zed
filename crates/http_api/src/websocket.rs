@@ -30,7 +30,7 @@ pub struct CloseReason {
 }
 
 impl CloseReason {
-    pub const UNAUTHORIZED: Self = Self {
+    const UNAUTHORIZED: Self = Self {
         code: 4001,
         reason: "unauthorized",
     };
@@ -68,8 +68,14 @@ impl ClientHandle {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientAuthMessage {
-    Auth { token: String },
+    Auth {
+        /// The API secret.
+        token: String,
+        device_name: Option<String>,
+    },
 }
+
+const MAX_DEVICE_NAME_CHARS: usize = 64;
 
 enum AuthFailure {
     Close(CloseReason),
@@ -95,19 +101,32 @@ async fn run_connection(
     mut socket: WebSocket,
     pending_permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let token = match tokio::time::timeout(AUTH_TIMEOUT, read_auth_token(&mut socket)).await {
-        Ok(Ok(token)) => token,
-        Ok(Err(AuthFailure::Close(reason))) => {
-            send_close(&mut socket, reason).await;
-            return;
-        }
-        Ok(Err(AuthFailure::Disconnected)) => return,
-        Err(_) => {
-            send_close(&mut socket, CloseReason::AUTH_TIMEOUT).await;
-            return;
-        }
-    };
+    let (token, device_name) =
+        match tokio::time::timeout(AUTH_TIMEOUT, read_auth_token(&mut socket)).await {
+            Ok(Ok(auth)) => auth,
+            Ok(Err(AuthFailure::Close(reason))) => {
+                send_close(&mut socket, reason).await;
+                return;
+            }
+            Ok(Err(AuthFailure::Disconnected)) => return,
+            Err(_) => {
+                send_close(&mut socket, CloseReason::AUTH_TIMEOUT).await;
+                return;
+            }
+        };
     drop(pending_permit);
+    if !server.is_secret(&token) {
+        send_close(&mut socket, CloseReason::UNAUTHORIZED).await;
+        return;
+    }
+    let device_name = device_name
+        .map(|name| {
+            name.chars()
+                .filter(|character| !character.is_control())
+                .take(MAX_DEVICE_NAME_CHARS)
+                .collect::<String>()
+        })
+        .filter(|name| !name.trim().is_empty());
 
     let (outgoing_sender, outgoing_receiver) = mpsc::channel(OUTGOING_QUEUE_CAPACITY);
     let (close_sender, close_receiver) = oneshot::channel();
@@ -116,10 +135,7 @@ async fn run_connection(
         outgoing: outgoing_sender,
         close: close_sender,
     };
-    let Some(device_name) = server.register_client(&token, client_id, handle) else {
-        send_close(&mut socket, CloseReason::UNAUTHORIZED).await;
-        return;
-    };
+    server.clients.lock().insert(client_id, handle);
 
     let auth_ok = serde_json::json!({ "type": "auth_ok", "client_id": client_id }).to_string();
     if !send_with_timeout(&mut socket, Message::Text(auth_ok.into())).await {
@@ -127,7 +143,10 @@ async fn run_connection(
         return;
     }
 
-    log::info!("client {client_id} connected ({device_name})");
+    log::info!(
+        "client {client_id} connected ({})",
+        device_name.as_deref().unwrap_or("unnamed")
+    );
     server
         .send_to_host(ServerMessage::ClientConnected {
             client_id,
@@ -151,12 +170,12 @@ async fn run_connection(
         .await;
 }
 
-async fn read_auth_token(socket: &mut WebSocket) -> Result<String, AuthFailure> {
+async fn read_auth_token(socket: &mut WebSocket) -> Result<(String, Option<String>), AuthFailure> {
     loop {
         match socket.recv().await {
             Some(Ok(Message::Text(text))) => {
                 return match serde_json::from_str::<ClientAuthMessage>(text.as_str()) {
-                    Ok(ClientAuthMessage::Auth { token }) => Ok(token),
+                    Ok(ClientAuthMessage::Auth { token, device_name }) => Ok((token, device_name)),
                     Err(_) => Err(AuthFailure::Close(CloseReason::EXPECTED_AUTH)),
                 };
             }
@@ -260,21 +279,6 @@ async fn send_close(socket: &mut WebSocket, reason: CloseReason) {
 }
 
 impl Server {
-    /// Returns the device name, or `None` if the token is not valid.
-    fn register_client(
-        &self,
-        token: &str,
-        client_id: ClientId,
-        handle: ClientHandle,
-    ) -> Option<String> {
-        // Holding the store lock while registering means a concurrent unpair
-        // either rejects this token or sees and closes this client.
-        let store = self.store.lock();
-        let device = store.device_for_token(token)?;
-        self.clients.lock().insert(client_id, handle);
-        Some(device.name.clone())
-    }
-
     /// Queues `message` for one client, or for all clients when `client_id`
     /// is `None`. Clients whose queue is full are disconnected instead of
     /// buffering without bound.
@@ -306,13 +310,6 @@ impl Server {
                     clients.remove(&recipient);
                 }
             }
-        }
-    }
-
-    pub fn disconnect_all_clients(&self, reason: CloseReason) {
-        let clients = std::mem::take(&mut *self.clients.lock());
-        for (_, handle) in clients {
-            handle.close(reason);
         }
     }
 }

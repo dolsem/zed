@@ -1,7 +1,7 @@
 import { effect } from "@preact/signals";
 import { render } from "preact";
 import { App } from "./app";
-import { fetchSession, setDeviceName, setToken, token } from "./connection";
+import { fetchSession, setToken, token } from "./connection";
 import { conn, handleLocation, refreshThreads } from "./state";
 import "./styles.css";
 import { initViewport } from "./ui";
@@ -18,8 +18,6 @@ effect(() => {
         conn.stop();
         conn.revoked.value = true;
         setToken(null);
-      } else if (session) {
-        setDeviceName(session.device_name);
       }
     });
   } else {

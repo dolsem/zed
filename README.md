@@ -76,29 +76,46 @@ Agent threads of a project opened over a remote connection (SSH, WSL, Docker) ar
 - Changes made while a host is unreachable are kept on the client, also across restarts, and sent once the host is reachable again.
 - If the same thread is open on both machines at once, the last save wins.
 
-#### Mobile web app
+#### HTTP API
 
-Zed can serve a web app that lets you control it from your phone. It works like an app when added to the home screen, including on iOS, and it can send push notifications when an agent finishes or needs permission.
+Zed can serve an HTTP API that lets other programs control it: create worktrees (including running their `create_worktree` hooks), start threads with any agent (Claude and other external agents included), follow them, send messages, answer permission prompts and agent questions, and switch models and modes. Enable it with a secret, which clients send as `Authorization: Bearer <secret>`:
 
+```json
+"http_api": { "enabled": true, "address": "127.0.0.1", "port": 7878, "secret": "<a long random string>" }
+```
+
+Zed shows an error if the API is enabled without a secret. Changing the secret revokes every client that had the old one. The endpoints are documented in `crates/mobile_protocol/src/rest.rs`. In short:
+
+- `GET /api/projects` and `GET /api/agents` list what threads can be started in and with.
+- `POST /api/worktrees` and `POST /api/threads` start an **operation** and answer `202` right away. `GET /api/operations/{id}/events` streams its progress as server-sent events: every step, each worktree hook as it starts and finishes (with the end of its output), and any error. A new worktree only counts as created once its hooks finished. `POST /api/threads` can also set controls (e.g. `{"mode": "plan"}`) and send the first message.
+- A thread is split into **runs**, one per user message, each holding everything the agent did in response. `GET /api/threads/{id}` lists them and `GET /api/threads/{id}/runs/{run_id}` returns one. By default a run only shows its outcome: the agent's final message once it finished, or what it's waiting on, such as a permission prompt (which is also how Claude asks to leave plan mode) or a question. Add `?detail=full` for every message, thought and tool call. Command output is left out of those, and is fetched separately from `GET /api/threads/{id}/tool_calls/{tool_call_id}/output`.
+- `GET /api/threads/{id}/events` subscribes to a thread: a snapshot, then an event whenever a run starts, changes status or finishes, and whenever the thread's state changes. With `?detail=full`, every item as it streams in too.
+- `POST /api/threads/{id}/messages`, `/cancel`, `/permissions/{tool_call_id}` and `/questions/{question_id}`, plus `PUT /api/threads/{id}/controls/{control_id}`, act on the thread.
+
+The server is the separate `http_api` executable, which Zed starts and stops.
+
+#### Web UI
+
+The HTTP API can also serve a web app that lets you control Zed from your phone. It works like an app when added to the home screen, including on iOS, and it can send push notifications when an agent finishes or needs permission.
 - **Threads:** the active threads of every project, including remote ones. Terminal Threads are listed but can't be opened yet. The **+** button starts a thread in a chosen project, worktree (or a new worktree) and agent.
 - **Thread:** the full chat, with tool calls, permission prompts, the plan, the message queue and the model/mode/profile/thinking/effort/fast-mode controls.
 - **Tabs:** the thread's workspace's editor tabs, plus its terminals along the bottom. **+** opens a file tree, and a git history whose first entry is the uncommitted changes. That view always includes untracked files, whatever `git_panel.untracked_changes` says.
+- **Terminals** open full screen too. While one is open on the phone, Zed resizes it to the phone's screen, so the desktop shows the terminal at that size until the phone closes it. Scrolling the history on the phone doesn't move the desktop's view.
 - **Editors** open full screen. They stay in sync with Zed's buffers, with syntax highlighting, diagnostics, completions, hover, go-to-definition, formatting and saving through Zed. Diffs and terminals also open full screen.
 
 To set it up:
 
-1. Enable the server. It listens on `127.0.0.1:7878` by default:
+1. Enable the HTTP API (with a secret, see above) and the web UI. Zed shows an error if the web UI is enabled without the HTTP API:
    ```json
-   "mobile_server": { "enabled": true, "address": "127.0.0.1", "port": 7878 }
+   "web_ui": { "enabled": true }
    ```
-2. Expose it over HTTPS with a reverse proxy, e.g. `cloudflared tunnel --url http://127.0.0.1:7878`. Installing the app and receiving push notifications both need HTTPS.
-3. Open the URL on your phone and add it to the home screen. Run `mobile server: pair device` in Zed and enter the code it shows in the app. Do this from the installed app, because on iOS it doesn't share storage with Safari.
+2. Expose the server over HTTPS with a reverse proxy, e.g. `cloudflared tunnel --url http://127.0.0.1:7878`. Installing the app and receiving push notifications both need HTTPS.
+3. Open the URL on your phone and add it to the home screen. Run `web ui: pair device` in Zed and enter the code it shows in the app, which then receives the HTTP API's secret. Do this from the installed app, because on iOS it doesn't share storage with Safari.
 4. Turn on notifications in the app's settings (the gear icon).
 
-Pushes follow the same rule as Zed's own popups: nothing is sent while the thread is on screen in an active Zed window. On top of that, they only go out when the phone was the last thing used to interact with Zed, unless the bell in the status bar is switched on (`mobile_server.always_notify`), which pushes whenever Zed would notify.
+Pushes follow the same rule as Zed's own popups: nothing is sent while the thread is on screen in an active Zed window. On top of that, they only go out when the phone was the last thing used to interact with Zed, unless the bell in the status bar is switched on (`web_ui.always_notify`), which pushes whenever Zed would notify.
 
-`mobile server: unpair all devices` revokes every paired phone. The server is the separate `mobile_server` executable, which Zed starts and stops. Its state (paired devices, push keys) lives in Zed's data directory under `mobile_server/`.
-
+To unpair every device, change `http_api.secret`. That also drops their push subscriptions. The web UI's state (push keys and subscriptions) lives in Zed's data directory under `web_ui/`.
 #### `dolsem` release channel
 
 Builds from this fork use a separate `dolsem` release channel (`crates/zed/RELEASE_CHANNEL`). It runs as **Zed Dolsem**, with its own app icon, app identifier (`dev.zed.Zed-Dolsem`) and single-instance port. That lets it run side by side with an official Zed install. It never checks for or installs updates.

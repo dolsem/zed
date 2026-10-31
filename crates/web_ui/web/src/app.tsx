@@ -207,7 +207,7 @@ function PairingScreen() {
         {revoked && (
           <div class="callout error compact">
             <Icon name="alert" size={16} />
-            <div class="callout-text">This device was unpaired. Pair it again to reconnect.</div>
+            <div class="callout-text">Zed no longer accepts this device, e.g. because its HTTP API secret changed. Pair it again to reconnect.</div>
           </div>
         )}
         <label class="field">

@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use anyhow::anyhow;
+use anyhow::{Context as _, anyhow};
 use askpass::AskPassDelegate;
 use collections::{HashMap, HashSet};
 use fs::Fs;
@@ -21,6 +21,7 @@ use settings::Settings;
 use ui::prelude::*;
 use workspace::{
     MultiWorkspace, OpenMode, PreviousWorkspaceState, ToastView, Workspace, dock::DockPosition,
+    tasks::WorktreeHookEventHandler,
 };
 use zed_actions::NewWorktreeBranchTarget;
 
@@ -278,6 +279,7 @@ impl Render for WorktreeFetchFailedToast {
                                 RemoteBranchFetchMode::UseLocal,
                                 // User-initiated retry of a foreground create.
                                 true,
+                                None,
                                 cx,
                             );
                             task.detach_and_log_err(cx);
@@ -712,6 +714,7 @@ pub fn handle_create_worktree(
         RemoteBranchFetchMode::Fetch,
         // The user explicitly asked to create a worktree, so foreground it.
         true,
+        None,
         cx,
     );
     task.detach_and_log_err(cx);
@@ -727,6 +730,9 @@ pub struct CreatedWorktreeWorkspace {
     /// that care — like the `create_thread` agent tool — can use this to warn
     /// that the result may not reflect every source worktree's state.
     pub consolidated_worktrees: bool,
+    /// Resolves once the `create_worktree` hooks finished, to an error if any
+    /// of them failed. The hooks keep running when this is dropped.
+    pub setup_hooks: futures::channel::oneshot::Receiver<anyhow::Result<()>>,
 }
 
 /// Same as [`handle_create_worktree`], but returns a `Task` that resolves to
@@ -752,6 +758,26 @@ pub fn create_worktree_workspace(
     fallback_focused_dock: Option<DockPosition>,
     cx: &mut gpui::Context<Workspace>,
 ) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
+    create_worktree_workspace_with_hook_events(
+        workspace,
+        action,
+        window,
+        fallback_focused_dock,
+        None,
+        cx,
+    )
+}
+
+/// Same as [`create_worktree_workspace`], reporting the progress of the new
+/// worktree's `create_worktree` hooks to `on_hook_event`.
+pub fn create_worktree_workspace_with_hook_events(
+    workspace: &mut Workspace,
+    action: &zed_actions::CreateWorktree,
+    window: &mut gpui::Window,
+    fallback_focused_dock: Option<DockPosition>,
+    on_hook_event: Option<WorktreeHookEventHandler>,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
     create_worktree_workspace_inner(
         workspace,
         action,
@@ -760,6 +786,7 @@ pub fn create_worktree_workspace(
         RemoteBranchFetchMode::Fetch,
         // Agent-created worktree workspaces open in the background.
         false,
+        on_hook_event,
         cx,
     )
 }
@@ -771,6 +798,7 @@ fn create_worktree_workspace_inner(
     fallback_focused_dock: Option<DockPosition>,
     remote_branch_fetch_mode: RemoteBranchFetchMode,
     activate: bool,
+    on_hook_event: Option<WorktreeHookEventHandler>,
     cx: &mut gpui::Context<Workspace>,
 ) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
     let project = workspace.project().clone();
@@ -874,6 +902,7 @@ fn create_worktree_workspace_inner(
             window_handle,
             remote_connection_options,
             activate,
+            on_hook_event,
             &mut cx,
         )
         .await;
@@ -1270,6 +1299,7 @@ async fn do_create_worktree(
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
     activate: bool,
+    on_hook_event: Option<WorktreeHookEventHandler>,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<CreatedWorktreeWorkspace> {
     // List existing worktrees from all repos to detect name collisions
@@ -1381,7 +1411,7 @@ async fn do_create_worktree(
     let has_non_git = !non_git_paths.is_empty();
     all_paths.extend(non_git_paths.iter().cloned());
 
-    let workspace = open_worktree_workspace(
+    let (workspace, setup_hooks) = open_worktree_workspace(
         all_paths,
         path_remapping,
         non_git_paths,
@@ -1392,6 +1422,7 @@ async fn do_create_worktree(
         remote_connection_options,
         WorktreeOperation::Create,
         activate,
+        on_hook_event,
         cx,
     )
     .await?;
@@ -1399,6 +1430,7 @@ async fn do_create_worktree(
     Ok(CreatedWorktreeWorkspace {
         workspace,
         consolidated_worktrees,
+        setup_hooks: setup_hooks.context("the worktree's setup hooks didn't start")?,
     })
 }
 
@@ -1421,7 +1453,7 @@ async fn do_switch_worktree(
     let has_non_git = !non_git_paths.is_empty();
     all_paths.extend(non_git_paths.iter().cloned());
 
-    open_worktree_workspace(
+    let (workspace, _) = open_worktree_workspace(
         all_paths,
         path_remapping,
         non_git_paths,
@@ -1433,14 +1465,17 @@ async fn do_switch_worktree(
         WorktreeOperation::Switch,
         // Switching is always an explicit, foreground user action.
         true,
+        None,
         cx,
     )
-    .await
+    .await?;
+    Ok(workspace)
 }
 
 /// Core workspace opening logic shared by both create and switch flows.
 /// Returns the newly opened workspace entity so callers can do post-open
-/// work (e.g., the `create_thread` agent tool spawns a thread inside it).
+/// work (e.g., the `create_thread` agent tool spawns a thread inside it),
+/// and when creating a worktree, a receiver for the outcome of its hooks.
 async fn open_worktree_workspace(
     all_paths: Vec<PathBuf>,
     path_remapping: Vec<(PathBuf, PathBuf)>,
@@ -1452,8 +1487,12 @@ async fn open_worktree_workspace(
     remote_connection_options: Option<RemoteConnectionOptions>,
     operation: WorktreeOperation,
     activate: bool,
+    on_hook_event: Option<WorktreeHookEventHandler>,
     cx: &mut AsyncWindowContext,
-) -> anyhow::Result<Entity<Workspace>> {
+) -> anyhow::Result<(
+    Entity<Workspace>,
+    Option<futures::channel::oneshot::Receiver<anyhow::Result<()>>>,
+)> {
     let window_handle = window_handle
         .ok_or_else(|| anyhow!("No window handle available for workspace creation"))?;
 
@@ -1652,7 +1691,7 @@ async fn open_worktree_workspace(
         })
         .ok();
 
-    window_handle.update(cx, |multi_workspace, window, cx| {
+    let setup_hooks = window_handle.update(cx, |multi_workspace, window, cx| {
         if activate {
             multi_workspace.activate(new_workspace.clone(), source_for_transfer, window, cx);
         } else {
@@ -1661,23 +1700,32 @@ async fn open_worktree_workspace(
             multi_workspace.add(new_workspace.clone(), window, cx);
         }
 
-        if is_creating_new_worktree {
-            new_workspace.update(cx, |workspace, cx| {
-                // Run create-worktree setup hooks regardless of foreground vs
-                // background — the worktree was created either way.
-                workspace.run_create_worktree_tasks(window, cx);
-
-                if activate && let Some(dock_position) = focused_dock {
-                    let dock = workspace.dock_at_position(dock_position);
-                    if let Some(panel) = dock.read(cx).active_panel() {
-                        panel.activation_focus_handle(cx).focus(window, cx);
-                    }
-                }
-            });
+        if !is_creating_new_worktree {
+            return None;
         }
+        new_workspace.update(cx, |workspace, cx| {
+            // Run create-worktree setup hooks regardless of foreground vs
+            // background — the worktree was created either way.
+            let hooks = workspace.run_create_worktree_tasks(on_hook_event, window, cx);
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            cx.spawn(async move |_, _| {
+                if let Err(Err(error)) = sender.send(hooks.await) {
+                    log::error!("{error:#}");
+                }
+            })
+            .detach();
+
+            if activate && let Some(dock_position) = focused_dock {
+                let dock = workspace.dock_at_position(dock_position);
+                if let Some(panel) = dock.read(cx).active_panel() {
+                    panel.activation_focus_handle(cx).focus(window, cx);
+                }
+            }
+            Some(receiver)
+        })
     })?;
 
-    Ok(new_workspace)
+    Ok((new_workspace, setup_hooks))
 }
 
 #[cfg(test)]
@@ -1855,7 +1903,9 @@ mod tests {
             );
         });
         active_workspace.update_in(cx, |workspace, window, cx| {
-            workspace.run_create_worktree_tasks(window, cx);
+            workspace
+                .run_create_worktree_tasks(None, window, cx)
+                .detach_and_log_err(cx);
         });
         cx.run_until_parked();
 

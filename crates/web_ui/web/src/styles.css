@@ -2988,11 +2988,11 @@ button.form-row:active:not(:disabled) {
 .terminal-wrap {
   position: absolute;
   inset: 0;
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: hidden;
   overscroll-behavior: contain;
-  touch-action: pan-x;
-  padding: 4px max(4px, var(--safe-right)) 4px max(4px, var(--safe-left));
+  /* Swipes scroll the history through Zed; the browser mustn't pan. */
+  touch-action: none;
+  padding: 4px;
 }
 
 .terminal-grid {
@@ -3008,6 +3008,12 @@ button.form-row:active:not(:disabled) {
 .terminal-row {
   overflow: hidden;
   white-space: pre;
+}
+
+/* Rows are sized exactly; glyph boxes must not add to the line box. */
+.terminal-row > span {
+  line-height: inherit;
+  vertical-align: top;
 }
 
 .terminal-cursor {

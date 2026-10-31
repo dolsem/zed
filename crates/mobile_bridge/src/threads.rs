@@ -8,7 +8,8 @@ use agent_ui::{AgentNotificationInfo, AgentNotificationObserver, AgentPanel, Thr
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, EntityId, Subscription, Task, WindowHandle};
-use mobile_protocol::ClientId;
+use mobile_protocol::rest::{self, thread_events};
+use mobile_protocol::{ClientId, RequestId};
 use settings::Settings as _;
 use sidebar::mobile::{MobileThreadId, find_or_open_workspace, threads_snapshot};
 use util::path_list::PathList;
@@ -19,7 +20,7 @@ use crate::api::{
     NewThreadProject, ProjectThreads, ThreadEntriesRemovedEvent, ThreadEntryEvent, ThreadKind,
     ThreadSnapshot, ThreadSummary, ThreadsList, WorktreeChoice, WorktreeOption, events,
 };
-use crate::{MobileBridge, MobileServerSettings, Subscribers, multi_workspace_windows, to_json};
+use crate::{MobileBridge, Subscribers, WebUiSettings, multi_workspace_windows, to_json};
 
 const THREADS_LIST_DEBOUNCE: Duration = Duration::from_millis(250);
 const THREAD_FLUSH_INTERVAL: Duration = Duration::from_millis(80);
@@ -37,15 +38,28 @@ pub(crate) struct ThreadsState {
 }
 
 struct ThreadSubscription {
+    /// Web UI clients with the thread open.
     subscribers: Subscribers,
+    /// HTTP API event streams, and whether they want every run item.
+    streams: HashMap<RequestId, bool>,
     conversation: MobileConversation,
     thread_view_id: Option<EntityId>,
     entry_count: usize,
     last_state: Option<api::ThreadState>,
+    /// The runs as last sent to `streams`, without items.
+    last_runs: Vec<rest::Run>,
+    /// Set when entries were removed, so streams need a fresh snapshot.
+    streams_need_snapshot: bool,
     dirty_entries: BTreeSet<usize>,
     state_dirty: bool,
     flush_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+impl ThreadSubscription {
+    fn is_unused(&self) -> bool {
+        self.subscribers.is_empty() && self.streams.is_empty()
+    }
 }
 
 impl ThreadsState {
@@ -78,7 +92,8 @@ impl ThreadsState {
                 .and_then(|multi_workspace| multi_workspace.sidebar())
                 .and_then(|sidebar| sidebar.to_any().downcast::<sidebar::Sidebar>().ok())
             {
-                let subscription = cx.observe(&sidebar, |this, _, cx| this.schedule_list_refresh(cx));
+                let subscription =
+                    cx.observe(&sidebar, |this, _, cx| this.schedule_list_refresh(cx));
                 self.observed_sidebars
                     .insert(sidebar.entity_id(), subscription);
             }
@@ -101,14 +116,23 @@ impl ThreadsState {
         }
         self.threads.retain(|_, subscription| {
             subscription.subscribers.remove(&client_id);
-            !subscription.subscribers.is_empty()
+            !subscription.is_unused()
         });
     }
 
     pub fn unsubscribe(&mut self, client_id: ClientId, thread_id: &str) {
         if let Some(subscription) = self.threads.get_mut(thread_id) {
             subscription.subscribers.remove(&client_id);
-            if subscription.subscribers.is_empty() {
+            if subscription.is_unused() {
+                self.threads.remove(thread_id);
+            }
+        }
+    }
+
+    pub fn remove_stream(&mut self, request_id: RequestId, thread_id: &str) {
+        if let Some(subscription) = self.threads.get_mut(thread_id) {
+            subscription.streams.remove(&request_id);
+            if subscription.is_unused() {
                 self.threads.remove(thread_id);
             }
         }
@@ -153,8 +177,7 @@ impl MobileBridge {
         if info.visible_on_desktop {
             return;
         }
-        if !MobileServerSettings::get_global(cx).always_notify && !self.last_interaction_from_mobile
-        {
+        if !WebUiSettings::get_global(cx).always_notify && !self.last_interaction_from_mobile {
             return;
         }
         let thread_id = info.thread_id.to_key_string();
@@ -190,127 +213,181 @@ impl MobileBridge {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Task<Result<serde_json::Value>> {
-        let mut projects = Vec::new();
-        let mut branch_tasks = Vec::new();
-        for window in multi_workspace_windows(cx) {
-            let Ok(multi_workspace) = window.read(cx) else {
-                continue;
-            };
-            for group in sidebar::mobile::project_groups(multi_workspace, cx) {
-                if group.key.path_list().paths().is_empty() {
-                    continue;
-                }
-                let mut worktrees = Vec::new();
-                let mut repository = None;
-                for workspace in &group.workspaces {
-                    let project = workspace.read(cx).project().read(cx);
-                    for candidate in project.repositories(cx).values() {
-                        let snapshot = candidate.read(cx).snapshot();
-                        let is_root = group
-                            .key
-                            .path_list()
-                            .paths()
-                            .iter()
-                            .any(|path| path.as_path() == snapshot.work_directory_abs_path.as_ref());
-                        if !is_root {
-                            continue;
-                        }
-                        repository.get_or_insert_with(|| candidate.clone());
-                        push_worktree_option(
-                            &mut worktrees,
-                            snapshot.work_directory_abs_path.to_path_buf(),
-                            snapshot.branch.as_ref().map(|branch| branch.name().to_string()),
-                            true,
-                        );
-                        for linked_worktree in snapshot.linked_worktrees() {
-                            push_worktree_option(
-                                &mut worktrees,
-                                linked_worktree.path.clone(),
-                                linked_worktree.branch_name().map(str::to_string),
-                                false,
-                            );
-                        }
-                    }
-                }
-                let current_branch = worktrees
-                    .iter()
-                    .find(|worktree| worktree.is_main)
-                    .and_then(|worktree| worktree.branch.clone());
-                if let Some(repository) = &repository {
-                    branch_tasks.push((
-                        projects.len(),
-                        repository.update(cx, |repository, _| repository.branches()),
-                    ));
-                }
-                projects.push(NewThreadProject {
-                    project_id: project_id(&group.key),
-                    name: String::new(),
-                    remote_host: group.key.host().map(|host| host.display_name()),
-                    worktrees,
-                    can_create_worktree: repository.is_some(),
-                    branches: current_branch.into_iter().collect(),
-                });
-            }
-        }
-        let names: HashMap<String, String> = threads_snapshot(cx)
-            .into_iter()
-            .map(|project| (project_id(&project.key), project.name.to_string()))
-            .collect();
-        for project in &mut projects {
-            if let Some(name) = names.get(&project.project_id) {
-                project.name = name.clone();
-            }
-        }
-
-        let mut agents = vec![AgentOption {
-            id: agent::ZED_AGENT_ID.to_string(),
-            name: "Zed Agent".to_string(),
-            is_external: false,
-        }];
-        let mut default_agent_id = agent::ZED_AGENT_ID.to_string();
-        if let Ok((_, workspace)) = crate::active_workspace(cx) {
-            let project = workspace.read(cx).project().read(cx);
-            let store = project.agent_server_store().read(cx);
-            for agent_id in store.external_agents() {
-                agents.push(AgentOption {
-                    id: agent_id.0.to_string(),
-                    name: store
-                        .agent_display_name(agent_id)
-                        .unwrap_or_else(|| agent_id.0.clone())
-                        .to_string(),
-                    is_external: true,
-                });
-            }
-            if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                default_agent_id = panel.read(cx).selected_agent(cx).id().0.to_string();
-            }
-        }
-
-        cx.background_spawn(async move {
-            for (index, branches) in branch_tasks {
-                let Ok(Ok(result)) = branches.await else {
-                    continue;
-                };
-                if let Some(project) = projects.get_mut(index) {
-                    for branch in result.branches {
-                        if branch.is_remote() {
-                            continue;
-                        }
-                        let name = branch.name().to_string();
-                        if !project.branches.contains(&name) {
-                            project.branches.push(name);
-                        }
-                    }
-                }
-            }
-            to_json(NewThreadOptions {
-                projects,
-                agents,
-                default_agent_id,
-            })
-        })
+        let options = build_new_thread_options(cx);
+        cx.background_spawn(async move { to_json(options.await?) })
     }
 
+    /// Loads the thread in Zed if needed, and waits until its agent is
+    /// ready (or failed to start).
+    pub(crate) fn load_conversation(
+        &mut self,
+        thread_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<MobileConversation>> {
+        let parsed_thread_id = match ThreadId::from_key_string(thread_id) {
+            Ok(thread_id) => thread_id,
+            Err(error) => return Task::ready(Err(error.context("invalid thread id"))),
+        };
+        let needs_activation = agent_mobile::find_conversation(parsed_thread_id, cx).is_none();
+        if needs_activation
+            && let Err(error) = sidebar::mobile::activate_thread(parsed_thread_id, cx)
+        {
+            return Task::ready(Err(error));
+        }
+        cx.spawn(async move |_, cx| wait_for_conversation(parsed_thread_id, cx).await)
+    }
+}
+
+/// Waits until the thread's conversation is open and its session loaded.
+pub(crate) async fn wait_for_conversation(
+    thread_id: ThreadId,
+    cx: &mut gpui::AsyncApp,
+) -> Result<MobileConversation> {
+    let deadline = cx.background_executor().now() + THREAD_LOAD_TIMEOUT;
+    loop {
+        let conversation = cx.update(|cx| {
+            let conversation = agent_mobile::find_conversation(thread_id, cx)?;
+            if conversation.thread(cx).is_some() {
+                return Some(Ok(conversation));
+            }
+            agent_mobile::conversation_error(&conversation, cx).map(|error| Err(anyhow!(error)))
+        });
+        if let Some(conversation) = conversation {
+            return conversation;
+        }
+        if cx.background_executor().now() >= deadline {
+            return Err(anyhow!("timed out loading the thread"));
+        }
+        cx.background_executor()
+            .timer(THREAD_LOAD_POLL_INTERVAL)
+            .await;
+    }
+}
+
+pub(crate) fn build_new_thread_options(cx: &mut App) -> Task<Result<NewThreadOptions>> {
+    let mut projects = Vec::new();
+    let mut branch_tasks = Vec::new();
+    for window in multi_workspace_windows(cx) {
+        let Ok(multi_workspace) = window.read(cx) else {
+            continue;
+        };
+        for group in sidebar::mobile::project_groups(multi_workspace, cx) {
+            if group.key.path_list().paths().is_empty() {
+                continue;
+            }
+            let mut worktrees = Vec::new();
+            let mut repository = None;
+            for workspace in &group.workspaces {
+                let project = workspace.read(cx).project().read(cx);
+                for candidate in project.repositories(cx).values() {
+                    let snapshot = candidate.read(cx).snapshot();
+                    let is_root =
+                        group.key.path_list().paths().iter().any(|path| {
+                            path.as_path() == snapshot.work_directory_abs_path.as_ref()
+                        });
+                    if !is_root {
+                        continue;
+                    }
+                    repository.get_or_insert_with(|| candidate.clone());
+                    push_worktree_option(
+                        &mut worktrees,
+                        snapshot.work_directory_abs_path.to_path_buf(),
+                        snapshot
+                            .branch
+                            .as_ref()
+                            .map(|branch| branch.name().to_string()),
+                        true,
+                    );
+                    for linked_worktree in snapshot.linked_worktrees() {
+                        push_worktree_option(
+                            &mut worktrees,
+                            linked_worktree.path.clone(),
+                            linked_worktree.branch_name().map(str::to_string),
+                            false,
+                        );
+                    }
+                }
+            }
+            let current_branch = worktrees
+                .iter()
+                .find(|worktree| worktree.is_main)
+                .and_then(|worktree| worktree.branch.clone());
+            if let Some(repository) = &repository {
+                branch_tasks.push((
+                    projects.len(),
+                    repository.update(cx, |repository, _| repository.branches()),
+                ));
+            }
+            projects.push(NewThreadProject {
+                project_id: project_id(&group.key),
+                name: String::new(),
+                remote_host: group.key.host().map(|host| host.display_name()),
+                worktrees,
+                can_create_worktree: repository.is_some(),
+                branches: current_branch.into_iter().collect(),
+            });
+        }
+    }
+    let names: HashMap<String, String> = threads_snapshot(cx)
+        .into_iter()
+        .map(|project| (project_id(&project.key), project.name.to_string()))
+        .collect();
+    for project in &mut projects {
+        if let Some(name) = names.get(&project.project_id) {
+            project.name = name.clone();
+        }
+    }
+
+    let mut agents = vec![AgentOption {
+        id: agent::ZED_AGENT_ID.to_string(),
+        name: "Zed Agent".to_string(),
+        is_external: false,
+    }];
+    let mut default_agent_id = agent::ZED_AGENT_ID.to_string();
+    if let Ok((_, workspace)) = crate::active_workspace(cx) {
+        let project = workspace.read(cx).project().read(cx);
+        let store = project.agent_server_store().read(cx);
+        for agent_id in store.external_agents() {
+            agents.push(AgentOption {
+                id: agent_id.0.to_string(),
+                name: store
+                    .agent_display_name(agent_id)
+                    .unwrap_or_else(|| agent_id.0.clone())
+                    .to_string(),
+                is_external: true,
+            });
+        }
+        if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+            default_agent_id = panel.read(cx).selected_agent(cx).id().0.to_string();
+        }
+    }
+
+    cx.background_spawn(async move {
+        for (index, branches) in branch_tasks {
+            let Ok(Ok(result)) = branches.await else {
+                continue;
+            };
+            if let Some(project) = projects.get_mut(index) {
+                for branch in result.branches {
+                    if branch.is_remote() {
+                        continue;
+                    }
+                    let name = branch.name().to_string();
+                    if !project.branches.contains(&name) {
+                        project.branches.push(name);
+                    }
+                }
+            }
+        }
+        Ok(NewThreadOptions {
+            projects,
+            agents,
+            default_agent_id,
+        })
+    })
+}
+
+impl MobileBridge {
     pub(crate) fn create_thread(
         &mut self,
         params: CreateThreadParams,
@@ -352,9 +429,9 @@ impl MobileBridge {
                     let action = zed_actions::CreateWorktree {
                         worktree_name: name.filter(|name| !name.trim().is_empty()),
                         branch_target: match branch {
-                            Some(name) => zed_actions::NewWorktreeBranchTarget::ExistingBranch {
-                                name,
-                            },
+                            Some(name) => {
+                                zed_actions::NewWorktreeBranchTarget::ExistingBranch { name }
+                            }
                             None => zed_actions::NewWorktreeBranchTarget::CurrentBranch,
                         },
                     };
@@ -365,7 +442,10 @@ impl MobileBridge {
                             )
                         })
                     })?;
-                    creation.await.context("failed to create the worktree")?.workspace
+                    creation
+                        .await
+                        .context("failed to create the worktree")?
+                        .workspace
                 }
             };
             let thread_id = wait_for_agent_panel(&workspace, cx).await.and_then(|()| {
@@ -385,38 +465,54 @@ impl MobileBridge {
         thread_id: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<serde_json::Value>> {
-        let parsed_thread_id = match ThreadId::from_key_string(&thread_id) {
-            Ok(thread_id) => thread_id,
-            Err(error) => return Task::ready(Err(error.context("invalid thread id"))),
-        };
-        let needs_activation = agent_mobile::find_conversation(parsed_thread_id, cx).is_none();
-        if needs_activation
-            && let Err(error) = sidebar::mobile::activate_thread(parsed_thread_id, cx)
-        {
-            return Task::ready(Err(error));
-        }
+        let conversation = self.load_conversation(&thread_id, cx);
         cx.spawn(async move |this, cx| {
-            let deadline = cx.background_executor().now() + THREAD_LOAD_TIMEOUT;
-            let conversation = loop {
-                let conversation = cx.update(|cx| {
-                    agent_mobile::find_conversation(parsed_thread_id, cx)
-                        .filter(|conversation| conversation.thread(cx).is_some())
-                });
-                if let Some(conversation) = conversation {
-                    break conversation;
-                }
-                if cx.background_executor().now() >= deadline {
-                    return Err(anyhow!("timed out loading the thread"));
-                }
-                cx.background_executor()
-                    .timer(THREAD_LOAD_POLL_INTERVAL)
-                    .await;
-            };
+            let conversation = conversation.await?;
             this.update(cx, |this, cx| {
                 let snapshot = this.subscribe_thread(client_id, &thread_id, conversation, cx)?;
                 to_json(snapshot)
             })?
         })
+    }
+
+    /// Makes sure the thread is watched through `conversation`, keeping
+    /// whoever is already subscribed.
+    fn ensure_thread_subscription(
+        &mut self,
+        thread_id: &str,
+        conversation: &MobileConversation,
+        cx: &mut Context<Self>,
+    ) -> Result<&mut ThreadSubscription> {
+        let needs_new_subscription = self.threads.threads.get(thread_id).is_none_or(|existing| {
+            existing.conversation.conversation != conversation.conversation
+                || existing.thread_view_id
+                    != conversation
+                        .thread_view(cx)
+                        .map(|thread_view| thread_view.entity_id())
+        });
+        if needs_new_subscription {
+            let (subscribers, streams) = self
+                .threads
+                .threads
+                .remove(thread_id)
+                .map(|existing| (existing.subscribers, existing.streams))
+                .unwrap_or_default();
+            let mut subscription =
+                self.watch_thread(thread_id, conversation.clone(), subscribers, cx)?;
+            subscription.streams_need_snapshot = !streams.is_empty();
+            subscription.streams = streams;
+            let needs_flush = subscription.streams_need_snapshot;
+            self.threads
+                .threads
+                .insert(thread_id.to_string(), subscription);
+            if needs_flush {
+                self.schedule_thread_flush(thread_id, cx);
+            }
+        }
+        self.threads
+            .threads
+            .get_mut(thread_id)
+            .context("the thread subscription disappeared")
     }
 
     fn subscribe_thread(
@@ -426,28 +522,9 @@ impl MobileBridge {
         conversation: MobileConversation,
         cx: &mut Context<Self>,
     ) -> Result<ThreadSnapshot> {
-        let needs_new_subscription = self.threads.threads.get(thread_id).is_none_or(|existing| {
-            existing.conversation.conversation != conversation.conversation
-                || existing.thread_view_id
-                    != conversation
-                        .thread_view(cx)
-                        .map(|thread_view| thread_view.entity_id())
-        });
-        if needs_new_subscription {
-            let mut subscribers = self
-                .threads
-                .threads
-                .remove(thread_id)
-                .map(|existing| existing.subscribers)
-                .unwrap_or_default();
-            subscribers.insert(client_id);
-            let subscription = self.watch_thread(thread_id, conversation.clone(), subscribers, cx)?;
-            self.threads
-                .threads
-                .insert(thread_id.to_string(), subscription);
-        } else if let Some(existing) = self.threads.threads.get_mut(thread_id) {
-            existing.subscribers.insert(client_id);
-        }
+        self.ensure_thread_subscription(thread_id, &conversation, cx)?
+            .subscribers
+            .insert(client_id);
 
         let state = agent_mobile::thread_state(&conversation, thread_id, cx)
             .context("the thread is still loading")?;
@@ -483,11 +560,15 @@ impl MobileBridge {
 
         let view_thread_id = thread_id.to_string();
         let bridge = cx.weak_entity();
-        if let Some(subscription) = agent_mobile::observe_thread_view(&conversation, cx, move |cx| {
-            bridge
-                .update(cx, |this, cx| this.mark_thread_state_dirty(&view_thread_id, cx))
-                .ok();
-        }) {
+        if let Some(subscription) =
+            agent_mobile::observe_thread_view(&conversation, cx, move |cx| {
+                bridge
+                    .update(cx, |this, cx| {
+                        this.mark_thread_state_dirty(&view_thread_id, cx)
+                    })
+                    .ok();
+            })
+        {
             subscriptions.push(subscription);
         }
 
@@ -498,19 +579,188 @@ impl MobileBridge {
             this.handle_conversation_changed(&reload_thread_id, cx);
         }));
 
+        let closed_thread_id = thread_id.to_string();
+        subscriptions.push(
+            cx.observe_release(&conversation.conversation, move |this, _, cx| {
+                this.handle_thread_closed(&closed_thread_id, cx);
+            }),
+        );
+
         Ok(ThreadSubscription {
             subscribers,
+            streams: HashMap::default(),
             thread_view_id: conversation
                 .thread_view(cx)
                 .map(|thread_view| thread_view.entity_id()),
             conversation,
             entry_count: 0,
             last_state: None,
+            last_runs: Vec::new(),
+            streams_need_snapshot: false,
             dirty_entries: BTreeSet::new(),
             state_dirty: false,
             flush_task: None,
             _subscriptions: subscriptions,
         })
+    }
+
+    /// Starts streaming the thread's events to an HTTP API client, beginning
+    /// with a snapshot.
+    pub(crate) fn subscribe_thread_stream(
+        &mut self,
+        request_id: RequestId,
+        thread_id: &str,
+        conversation: MobileConversation,
+        include_items: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let details = thread_details(&conversation, thread_id, include_items, cx)
+            .context("the thread is still loading")?;
+        let subscription = self.ensure_thread_subscription(thread_id, &conversation, cx)?;
+        // Other streams were sent the runs as of the last flush, which they
+        // must keep being compared against.
+        if subscription.streams.is_empty() {
+            subscription.last_runs = details.runs.iter().map(without_items).collect();
+        }
+        subscription.streams.insert(request_id, include_items);
+        self.rest.streams.insert(
+            request_id,
+            crate::rest::StreamTarget::Thread(thread_id.to_string()),
+        );
+        self.start_stream(request_id);
+        self.send_stream_event(request_id, thread_events::SNAPSHOT, &details);
+        Ok(())
+    }
+
+    fn handle_thread_closed(&mut self, thread_id: &str, _cx: &mut Context<Self>) {
+        let Some(subscription) = self.threads.threads.get_mut(thread_id) else {
+            return;
+        };
+        let streams = std::mem::take(&mut subscription.streams);
+        if subscription.is_unused() {
+            self.threads.threads.remove(thread_id);
+        }
+        for request_id in streams.into_keys() {
+            self.end_stream_with_error(request_id, "The thread was closed in Zed.");
+        }
+    }
+
+    fn flush_thread_streams(
+        &mut self,
+        thread_id: &str,
+        dirty_entries: &BTreeSet<usize>,
+        state: Option<&api::ThreadState>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(subscription) = self.threads.threads.get_mut(thread_id) else {
+            return;
+        };
+        if subscription.streams.is_empty() {
+            return;
+        }
+        let conversation = subscription.conversation.clone();
+        let streams = subscription.streams.clone();
+
+        if std::mem::take(&mut subscription.streams_need_snapshot) {
+            let Some(summary) = thread_details(&conversation, thread_id, false, cx) else {
+                return;
+            };
+            let full = streams
+                .values()
+                .any(|include_items| *include_items)
+                .then(|| thread_details(&conversation, thread_id, true, cx))
+                .flatten();
+            if let Some(subscription) = self.threads.threads.get_mut(thread_id) {
+                subscription.last_runs = summary.runs.clone();
+            }
+            for (request_id, include_items) in streams {
+                let details = match &full {
+                    Some(full) if include_items => full,
+                    _ => &summary,
+                };
+                self.send_stream_event(request_id, thread_events::SNAPSHOT, details);
+            }
+            return;
+        }
+
+        let ranges = agent_mobile::run_ranges(&conversation, cx);
+        let Some(last_index) = ranges.len().checked_sub(1) else {
+            if let Some(state) = state {
+                for request_id in streams.keys() {
+                    self.send_stream_event(*request_id, thread_events::STATE, state);
+                }
+            }
+            return;
+        };
+        let run_index_of = |entry_index: usize| {
+            ranges
+                .iter()
+                .position(|range| range.entries.contains(&entry_index))
+        };
+        // A run's status also changes when the next one starts or the agent
+        // stops, which doesn't touch its entries.
+        let mut touched_runs = dirty_entries
+            .iter()
+            .filter_map(|index| run_index_of(*index))
+            .collect::<BTreeSet<_>>();
+        touched_runs.insert(last_index);
+        if let Some(previous_index) = last_index.checked_sub(1) {
+            touched_runs.insert(previous_index);
+        }
+
+        let mut item_events = Vec::new();
+        if streams.values().any(|include_items| *include_items) {
+            for entry_index in dirty_entries {
+                let Some(run_index) = run_index_of(*entry_index) else {
+                    continue;
+                };
+                let range = &ranges[run_index];
+                if let Some(item) = agent_mobile::thread_run_item(&conversation, *entry_index, cx) {
+                    item_events.push(rest::RunItemEvent {
+                        run_id: range.run_id.clone(),
+                        index: entry_index - range.entries.start,
+                        item,
+                    });
+                }
+            }
+        }
+
+        let mut run_events = Vec::new();
+        let Some(subscription) = self.threads.threads.get_mut(thread_id) else {
+            return;
+        };
+        subscription.last_runs.truncate(ranges.len());
+        for run_index in touched_runs {
+            let Some(run) = agent_mobile::build_run(
+                &conversation,
+                &ranges[run_index],
+                run_index == last_index,
+                false,
+                cx,
+            ) else {
+                continue;
+            };
+            match subscription.last_runs.get_mut(run_index) {
+                Some(last_run) if *last_run == run => continue,
+                Some(last_run) => *last_run = run.clone(),
+                None => subscription.last_runs.push(run.clone()),
+            }
+            run_events.push(run);
+        }
+
+        for (request_id, include_items) in streams {
+            if include_items {
+                for event in &item_events {
+                    self.send_stream_event(request_id, thread_events::ITEM, event);
+                }
+            }
+            for run in &run_events {
+                self.send_stream_event(request_id, thread_events::RUN, run);
+            }
+            if let Some(state) = state {
+                self.send_stream_event(request_id, thread_events::STATE, state);
+            }
+        }
     }
 
     fn handle_conversation_changed(&mut self, thread_id: &str, cx: &mut Context<Self>) {
@@ -530,8 +780,11 @@ impl MobileBridge {
         let old_entry_count = subscription.entry_count;
         let conversation = subscription.conversation;
         let subscribers = subscription.subscribers;
+        let streams = subscription.streams;
         match self.watch_thread(thread_id, conversation.clone(), subscribers.clone(), cx) {
             Ok(mut new_subscription) => {
+                new_subscription.streams_need_snapshot = !streams.is_empty();
+                new_subscription.streams = streams;
                 let entries = agent_mobile::thread_entries(&conversation, cx);
                 for client_id in &subscribers {
                     self.send_event(
@@ -562,11 +815,24 @@ impl MobileBridge {
                     .insert(thread_id.to_string(), new_subscription);
                 self.schedule_thread_flush(thread_id, cx);
             }
-            Err(error) => log::error!("failed to re-attach to mobile thread: {error:#}"),
+            Err(error) => {
+                log::error!("failed to re-attach to the thread: {error:#}");
+                for request_id in streams.into_keys() {
+                    self.end_stream_with_error(
+                        request_id,
+                        &format!("Lost track of the thread: {error:#}"),
+                    );
+                }
+            }
         }
     }
 
-    fn handle_thread_event(&mut self, thread_id: &str, event: &AcpThreadEvent, cx: &mut Context<Self>) {
+    fn handle_thread_event(
+        &mut self,
+        thread_id: &str,
+        event: &AcpThreadEvent,
+        cx: &mut Context<Self>,
+    ) {
         let Some(subscription) = self.threads.threads.get_mut(thread_id) else {
             return;
         };
@@ -601,6 +867,10 @@ impl MobileBridge {
                     end: range.end,
                 };
                 let subscribers = subscription.subscribers.clone();
+                if !subscription.streams.is_empty() {
+                    subscription.streams_need_snapshot = true;
+                    self.schedule_thread_flush(thread_id, cx);
+                }
                 for client_id in subscribers {
                     self.send_event(client_id, events::THREAD_ENTRIES_REMOVED, &event);
                 }
@@ -612,9 +882,9 @@ impl MobileBridge {
                 // The tool call's permission buttons live in its entry.
                 if let Some(thread) = subscription.conversation.thread(cx) {
                     let entry_count = thread.read(cx).entries().len();
-                    subscription.dirty_entries.extend(
-                        (0..entry_count).rev().take(8),
-                    );
+                    subscription
+                        .dirty_entries
+                        .extend((0..entry_count).rev().take(8));
                 }
             }
             _ => {
@@ -624,7 +894,7 @@ impl MobileBridge {
         self.schedule_thread_flush(thread_id, cx);
     }
 
-    fn mark_thread_state_dirty(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn mark_thread_state_dirty(&mut self, thread_id: &str, cx: &mut Context<Self>) {
         if let Some(subscription) = self.threads.threads.get_mut(thread_id) {
             subscription.state_dirty = true;
             self.schedule_thread_flush(thread_id, cx);
@@ -657,7 +927,10 @@ impl MobileBridge {
         let subscribers = subscription.subscribers.clone();
 
         let mut entry_events = Vec::new();
-        for index in dirty_entries {
+        for index in dirty_entries.iter().copied() {
+            if subscribers.is_empty() {
+                break;
+            }
             if let Some(entry) = agent_mobile::thread_entry(&conversation, index, cx) {
                 entry_events.push(ThreadEntryEvent {
                     thread_id: thread_id.to_string(),
@@ -678,7 +951,8 @@ impl MobileBridge {
             return;
         };
         subscription.entry_count = entry_count;
-        let state_to_send = new_state.filter(|state| subscription.last_state.as_ref() != Some(state));
+        let state_to_send =
+            new_state.filter(|state| subscription.last_state.as_ref() != Some(state));
         if let Some(state) = &state_to_send {
             subscription.last_state = Some(state.clone());
         }
@@ -690,9 +964,10 @@ impl MobileBridge {
                 self.send_event(*client_id, events::THREAD_STATE, state);
             }
         }
+        self.flush_thread_streams(thread_id, &dirty_entries, state_to_send.as_ref(), cx);
     }
 
-    fn conversation_for(&self, thread_id: &str, cx: &App) -> Result<MobileConversation> {
+    pub(crate) fn conversation_for(&self, thread_id: &str, cx: &App) -> Result<MobileConversation> {
         if let Some(subscription) = self.threads.threads.get(thread_id) {
             return Ok(subscription.conversation.clone());
         }
@@ -730,9 +1005,11 @@ impl MobileBridge {
         option_id: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<serde_json::Value>> {
-        let result = self.conversation_for(thread_id, cx).and_then(|conversation| {
-            agent_mobile::authorize_tool_call(&conversation, &tool_call_id, &option_id, cx)
-        });
+        let result = self
+            .conversation_for(thread_id, cx)
+            .and_then(|conversation| {
+                agent_mobile::authorize_tool_call(&conversation, &tool_call_id, &option_id, cx)
+            });
         Task::ready(result.map(|()| serde_json::Value::Null))
     }
 
@@ -762,10 +1039,40 @@ impl MobileBridge {
         index: usize,
         cx: &mut Context<Self>,
     ) -> Task<Result<serde_json::Value>> {
-        let result = self.conversation_for(thread_id, cx).and_then(|conversation| {
-            agent_mobile::remove_queued_message(&conversation, index, cx)
-        });
+        let result = self
+            .conversation_for(thread_id, cx)
+            .and_then(|conversation| agent_mobile::remove_queued_message(&conversation, index, cx));
         Task::ready(result.map(|()| serde_json::Value::Null))
+    }
+}
+
+pub(crate) fn thread_details(
+    conversation: &MobileConversation,
+    thread_id: &str,
+    include_items: bool,
+    cx: &App,
+) -> Option<rest::ThreadDetails> {
+    Some(rest::ThreadDetails {
+        state: agent_mobile::thread_state(conversation, thread_id, cx)?,
+        workspace_paths: workspace_paths(&conversation.workspace, cx),
+        runs: agent_mobile::thread_runs(conversation, include_items, cx),
+    })
+}
+
+pub(crate) fn workspace_paths(workspace: &Entity<Workspace>, cx: &App) -> Vec<String> {
+    workspace
+        .read(cx)
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+        .collect()
+}
+
+fn without_items(run: &rest::Run) -> rest::Run {
+    rest::Run {
+        items: None,
+        ..run.clone()
     }
 }
 
@@ -776,7 +1083,10 @@ fn push_worktree_option(
     is_main: bool,
 ) {
     let path_string = path.to_string_lossy().into_owned();
-    if worktrees.iter().any(|worktree| worktree.path == path_string) {
+    if worktrees
+        .iter()
+        .any(|worktree| worktree.path == path_string)
+    {
         return;
     }
     let name = path
@@ -807,10 +1117,14 @@ fn project_id(key: &ProjectGroupKey) -> String {
     format!("{host}|{paths}")
 }
 
-fn find_project_group(
+pub(crate) fn find_project_group(
     project_id_to_find: &str,
     cx: &App,
-) -> Option<(WindowHandle<MultiWorkspace>, ProjectGroupKey, Vec<Entity<Workspace>>)> {
+) -> Option<(
+    WindowHandle<MultiWorkspace>,
+    ProjectGroupKey,
+    Vec<Entity<Workspace>>,
+)> {
     multi_workspace_windows(cx).into_iter().find_map(|window| {
         let multi_workspace = window.read(cx).ok()?;
         sidebar::mobile::project_groups(multi_workspace, cx)
@@ -820,7 +1134,10 @@ fn find_project_group(
     })
 }
 
-async fn wait_for_agent_panel(workspace: &Entity<Workspace>, cx: &mut gpui::AsyncApp) -> Result<()> {
+pub(crate) async fn wait_for_agent_panel(
+    workspace: &Entity<Workspace>,
+    cx: &mut gpui::AsyncApp,
+) -> Result<()> {
     let deadline = cx.background_executor().now() + THREAD_LOAD_TIMEOUT;
     loop {
         let has_panel = cx.update(|cx| workspace.read(cx).panel::<AgentPanel>(cx).is_some());
@@ -836,7 +1153,7 @@ async fn wait_for_agent_panel(workspace: &Entity<Workspace>, cx: &mut gpui::Asyn
     }
 }
 
-fn build_threads_list(cx: &App) -> ThreadsList {
+pub(crate) fn build_threads_list(cx: &App) -> ThreadsList {
     let projects = threads_snapshot(cx)
         .into_iter()
         .map(|project| ProjectThreads {

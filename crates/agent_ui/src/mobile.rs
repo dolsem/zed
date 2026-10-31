@@ -3,16 +3,19 @@
 //! go through the same `ThreadView` code paths as Zed's own UI, so the desktop
 //! stays in sync.
 
+use std::collections::BTreeMap;
+use std::ops::Range;
+
 use acp_thread::{
-    AcpThread, AgentModelList, AgentThreadEntry, AssistantMessageChunk, PermissionOptions,
-    ThreadStatus, ToolCallContent, ToolCallStatus,
+    AcpThread, AgentModelList, AgentThreadEntry, AssistantMessageChunk, ElicitationEntryId,
+    ElicitationStatus, PermissionOptions, ThreadStatus, ToolCall, ToolCallContent, ToolCallStatus,
 };
 use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
 use agent_settings::{AgentProfile, AgentProfileId};
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{AnyWindowHandle, App, Entity, Task};
 use language_model::Speed;
-use mobile_protocol::api;
+use mobile_protocol::{api, rest};
 use workspace::{MultiWorkspace, Workspace};
 
 use crate::agent_panel::CreateThreadOptions;
@@ -232,17 +235,7 @@ fn convert_entry(entry: &AgentThreadEntry, cx: &App) -> api::ThreadEntry {
                 id: tool_call.id.0.to_string(),
                 title: tool_call.label.read(cx).source().to_string(),
                 tool_kind: tool_kind_name(tool_call.kind()).to_string(),
-                status: match tool_call.status() {
-                    ToolCallStatus::Pending => api::ToolCallStatus::Pending,
-                    ToolCallStatus::WaitingForConfirmation => {
-                        api::ToolCallStatus::WaitingForConfirmation
-                    }
-                    ToolCallStatus::InProgress => api::ToolCallStatus::InProgress,
-                    ToolCallStatus::Completed => api::ToolCallStatus::Completed,
-                    ToolCallStatus::Failed => api::ToolCallStatus::Failed,
-                    ToolCallStatus::Rejected => api::ToolCallStatus::Rejected,
-                    ToolCallStatus::Canceled => api::ToolCallStatus::Canceled,
-                },
+                status: tool_call_status(tool_call.status()),
                 content: tool_call
                     .content()
                     .iter()
@@ -433,7 +426,9 @@ pub fn send_message(conversation: &MobileConversation, text: String, cx: &mut Ap
         .thread_view(cx)
         .context("the thread is still loading")?;
     conversation.window.update(cx, |_, window, cx| {
-        thread_view.update(cx, |thread_view, cx| thread_view.send_text(text, window, cx));
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.send_text(text, window, cx)
+        });
     })
 }
 
@@ -490,7 +485,10 @@ fn thread_controls(thread_view: &ThreadView, cx: &App) -> Vec<api::ThreadControl
                     value: model.id.to_string(),
                     label: model.name.to_string(),
                     group,
-                    description: model.description.as_ref().map(|description| description.to_string()),
+                    description: model
+                        .description
+                        .as_ref()
+                        .map(|description| description.to_string()),
                 });
             }
         };
@@ -513,9 +511,7 @@ fn thread_controls(thread_view: &ThreadView, cx: &App) -> Vec<api::ThreadControl
             id: MODEL_CONTROL.to_string(),
             label: "Model".to_string(),
             kind: api::ThreadControlKind::Select {
-                value: delegate
-                    .active_model()
-                    .map(|model| model.id.to_string()),
+                value: delegate.active_model().map(|model| model.id.to_string()),
                 options,
             },
         });
@@ -788,4 +784,477 @@ pub fn observe_thread_view(
 ) -> Option<gpui::Subscription> {
     let thread_view = conversation.thread_view(cx)?;
     Some(cx.observe(&thread_view, move |_, cx| on_change(cx)))
+}
+
+fn tool_call_status(status: ToolCallStatus) -> api::ToolCallStatus {
+    match status {
+        ToolCallStatus::Pending => api::ToolCallStatus::Pending,
+        ToolCallStatus::WaitingForConfirmation => api::ToolCallStatus::WaitingForConfirmation,
+        ToolCallStatus::InProgress => api::ToolCallStatus::InProgress,
+        ToolCallStatus::Completed => api::ToolCallStatus::Completed,
+        ToolCallStatus::Failed => api::ToolCallStatus::Failed,
+        ToolCallStatus::Rejected => api::ToolCallStatus::Rejected,
+        ToolCallStatus::Canceled => api::ToolCallStatus::Canceled,
+    }
+}
+
+/// Why the conversation has no thread to work with, if that's the case:
+/// the agent failed to start, or it waits for the user to sign in.
+pub fn conversation_error(conversation: &MobileConversation, cx: &App) -> Option<String> {
+    let conversation_view = conversation.conversation.read(cx);
+    conversation_view
+        .load_error_message()
+        .map(|message| format!("The agent failed to start: {message}"))
+        .or_else(|| {
+            conversation_view
+                .authentication_required_message(cx)
+                .map(|message| format!("{message} Sign in from Zed's agent panel."))
+        })
+}
+
+/// The entries of one run: a user message and everything up to the next one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRange {
+    pub run_id: String,
+    pub entries: Range<usize>,
+}
+
+pub fn run_ranges(conversation: &MobileConversation, cx: &App) -> Vec<RunRange> {
+    match conversation.thread(cx) {
+        Some(thread) => thread_run_ranges(thread.read(cx)),
+        None => Vec::new(),
+    }
+}
+
+fn thread_run_ranges(thread: &AcpThread) -> Vec<RunRange> {
+    let entries = thread.entries();
+    // Subagents get their own (indented) user messages, which belong to the
+    // run that started them.
+    let mut starts = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| {
+            matches!(entry, AgentThreadEntry::UserMessage(message) if !message.indented)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let has_preamble = starts.first().is_none_or(|first| *first > 0) && !entries.is_empty();
+    if has_preamble {
+        starts.insert(0, 0);
+    }
+    let first_number = if has_preamble { 0 } else { 1 };
+    starts
+        .iter()
+        .enumerate()
+        .map(|(position, start)| RunRange {
+            run_id: (first_number + position).to_string(),
+            entries: *start..starts.get(position + 1).copied().unwrap_or(entries.len()),
+        })
+        .collect()
+}
+
+pub fn thread_runs(
+    conversation: &MobileConversation,
+    include_items: bool,
+    cx: &App,
+) -> Vec<rest::Run> {
+    let ranges = run_ranges(conversation, cx);
+    let last_index = ranges.len().saturating_sub(1);
+    ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, range)| {
+            build_run(conversation, range, index == last_index, include_items, cx)
+        })
+        .collect()
+}
+
+pub fn thread_run(
+    conversation: &MobileConversation,
+    run_id: &str,
+    include_items: bool,
+    cx: &App,
+) -> Option<rest::Run> {
+    let ranges = run_ranges(conversation, cx);
+    let index = ranges.iter().position(|range| range.run_id == run_id)?;
+    build_run(
+        conversation,
+        &ranges[index],
+        index + 1 == ranges.len(),
+        include_items,
+        cx,
+    )
+}
+
+pub fn build_run(
+    conversation: &MobileConversation,
+    range: &RunRange,
+    is_last: bool,
+    include_items: bool,
+    cx: &App,
+) -> Option<rest::Run> {
+    let thread_view = conversation.thread_view(cx)?;
+    let thread_view = thread_view.read(cx);
+    let thread = thread_view.thread.read(cx);
+    let entries = thread.entries().get(range.entries.clone())?;
+
+    let mut user_message = String::new();
+    let mut final_message = None;
+    let mut pending = Vec::new();
+    let mut message_count = 0;
+    let mut tool_call_count = 0;
+    let mut has_canceled_tool_call = false;
+    for (offset, entry) in entries.iter().enumerate() {
+        match entry {
+            AgentThreadEntry::UserMessage(message) => {
+                if offset == 0 {
+                    user_message = message.content.to_markdown(cx);
+                }
+            }
+            AgentThreadEntry::AssistantMessage(message) => {
+                message_count += 1;
+                if !message.indented && !message.is_subagent_output {
+                    let markdown = assistant_markdown(&message.chunks, false, cx);
+                    if !markdown.trim().is_empty() {
+                        final_message = Some(markdown);
+                    }
+                }
+            }
+            AgentThreadEntry::ToolCall(tool_call) => {
+                tool_call_count += 1;
+                has_canceled_tool_call |= tool_call.status() == ToolCallStatus::Canceled;
+                if let Some(authorization) = tool_call.authorization() {
+                    pending.push(rest::PendingRequest::Permission {
+                        tool_call: run_tool_call(tool_call, cx),
+                        options: permission_options(&authorization.options),
+                    });
+                }
+            }
+            AgentThreadEntry::Elicitation(id) => {
+                if let Some(question) = question(thread, id)
+                    && question.status == rest::QuestionStatus::Pending
+                {
+                    pending.push(rest::PendingRequest::Question(question));
+                }
+            }
+            AgentThreadEntry::ContextCompaction(_) => {}
+        }
+    }
+
+    let is_generating = is_last && thread.status() == ThreadStatus::Generating;
+    let error = is_last.then(|| thread_view.error_message(cx)).flatten();
+    let status = if pending
+        .iter()
+        .any(|request| matches!(request, rest::PendingRequest::Permission { .. }))
+    {
+        rest::RunStatus::WaitingForPermission
+    } else if !pending.is_empty() {
+        rest::RunStatus::WaitingForAnswer
+    } else if is_generating {
+        rest::RunStatus::Running
+    } else if error.is_some() {
+        rest::RunStatus::Failed
+    } else if has_canceled_tool_call {
+        rest::RunStatus::Cancelled
+    } else {
+        rest::RunStatus::Completed
+    };
+
+    let items = include_items.then(|| {
+        entries
+            .iter()
+            .map(|entry| run_item(thread, entry, cx))
+            .collect()
+    });
+    Some(rest::Run {
+        run_id: range.run_id.clone(),
+        status,
+        user_message,
+        final_message: final_message.filter(|_| status.is_finished()),
+        pending,
+        error,
+        message_count,
+        tool_call_count,
+        items,
+    })
+}
+
+/// The item for the thread entry at `index`.
+pub fn thread_run_item(
+    conversation: &MobileConversation,
+    index: usize,
+    cx: &App,
+) -> Option<rest::RunItem> {
+    let thread = conversation.thread(cx)?;
+    let thread = thread.read(cx);
+    let entry = thread.entries().get(index)?;
+    Some(run_item(thread, entry, cx))
+}
+
+fn run_item(thread: &AcpThread, entry: &AgentThreadEntry, cx: &App) -> rest::RunItem {
+    match entry {
+        AgentThreadEntry::UserMessage(message) => rest::RunItem::UserMessage {
+            text: message.content.to_markdown(cx),
+        },
+        AgentThreadEntry::AssistantMessage(message) => {
+            let thinking = assistant_markdown(&message.chunks, true, cx);
+            rest::RunItem::AssistantMessage {
+                markdown: assistant_markdown(&message.chunks, false, cx),
+                thinking: (!thinking.trim().is_empty()).then_some(thinking),
+                is_subagent: message.indented || message.is_subagent_output,
+            }
+        }
+        AgentThreadEntry::ToolCall(tool_call) => {
+            rest::RunItem::ToolCall(run_tool_call(tool_call, cx))
+        }
+        AgentThreadEntry::Elicitation(id) => match question(thread, id) {
+            Some(question) => rest::RunItem::Question(question),
+            None => rest::RunItem::AssistantMessage {
+                markdown: "The agent asked for input.".to_string(),
+                thinking: None,
+                is_subagent: false,
+            },
+        },
+        AgentThreadEntry::ContextCompaction(compaction) => {
+            let summary = compaction
+                .summary
+                .iter()
+                .map(|block| block.to_markdown(cx).to_string())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            rest::RunItem::Compaction {
+                summary: (!summary.is_empty()).then_some(summary),
+            }
+        }
+    }
+}
+
+fn assistant_markdown(chunks: &[AssistantMessageChunk], thoughts: bool, cx: &App) -> String {
+    chunks
+        .iter()
+        .filter_map(|chunk| match chunk {
+            AssistantMessageChunk::Message { block, .. } if !thoughts => {
+                Some(block.to_markdown(cx))
+            }
+            AssistantMessageChunk::Thought { block, .. } if thoughts => Some(block.to_markdown(cx)),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Command output is left out; see [`command_output`].
+fn run_tool_call(tool_call: &ToolCall, cx: &App) -> rest::RunToolCall {
+    let output = tool_call_output(tool_call, cx);
+    let is_execute = matches!(tool_call.kind(), acp_v2::ToolKind::Execute);
+    let content = tool_call
+        .content()
+        .iter()
+        .filter_map(|content| match content {
+            ToolCallContent::Diff(diff) | ToolCallContent::LegacyDiff { diff, .. } => {
+                let diff = diff.read(cx);
+                let base_text = diff.base_text().to_string();
+                Some(rest::RunToolCallContent::Diff {
+                    path: diff.file_path(cx).unwrap_or_default(),
+                    old_text: (!base_text.is_empty()).then_some(base_text),
+                    new_text: diff.buffer().read(cx).text(),
+                })
+            }
+            ToolCallContent::Terminal { .. } => None,
+            _ if is_execute => None,
+            _ => Some(rest::RunToolCallContent::Markdown {
+                markdown: content.to_markdown(cx),
+            }),
+        })
+        .collect();
+    rest::RunToolCall {
+        tool_call_id: tool_call.id.0.to_string(),
+        title: tool_call.label.read(cx).source().to_string(),
+        tool_kind: tool_kind_name(tool_call.kind()).to_string(),
+        status: tool_call_status(tool_call.status()),
+        command: output.command,
+        exit_code: output.exit_code,
+        output_bytes: output.output.len(),
+        content,
+        raw_input: tool_call.raw_input.clone(),
+    }
+}
+
+struct ToolCallOutput {
+    command: Option<String>,
+    exit_code: Option<i32>,
+    output: String,
+}
+
+/// What a tool call printed: its terminals' output, and for tools that run
+/// commands without a terminal, the text they reported.
+fn tool_call_output(tool_call: &ToolCall, cx: &App) -> ToolCallOutput {
+    let is_execute = matches!(tool_call.kind(), acp_v2::ToolKind::Execute);
+    let mut command = None;
+    let mut exit_code = None;
+    let mut outputs = Vec::new();
+    for content in tool_call.content() {
+        match content {
+            ToolCallContent::Terminal { terminal, .. } => {
+                let terminal = terminal.read(cx);
+                let terminal_command = terminal.command().read(cx).source().to_string();
+                if command.is_none() && !terminal_command.trim().is_empty() {
+                    command = Some(strip_code_fence(&terminal_command));
+                }
+                exit_code = exit_code.or_else(|| {
+                    terminal
+                        .output()
+                        .and_then(|output| output.exit_status.exit_code)
+                        .map(|code| code as i32)
+                });
+                outputs.push(match terminal.output() {
+                    Some(output) => output.content.clone(),
+                    None => terminal.inner().read(cx).get_content(),
+                });
+            }
+            ToolCallContent::Diff(_) | ToolCallContent::LegacyDiff { .. } => {}
+            _ if is_execute => outputs.push(content.to_markdown(cx).to_string()),
+            _ => {}
+        }
+    }
+    if is_execute && command.is_none() {
+        command = tool_call
+            .raw_input
+            .as_ref()
+            .and_then(|input| input.get("command"))
+            .and_then(|command| command.as_str())
+            .map(str::to_string)
+            .or_else(|| Some(strip_code_fence(tool_call.label.read(cx).source())));
+    }
+    ToolCallOutput {
+        command,
+        exit_code,
+        output: outputs.join("\n"),
+    }
+}
+
+pub fn command_output(
+    conversation: &MobileConversation,
+    tool_call_id: &str,
+    cx: &App,
+) -> Result<rest::CommandOutput> {
+    let thread = conversation
+        .thread(cx)
+        .context("the thread is still loading")?;
+    let thread = thread.read(cx);
+    let (_, tool_call) = thread
+        .tool_call(&acp_v1::ToolCallId::new(tool_call_id.to_string()))
+        .context("no such tool call")?;
+    let output = tool_call_output(tool_call, cx);
+    Ok(rest::CommandOutput {
+        tool_call_id: tool_call_id.to_string(),
+        command: output.command,
+        status: tool_call_status(tool_call.status()),
+        exit_code: output.exit_code,
+        output: output.output,
+    })
+}
+
+fn question(thread: &AcpThread, id: &ElicitationEntryId) -> Option<rest::Question> {
+    let (_, elicitation) = thread.elicitation(id)?;
+    let mode = match &elicitation.request.mode {
+        acp_v1::ElicitationMode::Form(form) => rest::QuestionMode::Form {
+            schema: serde_json::to_value(&form.requested_schema).unwrap_or_default(),
+        },
+        acp_v1::ElicitationMode::Url(url) => rest::QuestionMode::Url {
+            url: url.url.clone(),
+        },
+        _ => return None,
+    };
+    Some(rest::Question {
+        question_id: id.0.to_string(),
+        message: elicitation.request.message.clone(),
+        status: match elicitation.status {
+            ElicitationStatus::Pending { .. } => rest::QuestionStatus::Pending,
+            ElicitationStatus::Accepted => rest::QuestionStatus::Accepted,
+            ElicitationStatus::Declined => rest::QuestionStatus::Declined,
+            ElicitationStatus::Canceled => rest::QuestionStatus::Cancelled,
+            ElicitationStatus::Completed => rest::QuestionStatus::Completed,
+        },
+        mode,
+    })
+}
+
+pub fn answer_question(
+    conversation: &MobileConversation,
+    question_id: &str,
+    answer: rest::QuestionResponse,
+    cx: &mut App,
+) -> Result<()> {
+    let thread = conversation
+        .thread(cx)
+        .context("the thread is still loading")?;
+    let id = ElicitationEntryId(question_id.into());
+    let (_, elicitation) = thread
+        .read(cx)
+        .elicitation(&id)
+        .context("no such question")?;
+    if !matches!(elicitation.status, ElicitationStatus::Pending { .. }) {
+        return Err(anyhow!("the question was already answered"));
+    }
+    let action = match answer.action {
+        rest::QuestionAction::Accept => {
+            let mut accept = acp_v1::ElicitationAcceptAction::new();
+            if !answer.content.is_empty() {
+                let content = answer
+                    .content
+                    .into_iter()
+                    .map(|(key, value)| {
+                        serde_json::from_value::<acp_v1::ElicitationContentValue>(value)
+                            .map(|value| (key.clone(), value))
+                            .with_context(|| {
+                                format!(
+                                    "{key:?} must be a string, number, boolean or list of strings"
+                                )
+                            })
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                accept = accept.content(content);
+            }
+            acp_v1::ElicitationAction::Accept(accept)
+        }
+        rest::QuestionAction::Decline => acp_v1::ElicitationAction::Decline,
+        rest::QuestionAction::Cancel => acp_v1::ElicitationAction::Cancel,
+    };
+    thread.update(cx, |thread, cx| {
+        thread.respond_to_elicitation(&id, acp_v1::CreateElicitationResponse::new(action), cx)
+    });
+    Ok(())
+}
+
+/// Resolves a permission answer that names the kind of option rather than its
+/// id, then answers it like [`authorize_tool_call`].
+pub fn respond_to_permission(
+    conversation: &MobileConversation,
+    tool_call_id: &str,
+    response: rest::PermissionResponse,
+    cx: &mut App,
+) -> Result<()> {
+    let option_id = match (response.option_id, response.kind) {
+        (Some(option_id), _) => option_id,
+        (None, Some(kind)) => {
+            let thread = conversation
+                .thread(cx)
+                .context("the thread is still loading")?;
+            let thread = thread.read(cx);
+            let (_, tool_call) = thread
+                .tool_call(&acp_v1::ToolCallId::new(tool_call_id.to_string()))
+                .context("the tool call no longer exists")?;
+            let authorization = tool_call
+                .authorization()
+                .context("the tool call isn't waiting for permission")?;
+            permission_options(&authorization.options)
+                .into_iter()
+                .find(|option| option.kind == kind)
+                .with_context(|| format!("the tool call has no {kind:?} option"))?
+                .id
+        }
+        (None, None) => return Err(anyhow!("either option_id or kind is required")),
+    };
+    authorize_tool_call(conversation, tool_call_id, &option_id, cx)
 }

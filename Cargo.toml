@@ -106,6 +106,7 @@ members = [
     "crates/grammars",
     "crates/hang_telemetry",
     "crates/html_to_markdown",
+    "crates/http_api",
     "crates/http_client",
     "crates/http_client_tls",
     "crates/http_proxy",
@@ -146,7 +147,6 @@ members = [
     "crates/mistral",
     "crates/mobile_bridge",
     "crates/mobile_protocol",
-    "crates/mobile_server",
     "crates/multi_buffer",
     "crates/net",
     "crates/node_runtime",
@@ -236,6 +236,7 @@ members = [
     "crates/watch",
     "crates/web_search",
     "crates/web_search_providers",
+    "crates/web_ui",
     "crates/which_key",
     "crates/windows_resources",
     "crates/workspace",
@@ -507,6 +508,7 @@ vim_mode_setting = { path = "crates/vim_mode_setting" }
 watch = { path = "crates/watch" }
 web_search = { path = "crates/web_search" }
 web_search_providers = { path = "crates/web_search_providers" }
+web_ui = { path = "crates/web_ui" }
 which_key = { path = "crates/which_key" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }

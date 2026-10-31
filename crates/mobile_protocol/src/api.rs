@@ -197,11 +197,24 @@ pub enum Request {
 
     // Terminals
     /// Subscribes to `terminal.screen` events for a terminal item and returns
-    /// the current `TerminalScreen`.
+    /// the current `TerminalScreen`. The terminal's PTY is resized to
+    /// `columns` x `rows` (the phone's screen) for as long as a client has it
+    /// open; the desktop shows that size meanwhile.
     #[serde(rename = "terminal.open")]
     OpenTerminal {
         workspace_id: WorkspaceId,
         item_id: ItemId,
+        columns: usize,
+        rows: usize,
+    },
+    /// Changes the size requested by `terminal.open`, e.g. when the keyboard
+    /// opens or the phone rotates.
+    #[serde(rename = "terminal.resize")]
+    ResizeTerminal {
+        workspace_id: WorkspaceId,
+        item_id: ItemId,
+        columns: usize,
+        rows: usize,
     },
     #[serde(rename = "terminal.close")]
     CloseTerminal {
@@ -216,7 +229,9 @@ pub enum Request {
         item_id: ItemId,
         data: String,
     },
-    /// Scrolls the terminal viewport; positive is up (into history).
+    /// Scrolls this client's view of the terminal; positive is up (into
+    /// history). The desktop's own scroll position is unaffected. The new
+    /// screen arrives as a `terminal.screen` event.
     #[serde(rename = "terminal.scroll")]
     TerminalScroll {
         workspace_id: WorkspaceId,
@@ -922,7 +937,7 @@ pub struct TerminalScreen {
     /// One entry per visible row, each a list of styled runs.
     pub lines: Vec<Vec<TerminalRun>>,
     pub cursor: Option<TerminalCursor>,
-    /// Lines scrolled back into history (0 = following output).
+    /// Lines this client is scrolled back into history (0 = following output).
     pub display_offset: usize,
     pub history_size: usize,
     /// Whether the app enabled bracketed paste / application cursor keys,

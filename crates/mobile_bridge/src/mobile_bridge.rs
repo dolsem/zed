@@ -1,11 +1,13 @@
-//! Lets the mobile web app control Zed. Zed spawns the `mobile_server`
-//! executable (which serves the PWA, authenticates devices and sends push
-//! notifications) and answers the API requests it relays from the PWA. See
-//! `api.rs` for the API and the `mobile_protocol` crate for the stdio
-//! envelope.
+//! Serves Zed's HTTP API and the web UI. Zed spawns the `http_api`
+//! executable (which authenticates clients, serves the web UI and sends push
+//! notifications) and answers the requests it relays: the HTTP API's REST
+//! endpoints (see `rest.rs`) and the web UI's WebSocket API (see `api.rs`).
+//! The `mobile_protocol` crate defines both and the stdio envelope.
 
 mod api;
 mod buffers;
+mod operations;
+mod rest;
 mod status_bar;
 mod terminals;
 mod threads;
@@ -17,8 +19,8 @@ use futures::{
     AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _, io::BufReader,
 };
 use gpui::{
-    App, AppContext as _, Context, Entity, EntityId, Global, Hsla, Task, WeakEntity,
-    WindowHandle, actions,
+    App, AppContext as _, Context, Entity, EntityId, Global, Hsla, Task, WeakEntity, WindowHandle,
+    actions,
 };
 use mobile_protocol::{ClientId, HostMessage, ServerMessage};
 use rand::Rng as _;
@@ -27,7 +29,9 @@ use settings::{RegisterSetting, Settings, SettingsStore};
 use std::path::PathBuf;
 use theme::ActiveTheme as _;
 use util::ResultExt as _;
-use workspace::{MultiWorkspace, Toast, Workspace, notifications::NotificationId};
+use workspace::notifications::simple_message_notification::MessageNotification;
+use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
+use workspace::{MultiWorkspace, Toast, Workspace};
 
 pub use status_bar::MobileNotificationsIndicator;
 
@@ -37,12 +41,10 @@ use crate::api::{
 };
 
 actions!(
-    mobile_server,
+    web_ui,
     [
-        /// Shows a code for pairing a phone with the mobile web app.
+        /// Shows a code for pairing a phone with the web UI.
         PairDevice,
-        /// Revokes access for every paired phone.
-        UnpairAllDevices,
     ]
 );
 
@@ -50,25 +52,95 @@ const PAIRING_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const PAIRING_CODE_TTL_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, RegisterSetting)]
-pub struct MobileServerSettings {
+pub struct HttpApiSettings {
     pub enabled: bool,
     pub address: String,
     pub port: u16,
+    pub secret: Option<String>,
+}
+
+impl Settings for HttpApiSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let http_api = content.http_api.clone().unwrap_or_default();
+        Self {
+            enabled: http_api.enabled.unwrap_or(false),
+            address: http_api.address.unwrap_or_else(|| "127.0.0.1".to_string()),
+            port: http_api.port.unwrap_or(7878),
+            secret: http_api.secret.filter(|secret| !secret.trim().is_empty()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, RegisterSetting)]
+pub struct WebUiSettings {
+    pub enabled: bool,
     pub always_notify: bool,
 }
 
-impl Settings for MobileServerSettings {
+impl Settings for WebUiSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
-        let mobile_server = content.mobile_server.clone().unwrap_or_default();
+        let web_ui = content.web_ui.clone().unwrap_or_default();
         Self {
-            enabled: mobile_server.enabled.unwrap_or(false),
-            address: mobile_server
-                .address
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
-            port: mobile_server.port.unwrap_or(7878),
-            always_notify: mobile_server.always_notify.unwrap_or(false),
+            enabled: web_ui.enabled.unwrap_or(false),
+            always_notify: web_ui.always_notify.unwrap_or(false),
         }
     }
+}
+
+/// What the `http_api` process is started with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerConfig {
+    address: String,
+    port: u16,
+    secret: String,
+    web_ui: bool,
+}
+
+/// The server to run according to the settings, or why they're invalid.
+fn server_config(
+    http_api: &HttpApiSettings,
+    web_ui: &WebUiSettings,
+) -> Result<Option<ServerConfig>> {
+    let mut problems = Vec::new();
+    if web_ui.enabled && !http_api.enabled {
+        problems.push(
+            "The web UI is enabled, but it's served by the HTTP API, which isn't. \
+             Set `http_api.enabled` to true.",
+        );
+    }
+    if http_api.enabled && http_api.secret.is_none() {
+        problems.push(
+            "The HTTP API is enabled, but `http_api.secret` isn't set. \
+             Set it to a long random string, which clients will authenticate with.",
+        );
+    }
+    if !problems.is_empty() {
+        return Err(anyhow!(problems.join(" ")));
+    }
+    Ok(http_api.enabled.then(|| ServerConfig {
+        address: http_api.address.clone(),
+        port: http_api.port,
+        secret: http_api.secret.clone().unwrap_or_default(),
+        web_ui: web_ui.enabled,
+    }))
+}
+
+struct HttpApiNotification;
+
+fn show_server_error(message: String, cx: &mut App) {
+    log::error!("{message}");
+    show_app_notification(
+        NotificationId::unique::<HttpApiNotification>(),
+        cx,
+        move |cx| {
+            let message = message.clone();
+            cx.new(|cx| MessageNotification::new(message, cx).with_title("HTTP API"))
+        },
+    );
+}
+
+fn dismiss_server_error(cx: &mut App) {
+    dismiss_app_notification(&NotificationId::unique::<HttpApiNotification>(), cx);
 }
 
 struct GlobalMobileBridge(Entity<MobileBridge>);
@@ -82,9 +154,6 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         workspace.register_action(|workspace, _: &PairDevice, _window, cx| {
             MobileBridge::start_pairing(workspace, cx);
-        });
-        workspace.register_action(|workspace, _: &UnpairAllDevices, _window, cx| {
-            MobileBridge::unpair_all_devices(workspace, cx);
         });
         if let Some(window) = window {
             cx.observe_window_activation(window, |_, window, cx| {
@@ -101,7 +170,8 @@ pub fn init(cx: &mut App) {
 }
 
 pub struct MobileBridge {
-    running_settings: Option<MobileServerSettings>,
+    /// What the settings ask for: a server, none, or an error.
+    configured: Option<Result<Option<ServerConfig>, String>>,
     server: Option<RunningServer>,
     clients: HashMap<ClientId, Client>,
     /// The workspace that requested pairing, so the outcome can be shown there.
@@ -114,6 +184,8 @@ pub struct MobileBridge {
     pub(crate) buffers: buffers::BuffersState,
     pub(crate) terminals: terminals::TerminalsState,
     pub(crate) workspace_items: workspace_items::WorkspaceItemsState,
+    pub(crate) rest: rest::RestState,
+    pub(crate) operations: operations::OperationsState,
     _settings_subscription: gpui::Subscription,
     _theme_subscription: gpui::Subscription,
 }
@@ -125,7 +197,7 @@ struct RunningServer {
 }
 
 pub(crate) struct Client {
-    pub device_name: String,
+    pub device_name: Option<String>,
 }
 
 impl MobileBridge {
@@ -139,7 +211,7 @@ impl MobileBridge {
             }
         });
         let mut this = Self {
-            running_settings: None,
+            configured: None,
             server: None,
             clients: HashMap::default(),
             pairing_workspace: None,
@@ -148,6 +220,8 @@ impl MobileBridge {
             buffers: buffers::BuffersState::default(),
             terminals: terminals::TerminalsState::default(),
             workspace_items: workspace_items::WorkspaceItemsState::default(),
+            rest: rest::RestState::default(),
+            operations: operations::OperationsState::default(),
             _settings_subscription: settings_subscription,
             _theme_subscription: theme_subscription,
         };
@@ -162,40 +236,51 @@ impl MobileBridge {
     }
 
     fn sync_server_with_settings(&mut self, cx: &mut Context<Self>) {
-        let settings = MobileServerSettings::get_global(cx).clone();
-        let desired = settings.enabled.then_some(settings);
-        if desired == self.running_settings {
+        let configured = server_config(
+            HttpApiSettings::get_global(cx),
+            WebUiSettings::get_global(cx),
+        )
+        .map_err(|error| error.to_string());
+        if self.configured.as_ref() == Some(&configured) {
             return;
         }
         self.stop_server(cx);
-        self.running_settings = desired.clone();
-        if let Some(settings) = desired {
-            match self.start_server(&settings, cx) {
-                Ok(server) => self.server = Some(server),
-                Err(error) => {
-                    log::error!("failed to start the mobile server: {error:#}");
+        self.configured = Some(configured.clone());
+        match configured {
+            Ok(Some(config)) => {
+                dismiss_server_error(cx);
+                match self.start_server(&config, cx) {
+                    Ok(server) => self.server = Some(server),
+                    Err(error) => {
+                        show_server_error(format!("Failed to start the HTTP API: {error:#}"), cx)
+                    }
                 }
             }
+            Ok(None) => dismiss_server_error(cx),
+            Err(message) => show_server_error(message, cx),
         }
     }
 
     fn start_server(
         &mut self,
-        settings: &MobileServerSettings,
+        config: &ServerConfig,
         cx: &mut Context<Self>,
     ) -> Result<RunningServer> {
         let binary_path = server_binary_path()?;
-        let state_dir = paths::data_dir().join("mobile_server");
+        let state_dir = paths::data_dir().join("web_ui");
         std::fs::create_dir_all(&state_dir)
             .with_context(|| format!("creating {}", state_dir.display()))?;
 
         let mut child = util::command::new_command(&binary_path)
             .arg(mobile_protocol::ADDRESS_FLAG)
-            .arg(&settings.address)
+            .arg(&config.address)
             .arg(mobile_protocol::PORT_FLAG)
-            .arg(settings.port.to_string())
+            .arg(config.port.to_string())
             .arg(mobile_protocol::STATE_DIR_FLAG)
             .arg(&state_dir)
+            .arg(mobile_protocol::WEB_UI_FLAG)
+            .arg(config.web_ui.to_string())
+            .env(mobile_protocol::SECRET_ENV_VAR, &config.secret)
             .stdin(util::command::Stdio::piped())
             .stdout(util::command::Stdio::piped())
             .stderr(util::command::Stdio::piped())
@@ -203,10 +288,10 @@ impl MobileBridge {
             .spawn()
             .with_context(|| format!("spawning {}", binary_path.display()))?;
         log::info!(
-            "started the mobile server ({}) on {}:{}",
+            "started the HTTP API ({}) on {}:{}",
             binary_path.display(),
-            settings.address,
-            settings.port
+            config.address,
+            config.port
         );
 
         let mut stdin = child.stdin.take().context("missing stdin")?;
@@ -233,7 +318,7 @@ impl MobileBridge {
                             break;
                         }
                     }
-                    Err(error) => log::error!("invalid message from the mobile server: {error}"),
+                    Err(error) => log::error!("invalid message from the HTTP API server: {error}"),
                 }
             }
             anyhow::Ok(())
@@ -241,7 +326,7 @@ impl MobileBridge {
         let logger = cx.background_spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Some(Ok(line)) = lines.next().await {
-                log::info!("mobile_server: {line}");
+                log::info!("http_api: {line}");
             }
         });
 
@@ -261,11 +346,8 @@ impl MobileBridge {
                     return;
                 }
             }
-            match process.await {
-                Ok(status) => log::info!("the mobile server exited with {status}"),
-                Err(error) => log::error!("failed to wait for the mobile server: {error}"),
-            }
-            this.update(cx, |this, cx| this.handle_server_exited(cx))
+            let status = process.await;
+            this.update(cx, |this, cx| this.handle_server_exited(status, cx))
                 .log_err();
         });
 
@@ -283,9 +365,26 @@ impl MobileBridge {
         }
     }
 
-    fn handle_server_exited(&mut self, cx: &mut Context<Self>) {
-        self.server = None;
+    fn handle_server_exited(
+        &mut self,
+        status: std::io::Result<std::process::ExitStatus>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(server) = self.server.take() else {
+            return;
+        };
         self.disconnect_all_clients(cx);
+        match status {
+            Ok(status) if server.listening_address.is_some() => {
+                show_server_error(format!("The HTTP API server stopped ({status})."), cx);
+            }
+            // Failures to start were already reported by `ServerMessage::Failed`.
+            Ok(status) => log::error!("the HTTP API server exited with {status}"),
+            Err(error) => show_server_error(
+                format!("Failed to wait for the HTTP API server: {error}"),
+                cx,
+            ),
+        }
     }
 
     fn disconnect_all_clients(&mut self, cx: &mut Context<Self>) {
@@ -293,35 +392,49 @@ impl MobileBridge {
         for client_id in client_ids {
             self.handle_client_disconnected(client_id, cx);
         }
+        self.close_all_requests(cx);
     }
 
     fn send_to_server(&self, message: HostMessage) -> Result<()> {
         let server = self
             .server
             .as_ref()
-            .context("the mobile server isn't running")?;
+            .context("the HTTP API server isn't running")?;
         server
             .outgoing
             .unbounded_send(message)
-            .map_err(|_| anyhow!("the mobile server exited"))
+            .map_err(|_| anyhow!("the HTTP API server exited"))
     }
 
     fn handle_server_message(&mut self, message: ServerMessage, cx: &mut Context<Self>) {
         match message {
             ServerMessage::Listening { address } => {
-                log::info!("the mobile server is listening on {address}");
+                log::info!("the HTTP API is listening on {address}");
                 if let Some(server) = self.server.as_mut() {
                     server.listening_address = Some(address);
                 }
             }
             ServerMessage::Failed { message } => {
-                log::error!("the mobile server failed to start: {message}");
+                show_server_error(format!("The HTTP API failed to start: {message}"), cx);
+            }
+            ServerMessage::Request {
+                request_id,
+                method,
+                path,
+                query,
+                body,
+            } => self.handle_rest_request(request_id, &method, &path, query, body, cx),
+            ServerMessage::RequestClosed { request_id } => {
+                self.handle_rest_request_closed(request_id, cx);
             }
             ServerMessage::ClientConnected {
                 client_id,
                 device_name,
             } => {
-                log::info!("mobile client {client_id} connected from {device_name}");
+                log::info!(
+                    "web UI client {client_id} connected from {}",
+                    device_name.as_deref().unwrap_or("an unnamed device")
+                );
                 self.clients.insert(client_id, Client { device_name });
                 let hello = api::Hello {
                     client_id: client_id.to_string(),
@@ -348,13 +461,13 @@ impl MobileBridge {
     fn handle_client_disconnected(&mut self, client_id: ClientId, cx: &mut Context<Self>) {
         if let Some(client) = self.clients.remove(&client_id) {
             log::info!(
-                "mobile client {client_id} ({}) disconnected",
-                client.device_name
+                "web UI client {client_id} ({}) disconnected",
+                client.device_name.as_deref().unwrap_or("unnamed")
             );
         }
         self.threads.remove_client(client_id);
         self.buffers.remove_client(client_id, cx);
-        self.terminals.remove_client(client_id);
+        self.terminals.remove_client(client_id, cx);
         self.workspace_items.remove_client(client_id);
     }
 
@@ -368,7 +481,12 @@ impl MobileBridge {
         }
     }
 
-    fn handle_client_message(&mut self, client_id: ClientId, message: &str, cx: &mut Context<Self>) {
+    fn handle_client_message(
+        &mut self,
+        client_id: ClientId,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) {
         if !self.clients.contains_key(&client_id) {
             return;
         }
@@ -522,13 +640,21 @@ impl MobileBridge {
             Request::OpenTerminal {
                 workspace_id,
                 item_id,
-            } => self.open_terminal(client_id, workspace_id, item_id, cx),
+                columns,
+                rows,
+            } => self.open_terminal(client_id, workspace_id, item_id, columns, rows, cx),
+            Request::ResizeTerminal {
+                workspace_id,
+                item_id,
+                columns,
+                rows,
+            } => self.resize_terminal(client_id, workspace_id, item_id, columns, rows, cx),
             Request::CloseTerminal {
                 workspace_id,
                 item_id,
             } => {
                 self.terminals
-                    .unsubscribe(client_id, workspace_id, item_id);
+                    .unsubscribe(client_id, workspace_id, item_id, cx);
                 Task::ready(Ok(serde_json::Value::Null))
             }
             Request::TerminalInput {
@@ -540,11 +666,16 @@ impl MobileBridge {
                 workspace_id,
                 item_id,
                 lines,
-            } => self.terminal_scroll(workspace_id, item_id, lines, cx),
+            } => self.terminal_scroll(client_id, workspace_id, item_id, lines, cx),
         }
     }
 
-    fn send_response(&self, client_id: ClientId, request_id: u64, result: Result<serde_json::Value>) {
+    fn send_response(
+        &self,
+        client_id: ClientId,
+        request_id: u64,
+        result: Result<serde_json::Value>,
+    ) {
         let outcome = match result {
             Ok(value) => ResponseOutcome::Result(value),
             Err(error) => ResponseOutcome::Error(format!("{error:#}")),
@@ -610,6 +741,14 @@ impl MobileBridge {
         let code = generate_pairing_code();
         let workspace_handle = cx.entity().downgrade();
         let result = bridge.update(cx, |bridge, _| {
+            let serves_web_ui =
+                matches!(&bridge.configured, Some(Ok(Some(config))) if config.web_ui);
+            if !serves_web_ui {
+                return Err(anyhow!(
+                    "The web UI isn't running. Set `web_ui.enabled` and `http_api.enabled` to true \
+                     and `http_api.secret` in your settings."
+                ));
+            }
             bridge.pairing_workspace = Some(workspace_handle);
             let listening_address = bridge
                 .server
@@ -628,34 +767,15 @@ impl MobileBridge {
                     .map(|address| format!(" (listening on {address})"))
                     .unwrap_or_default();
                 format!(
-                    "Enter pairing code {code} in the Zed mobile app{address}. \
+                    "Enter pairing code {code} in the Zed web UI{address}. \
                      It expires in {} minutes.",
                     PAIRING_CODE_TTL_SECONDS / 60
                 )
             }
-            Err(_) => {
-                "The mobile server isn't running. Set `mobile_server.enabled` to true in your settings."
-                    .to_string()
-            }
+            Err(error) => error.to_string(),
         };
         workspace.show_toast(
             Toast::new(NotificationId::unique::<PairingToast>(), message),
-            cx,
-        );
-    }
-
-    fn unpair_all_devices(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
-        struct UnpairToast;
-
-        let Some(bridge) = Self::global(cx) else {
-            return;
-        };
-        let message = match bridge.read(cx).send_to_server(HostMessage::UnpairAllDevices) {
-            Ok(()) => "Unpaired all devices from the Zed mobile app.".to_string(),
-            Err(error) => format!("Failed to unpair devices: {error}"),
-        };
-        workspace.show_toast(
-            Toast::new(NotificationId::unique::<UnpairToast>(), message),
             cx,
         );
     }
@@ -692,7 +812,7 @@ fn generate_pairing_code() -> String {
 }
 
 fn server_binary_path() -> Result<PathBuf> {
-    let executable_name = format!("mobile_server{}", std::env::consts::EXE_SUFFIX);
+    let executable_name = format!("http_api{}", std::env::consts::EXE_SUFFIX);
     let current_exe = std::env::current_exe().context("locating the Zed executable")?;
     let directory = current_exe
         .parent()
@@ -751,7 +871,9 @@ pub(crate) fn find_workspace(
     Err(anyhow!("the workspace is no longer open"))
 }
 
-pub(crate) fn active_workspace(cx: &App) -> Result<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> {
+pub(crate) fn active_workspace(
+    cx: &App,
+) -> Result<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> {
     multi_workspace_windows(cx)
         .into_iter()
         .find_map(|window| {
@@ -806,7 +928,10 @@ fn build_theme(cx: &App) -> Theme {
     insert("editor_background", colors.editor_background);
     insert("editor_foreground", colors.editor_foreground);
     insert("editor_line_number", colors.editor_line_number);
-    insert("editor_active_line_number", colors.editor_active_line_number);
+    insert(
+        "editor_active_line_number",
+        colors.editor_active_line_number,
+    );
     insert("editor_active_line", colors.editor_active_line_background);
     insert("editor_selection", local_player.selection);
     insert("editor_cursor", local_player.cursor);

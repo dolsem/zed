@@ -1,8 +1,8 @@
-use std::{path::PathBuf, process::ExitStatus};
+use std::{path::PathBuf, process::ExitStatus, rc::Rc};
 
 use anyhow::Result;
 use collections::HashSet;
-use gpui::{AppContext, AsyncWindowContext, Context, Entity, Task, TaskExt, WeakEntity};
+use gpui::{App, AppContext, AsyncWindowContext, Context, Entity, Task, WeakEntity};
 use language::Buffer;
 use project::{TaskSourceKind, WorktreeId};
 use remote::ConnectionState;
@@ -24,6 +24,20 @@ pub enum ScheduledTaskResult {
 }
 
 type TaskCompletionHandler = Box<dyn FnOnce(ScheduledTaskResult, &mut AsyncWindowContext)>;
+
+/// Progress of the `create_worktree` hooks started by
+/// [`Workspace::run_create_worktree_tasks`].
+#[derive(Clone, Debug)]
+pub enum WorktreeHookEvent {
+    Started(SpawnInTerminal),
+    Finished {
+        task: SpawnInTerminal,
+        /// `None` when the task succeeded.
+        error: Option<String>,
+    },
+}
+
+pub type WorktreeHookEventHandler = Rc<dyn Fn(WorktreeHookEvent, &mut App)>;
 
 impl Workspace {
     pub fn schedule_task(
@@ -232,7 +246,16 @@ impl Workspace {
         }
     }
 
-    pub fn run_create_worktree_tasks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Runs the `create_worktree` hook tasks of every worktree in the project.
+    /// Each worktree's hooks run one after another, stopping at the first
+    /// failure. The returned task resolves once all of them finished, to an
+    /// error if any of them failed or was cancelled.
+    pub fn run_create_worktree_tasks(
+        &mut self,
+        on_event: Option<WorktreeHookEventHandler>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let project = self.project().clone();
         let hooks = HashSet::from_iter([TaskHook::CreateWorktree]);
 
@@ -240,7 +263,7 @@ impl Workspace {
             let project = project.read(cx);
             let task_store = project.task_store();
             let Some(inventory) = task_store.read(cx).task_inventory().cloned() else {
-                return;
+                return Task::ready(Ok(()));
             };
 
             let git_store = project.git_store().read(cx);
@@ -287,16 +310,17 @@ impl Workspace {
         };
 
         if worktree_tasks.is_empty() {
-            return;
+            return Task::ready(Ok(()));
         }
 
-        let task = cx.spawn_in(window, async move |workspace, cx| {
+        cx.spawn_in(window, async move |workspace, cx| {
             let mut tasks = Vec::new();
             for (worktree_id, task_context, templates) in worktree_tasks {
                 let id_base = format!("worktree_setup_{worktree_id}");
 
                 tasks.push(cx.spawn({
                     let workspace = workspace.clone();
+                    let on_event = on_event.clone();
                     async move |cx| {
                         for task_template in templates {
                             let Some(resolved) =
@@ -304,26 +328,41 @@ impl Workspace {
                             else {
                                 continue;
                             };
+                            let spawned = resolved.resolved.clone();
+                            let label = spawned.label.clone();
+                            let report = |event: WorktreeHookEvent, cx: &mut AsyncWindowContext| {
+                                if let Some(on_event) = &on_event {
+                                    cx.update(|_, cx| on_event(event, cx)).log_err();
+                                }
+                            };
+                            report(WorktreeHookEvent::Started(spawned.clone()), cx);
 
                             let status = workspace.update_in(cx, |workspace, window, cx| {
                                 workspace.spawn_in_terminal(resolved.resolved, window, cx)
                             })?;
 
-                            if let Some(result) = status.await {
-                                match result {
-                                    Ok(exit_status) if !exit_status.success() => {
-                                        log::error!(
-                                            "Git worktree setup task failed with status: {:?}",
-                                            exit_status.code()
-                                        );
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        log::error!("Git worktree setup task error: {error:#}");
-                                        break;
-                                    }
-                                    _ => {}
-                                }
+                            let result = match status.await {
+                                Some(Ok(exit_status)) if exit_status.success() => Ok(()),
+                                Some(Ok(exit_status)) => Err(anyhow::anyhow!(
+                                    "Worktree setup task \"{label}\" failed with status: {:?}",
+                                    exit_status.code()
+                                )),
+                                Some(Err(error)) => Err(error
+                                    .context(format!("Worktree setup task \"{label}\" failed"))),
+                                None => Err(anyhow::anyhow!(
+                                    "Worktree setup task \"{label}\" was cancelled"
+                                )),
+                            };
+                            report(
+                                WorktreeHookEvent::Finished {
+                                    task: spawned,
+                                    error: result.as_ref().err().map(|error| format!("{error:#}")),
+                                },
+                                cx,
+                            );
+                            if let Err(error) = result {
+                                log::error!("{error:#}");
+                                return Err(error);
                             }
                         }
                         anyhow::Ok(())
@@ -331,10 +370,17 @@ impl Workspace {
                 }));
             }
 
-            futures::future::join_all(tasks).await;
-            anyhow::Ok(())
-        });
-        task.detach_and_log_err(cx);
+            let errors = futures::future::join_all(tasks)
+                .await
+                .into_iter()
+                .filter_map(|result| result.err().map(|error| format!("{error:#}")))
+                .collect::<Vec<_>>();
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(errors.join("; ")))
+            }
+        })
     }
 
     /// Runs the `remove_worktree` hook tasks for the git worktree at `worktree_path`,
@@ -697,10 +743,14 @@ mod tests {
         }
     }
 
-    async fn run_remove_worktree_tasks_with_results(
+    async fn hook_test_workspace(
         results: Vec<Option<Result<ExitStatus>>>,
         cx: &mut TestAppContext,
-    ) -> (Result<()>, Vec<String>) {
+    ) -> (
+        Entity<Workspace>,
+        Arc<Mutex<Vec<String>>>,
+        &mut gpui::VisualTestContext,
+    ) {
         cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -747,14 +797,22 @@ mod tests {
                             r#"[
                                 {"label":"teardown 1","command":"echo","hooks":["remove_worktree"]},
                                 {"label":"teardown 2","command":"echo","hooks":["remove_worktree"]},
-                                {"label":"setup","command":"echo","hooks":["create_worktree"]}
+                                {"label":"setup 1","command":"echo","hooks":["create_worktree"]},
+                                {"label":"setup 2","command":"echo","hooks":["create_worktree"]}
                             ]"#,
                         ),
                     )
                     .expect("hook tasks should parse");
             });
         });
+        (workspace, spawned_labels, cx)
+    }
 
+    async fn run_remove_worktree_tasks_with_results(
+        results: Vec<Option<Result<ExitStatus>>>,
+        cx: &mut TestAppContext,
+    ) -> (Result<()>, Vec<String>) {
+        let (workspace, spawned_labels, cx) = hook_test_workspace(results, cx).await;
         let task = workspace.update_in(cx, |workspace, window, cx| {
             workspace.run_remove_worktree_tasks(
                 "/worktrees/feature".into(),
@@ -791,6 +849,59 @@ mod tests {
                 .await;
         assert!(result.is_err());
         assert_eq!(spawned_labels, ["teardown 1", "teardown 2"]);
+    }
+
+    async fn run_create_worktree_tasks_with_results(
+        results: Vec<Option<Result<ExitStatus>>>,
+        cx: &mut TestAppContext,
+    ) -> (Result<()>, Vec<String>) {
+        let (workspace, _, cx) = hook_test_workspace(results, cx).await;
+        let events = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let on_event: WorktreeHookEventHandler = Rc::new({
+            let events = events.clone();
+            move |event, _| {
+                events.borrow_mut().push(match event {
+                    WorktreeHookEvent::Started(task) => format!("started {}", task.label),
+                    WorktreeHookEvent::Finished { task, error: None } => {
+                        format!("finished {}", task.label)
+                    }
+                    WorktreeHookEvent::Finished {
+                        task,
+                        error: Some(_),
+                    } => format!("failed {}", task.label),
+                })
+            }
+        });
+        let task = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.run_create_worktree_tasks(Some(on_event), window, cx)
+        });
+        let result = task.await;
+        let events = events.borrow().clone();
+        (result, events)
+    }
+
+    #[gpui::test]
+    async fn test_run_create_worktree_tasks_reports_progress(cx: &mut TestAppContext) {
+        let (result, events) = run_create_worktree_tasks_with_results(Vec::new(), cx).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            events,
+            [
+                "started setup 1",
+                "finished setup 1",
+                "started setup 2",
+                "finished setup 2"
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_run_create_worktree_tasks_stops_on_error(cx: &mut TestAppContext) {
+        let (result, events) =
+            run_create_worktree_tasks_with_results(vec![Some(Err(anyhow::anyhow!("boom")))], cx)
+                .await;
+        assert!(result.is_err());
+        assert_eq!(events, ["started setup 1", "failed setup 1"]);
     }
 
     struct TestTerminalProvider {

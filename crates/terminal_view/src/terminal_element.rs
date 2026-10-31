@@ -1331,7 +1331,9 @@ impl Element for TerminalElement {
                 let background_color = theme.colors().terminal_background;
 
                 let (hover_tooltip, hover_match) = self.terminal.update(cx, |terminal, cx| {
-                    terminal.set_size(dimensions);
+                    if !terminal.is_size_locked_by_remote() {
+                        terminal.set_size(dimensions);
+                    }
                     terminal.sync(window, cx);
 
                     if window.modifiers().secondary()

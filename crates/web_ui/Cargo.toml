@@ -1,0 +1,37 @@
+[package]
+name = "web_ui"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+description = "Zed's web app (a PWA for phones): its assets, pairing and Web Push, served by http_api"
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/web_ui.rs"
+doctest = false
+
+[dependencies]
+aes-gcm.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+futures.workspace = true
+hkdf.workspace = true
+log.workspace = true
+mime_guess.workspace = true
+mobile_protocol.workspace = true
+p256.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio = { workspace = true, features = ["fs", "sync", "time"] }
+url.workspace = true

@@ -57,6 +57,7 @@ use gpui::{
     App, AppContext as _, BackgroundExecutor, Bounds, ClipboardItem, Context, EventEmitter, Hsla,
     Keystroke, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Point as GpuiPoint, Rgba, ScrollWheelEvent, Size, Task, TouchPhase, Window, actions, black, px,
+    size,
 };
 
 #[cfg(not(windows))]
@@ -66,7 +67,8 @@ use crate::alacritty::{
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
     append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
     display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
-    make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
+    make_content, make_content_at_offset, new_term, open_pty, pty_options, pty_term_config, resize,
+    screen_lines,
     scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
     set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
     toggle_vi_mode as toggle_term_vi_mode, total_lines, update_selection as update_term_selection,
@@ -1053,6 +1055,7 @@ impl TerminalBuilder {
             hyperlink_regex_searches: RegexSearches::default(),
             vi_mode_enabled: false,
             is_remote_terminal: false,
+            remote_size_lock: false,
             last_mouse_move_time: Instant::now(),
             last_hyperlink_search_position: None,
             mouse_down_hyperlink: None,
@@ -1343,6 +1346,7 @@ impl TerminalBuilder {
                 ),
                 vi_mode_enabled: false,
                 is_remote_terminal,
+                remote_size_lock: false,
                 last_mouse_move_time: Instant::now(),
                 last_hyperlink_search_position: None,
                 mouse_down_hyperlink: None,
@@ -1549,6 +1553,10 @@ pub struct Terminal {
     task: Option<TaskState>,
     vi_mode_enabled: bool,
     is_remote_terminal: bool,
+    /// Set while a remote client (the mobile app) has sized the PTY to its
+    /// own screen, so the desktop view shows that size instead of imposing
+    /// its own.
+    remote_size_lock: bool,
     last_mouse_move_time: Instant,
     last_hyperlink_search_position: Option<GpuiPoint<Pixels>>,
     mouse_down_hyperlink: Option<HyperlinkMatch>,
@@ -2546,6 +2554,53 @@ impl Terminal {
     /// Like `scroll_viewport_by`, but scrolls to the bottom.
     pub fn scroll_viewport_to_bottom(&mut self, cx: &mut Context<Self>) {
         scroll_display(&mut self.term.lock_unfair(), Scroll::Bottom);
+        cx.emit(Event::Wakeup);
+    }
+
+    /// The screen as it would look scrolled `display_offset` lines into the
+    /// history, without moving the viewport that the desktop shows.
+    pub fn content_at_display_offset(&self, display_offset: usize) -> Content {
+        let term = self.term.lock_unfair();
+        make_content_at_offset(&term, &self.last_content, display_offset)
+    }
+
+    pub fn is_size_locked_by_remote(&self) -> bool {
+        self.remote_size_lock
+    }
+
+    /// While locked, `set_size` calls from the desktop view are ignored, so a
+    /// remote client's `resize_now` size sticks. Unlocking lets the desktop
+    /// take the size back on its next render.
+    pub fn set_remote_size_lock(&mut self, locked: bool) {
+        self.remote_size_lock = locked;
+    }
+
+    /// Resizes the PTY to a grid of `columns` x `rows` right away, keeping
+    /// the desktop's cell metrics so its rendering stays consistent.
+    pub fn resize_now(&mut self, columns: usize, rows: usize, cx: &mut Context<Self>) {
+        let columns = columns.max(2);
+        let rows = rows.max(1);
+        let current = self.last_content.terminal_bounds;
+        let new_bounds = TerminalBounds::new(
+            current.line_height,
+            current.cell_width,
+            Bounds {
+                origin: current.bounds.origin,
+                size: size(
+                    current.cell_width * columns as f32,
+                    current.line_height * rows as f32,
+                ),
+            },
+        );
+        self.last_content.terminal_bounds = new_bounds;
+        if let TerminalType::Pty {
+            resources: PtyResources::Active(pty_tx),
+            ..
+        } = &self.terminal_type
+        {
+            pty_tx.resize(new_bounds);
+        }
+        resize(&mut self.term.lock_unfair(), new_bounds);
         cx.emit(Event::Wakeup);
     }
 

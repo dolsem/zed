@@ -8515,6 +8515,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "add0ab9360ddbd88cfeb3bd9574a1d85cfdfa14db10b3e21d3700dbc4328758f"
 
 [[package]]
+name = "http_api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.9",
+ "env_logger 0.11.8",
+ "futures 0.3.34",
+ "http_client_tls",
+ "log",
+ "mobile_protocol",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "web_ui",
+ "zed-reqwest",
+]
+
+[[package]]
 name = "http_client"
 version = "0.1.0"
 dependencies = [
@@ -11433,6 +11453,7 @@ dependencies = [
  "settings",
  "sidebar",
  "snippet",
+ "task",
  "terminal",
  "terminal_view",
  "text",
@@ -11451,34 +11472,6 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "mobile_server"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "axum 0.8.9",
- "base64 0.22.1",
- "env_logger 0.11.8",
- "futures 0.3.34",
- "hkdf",
- "http_client_tls",
- "log",
- "mime_guess",
- "mobile_protocol",
- "p256 0.13.2",
- "parking_lot",
- "rand 0.9.4",
- "rust-embed",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tokio",
- "url",
- "zed-reqwest",
 ]
 
 [[package]]
@@ -21187,6 +21180,32 @@ dependencies = [
  "language_model",
  "serde_json",
  "web_search",
+]
+
+[[package]]
+name = "web_ui"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "axum 0.8.9",
+ "base64 0.22.1",
+ "futures 0.3.34",
+ "hkdf",
+ "log",
+ "mime_guess",
+ "mobile_protocol",
+ "p256 0.13.2",
+ "parking_lot",
+ "rand 0.9.4",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tokio",
+ "url",
+ "zed-reqwest",
 ]
 
 [[package]]

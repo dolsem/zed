@@ -889,7 +889,7 @@ fn open_commit_view(
 }
 
 /// The workspace's center panes followed by the terminal panel's panes.
-fn all_panes(workspace: &Entity<Workspace>, cx: &App) -> Vec<Entity<Pane>> {
+pub(crate) fn all_panes(workspace: &Entity<Workspace>, cx: &App) -> Vec<Entity<Pane>> {
     let workspace = workspace.read(cx);
     let mut panes = workspace.panes().to_vec();
     if let Some(terminal_panel) = workspace.panel::<TerminalPanel>(cx) {

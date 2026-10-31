@@ -5,7 +5,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { generateIcons } from "./scripts/icons.mjs";
 
-// The real backend (the Rust `mobile_server`, or `npm run mock`) to proxy
+// The real backend (the Rust `http_api` server, or `npm run mock`) to proxy
 // `/api` to while running `npm run dev`.
 const backend = process.env.ZED_MOBILE_BACKEND ?? "http://127.0.0.1:8787";
 

@@ -951,6 +951,53 @@ pub(super) fn make_content(term: &Term<ZedListener>, last_content: &Content) -> 
     }
 }
 
+/// Like `make_content`, but for a viewport scrolled `display_offset` lines
+/// into the history, without moving the terminal's own viewport. Selection
+/// and hover state belong to the desktop view, so they're left out.
+pub(super) fn make_content_at_offset(
+    term: &Term<ZedListener>,
+    last_content: &Content,
+    display_offset: usize,
+) -> Content {
+    let grid = term.grid();
+    let display_offset = display_offset.min(term.history_size());
+    let screen_lines = term.screen_lines();
+    let top = Line(-(display_offset as i32));
+    let bottom = Line(top.0 + screen_lines as i32 - 1);
+    let last_column = term.last_column();
+
+    // `iter_from` yields the cells after its starting point, like `display_iter`.
+    let mut cells = Vec::with_capacity(screen_lines * term.columns());
+    cells.extend(
+        grid.iter_from(AlacPoint::new(Line(top.0 - 1), last_column))
+            .take_while(|indexed| indexed.point.line <= bottom)
+            .map(|indexed| IndexedCell {
+                point: terminal_point_from_alacritty(indexed.point),
+                cell: terminal_cell_from_alacritty(indexed.cell),
+            }),
+    );
+
+    let renderable = term.renderable_content();
+    Content {
+        cells,
+        mode: terminal_modes_from_alacritty(renderable.mode),
+        total_lines: grid.total_lines(),
+        display_offset,
+        columns: grid.columns(),
+        screen_lines,
+        selection_text: None,
+        selection: None,
+        cursor: Cursor::from_alacritty(renderable.cursor),
+        cursor_char: term.grid()[renderable.cursor.point].c,
+        terminal_bounds: last_content.terminal_bounds,
+        last_hovered_word: None,
+        grid_lines_change: GridLinesChange::Unchanged,
+        scrolled_to_top: display_offset == term.history_size(),
+        scrolled_to_bottom: display_offset == 0,
+        bottom_row_occupied: false,
+    }
+}
+
 pub(super) fn content_text(term: &Term<ZedListener>) -> String {
     let start = AlacPoint::new(term.topmost_line(), Column(0));
     let end = AlacPoint::new(term.bottommost_line(), term.last_column());

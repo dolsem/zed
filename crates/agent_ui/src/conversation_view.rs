@@ -812,6 +812,35 @@ impl ConversationView {
         }
     }
 
+    /// Why the agent couldn't be started, if it couldn't.
+    pub(crate) fn load_error_message(&self) -> Option<String> {
+        match &self.server_state {
+            ServerState::LoadError { error } => Some(match error {
+                LoadError::Exited {
+                    status,
+                    stderr: Some(stderr),
+                } => format!("The agent exited with status {status}: {stderr}"),
+                error => error.to_string(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Set while the agent waits for the user to sign in, which can only be
+    /// done from Zed's agent panel.
+    pub(crate) fn authentication_required_message(&self, cx: &App) -> Option<String> {
+        match &self.as_connected()?.auth_state {
+            AuthState::Ok => None,
+            AuthState::Unauthenticated { description, .. } => Some(
+                description
+                    .as_ref()
+                    .map(|description| description.read(cx).source().to_string())
+                    .filter(|description| !description.trim().is_empty())
+                    .unwrap_or_else(|| "The agent requires authentication.".to_string()),
+            ),
+        }
+    }
+
     pub fn updated_at(&self, cx: &App) -> Option<Instant> {
         self.as_connected()
             .and_then(|connected| connected.conversation.read(cx).updated_at)

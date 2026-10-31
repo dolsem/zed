@@ -14,7 +14,7 @@ const WEB_INPUTS: &[&str] = &[
     "tsconfig.json",
 ];
 
-const PLACEHOLDER_MARKER: &str = "<!-- mobile_server placeholder -->";
+const PLACEHOLDER_MARKER: &str = "<!-- web_ui placeholder -->";
 
 fn main() {
     let manifest_dir = match std::env::var_os("CARGO_MANIFEST_DIR") {
@@ -44,11 +44,11 @@ fn main() {
     if web_dir.join("package.json").exists() {
         if needs_build(&web_dir, &dist_index) {
             if let Err(error) = build_web(&web_dir) {
-                println!("cargo:warning=the mobile PWA was not built: {error}");
+                println!("cargo:warning=the web UI was not built: {error}");
             }
         }
     } else {
-        println!("cargo:warning=web/package.json not found; the mobile PWA was not built");
+        println!("cargo:warning=web/package.json not found; the web UI was not built");
     }
 
     if !dist_index.exists() {
@@ -138,6 +138,6 @@ fn write_placeholder(dist_dir: &Path, dist_index: &Path) -> std::io::Result<()> 
     std::fs::create_dir_all(dist_dir)?;
     std::fs::write(
         dist_index,
-        "<!doctype html>\n<!-- mobile_server placeholder -->\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Zed</title></head>\n<body><p>The Zed mobile web app wasn't built. Install Node.js and npm, then rebuild <code>mobile_server</code>.</p></body>\n</html>\n",
+        "<!doctype html>\n<!-- web_ui placeholder -->\n<html lang=\"en\">\n<head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Zed</title></head>\n<body><p>The Zed web app wasn't built. Install Node.js and npm, then rebuild <code>web_ui</code>.</p></body>\n</html>\n",
     )
 }
