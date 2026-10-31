@@ -2,6 +2,8 @@
 //! (`mobile_bridge`). Unlike the sidebar's own list, this one ignores collapsed
 //! groups and the search filter, so every active thread is listed.
 
+use std::time::Duration;
+
 use super::*;
 
 pub struct MobileProject {
@@ -276,9 +278,16 @@ pub fn find_or_open_workspace(
     }
 }
 
-/// Shows an agent thread in Zed, opening its workspace (and connecting to its
-/// remote host) if needed, exactly as clicking it in the sidebar would.
-pub fn activate_thread(thread_id: ThreadId, cx: &mut App) -> anyhow::Result<()> {
+/// Where a thread lives: the window to open it in, and its workspace if
+/// that's already open.
+struct ThreadTarget {
+    metadata: ThreadMetadata,
+    window: WindowHandle<MultiWorkspace>,
+    open_workspace: Option<Entity<Workspace>>,
+    key: ProjectGroupKey,
+}
+
+fn thread_target(thread_id: ThreadId, cx: &App) -> anyhow::Result<ThreadTarget> {
     let metadata = ThreadMetadataStore::global(cx)
         .read(cx)
         .entry(thread_id)
@@ -293,15 +302,18 @@ pub fn activate_thread(thread_id: ThreadId, cx: &mut App) -> anyhow::Result<()> 
 
     let open_workspace = windows.iter().find_map(|window| {
         let multi_workspace = window.read(cx).ok()?;
-        let workspace = multi_workspace
-            .workspace_for_paths(metadata.folder_paths(), metadata.remote_connection.as_ref(), cx)?;
+        let workspace = multi_workspace.workspace_for_paths(
+            metadata.folder_paths(),
+            metadata.remote_connection.as_ref(),
+            cx,
+        )?;
         Some((*window, workspace))
     });
     let key = ProjectGroupKey::from_worktree_paths(
         &metadata.worktree_paths,
         metadata.remote_connection.clone(),
     );
-    let target_window = match &open_workspace {
+    let window = match &open_workspace {
         Some((window, _)) => *window,
         None => windows
             .iter()
@@ -316,30 +328,64 @@ pub fn activate_thread(thread_id: ThreadId, cx: &mut App) -> anyhow::Result<()> 
             .copied()
             .ok_or_else(|| anyhow::anyhow!("no Zed window is open"))?,
     };
+    Ok(ThreadTarget {
+        metadata,
+        window,
+        open_workspace: open_workspace.map(|(_, workspace)| workspace),
+        key,
+    })
+}
 
-    let sidebar = target_window
-        .read(cx)?
-        .sidebar()
-        .and_then(|sidebar| sidebar.to_any().downcast::<Sidebar>().ok())
-        .ok_or_else(|| anyhow::anyhow!("the window has no threads sidebar"))?;
-    // Activation updates the multi-workspace, so it must not be leased by
-    // `WindowHandle::update` while the sidebar runs.
-    let window_handle: gpui::AnyWindowHandle = target_window.into();
-    window_handle.update(cx, |_, window, cx| {
-        sidebar.update(cx, |sidebar, cx| match open_workspace {
-            Some((_, workspace)) => {
-                sidebar.activate_thread(metadata.clone(), &workspace, false, window, cx);
-            }
+/// Loads an agent thread in its workspace's agent panel without showing it,
+/// opening the workspace in the background first if needed, so that the
+/// user's view stays as it is.
+pub fn load_thread_in_background(thread_id: ThreadId, cx: &mut App) -> Task<anyhow::Result<()>> {
+    const PANEL_TIMEOUT: Duration = Duration::from_secs(90);
+    const PANEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+    let target = match thread_target(thread_id, cx) {
+        Ok(target) => target,
+        Err(error) => return Task::ready(Err(error)),
+    };
+    cx.spawn(async move |cx| {
+        let ThreadTarget {
+            metadata,
+            window,
+            open_workspace,
+            key,
+        } = target;
+        let workspace = match open_workspace {
+            Some(workspace) => workspace,
             None => {
-                let folder_paths = metadata.folder_paths().clone();
-                sidebar.open_workspace_and_activate_thread(
-                    metadata.clone(),
-                    folder_paths,
-                    &key,
+                cx.update(|cx| {
+                    find_or_open_workspace(window, key, metadata.folder_paths().clone(), cx)
+                })
+                .await?
+            }
+        };
+        // A newly opened workspace registers its panels asynchronously.
+        let deadline = cx.background_executor().now() + PANEL_TIMEOUT;
+        let panel = loop {
+            if let Some(panel) = cx.update(|cx| workspace.read(cx).panel::<AgentPanel>(cx)) {
+                break panel;
+            }
+            if cx.background_executor().now() >= deadline {
+                anyhow::bail!("the thread's workspace didn't finish loading");
+            }
+            cx.background_executor().timer(PANEL_POLL_INTERVAL).await;
+        };
+        window.update(cx, |_, window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.load_agent_thread_in_background(
+                    Agent::from(metadata.agent_id.clone()),
+                    metadata.thread_id,
+                    Some(metadata.folder_paths().clone()),
+                    metadata.title.clone(),
+                    AgentThreadSource::Sidebar,
                     window,
                     cx,
                 );
-            }
-        });
+            })
+        })
     })
 }

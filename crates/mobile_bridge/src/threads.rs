@@ -217,8 +217,8 @@ impl MobileBridge {
         cx.background_spawn(async move { to_json(options.await?) })
     }
 
-    /// Loads the thread in Zed if needed, and waits until its agent is
-    /// ready (or failed to start).
+    /// Loads the thread in Zed if needed, without changing what the user
+    /// sees, and waits until its agent is ready (or failed to start).
     pub(crate) fn load_conversation(
         &mut self,
         thread_id: &str,
@@ -228,13 +228,20 @@ impl MobileBridge {
             Ok(thread_id) => thread_id,
             Err(error) => return Task::ready(Err(error.context("invalid thread id"))),
         };
-        let needs_activation = agent_mobile::find_conversation(parsed_thread_id, cx).is_none();
-        if needs_activation
-            && let Err(error) = sidebar::mobile::activate_thread(parsed_thread_id, cx)
-        {
-            return Task::ready(Err(error));
-        }
-        cx.spawn(async move |_, cx| wait_for_conversation(parsed_thread_id, cx).await)
+        let load = if agent_mobile::find_conversation(parsed_thread_id, cx).is_none() {
+            Some(sidebar::mobile::load_thread_in_background(
+                parsed_thread_id,
+                cx,
+            ))
+        } else {
+            None
+        };
+        cx.spawn(async move |_, cx| {
+            if let Some(load) = load {
+                load.await?;
+            }
+            wait_for_conversation(parsed_thread_id, cx).await
+        })
     }
 }
 
@@ -323,7 +330,17 @@ pub(crate) fn build_new_thread_options(cx: &mut App) -> Task<Result<NewThreadOpt
                 name: String::new(),
                 remote_host: group.key.host().map(|host| host.display_name()),
                 worktrees,
-                can_create_worktree: repository.is_some(),
+                // Projects that aren't open have no repository state yet; a
+                // worktree can be created once they're opened in the background.
+                can_create_worktree: repository.is_some()
+                    || (group.workspaces.is_empty()
+                        && group.key.host().is_none()
+                        && group
+                            .key
+                            .path_list()
+                            .paths()
+                            .iter()
+                            .any(|path| path.join(".git").exists())),
                 branches: current_branch.into_iter().collect(),
             });
         }

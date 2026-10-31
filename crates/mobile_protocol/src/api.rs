@@ -40,7 +40,8 @@ pub enum Request {
     CreateThread(CreateThreadParams),
 
     // Thread screen
-    /// Shows the thread in Zed (loading it if needed), returns a snapshot and
+    /// Loads the thread in Zed if needed (in the background, without changing
+    /// what the desktop shows), returns a snapshot and
     /// subscribes the client to `thread.*` events until `thread.close`.
     #[serde(rename = "thread.open")]
     OpenThread { thread_id: String },

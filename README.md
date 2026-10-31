@@ -92,6 +92,8 @@ Zed shows an error if the API is enabled without a secret. Changing the secret r
 - `GET /api/threads/{id}/events` subscribes to a thread: a snapshot, then an event whenever a run starts, changes status or finishes, and whenever the thread's state changes. With `?detail=full`, every item as it streams in too.
 - `POST /api/threads/{id}/messages`, `/cancel`, `/permissions/{tool_call_id}` and `/questions/{question_id}`, plus `PUT /api/threads/{id}/controls/{control_id}`, act on the thread.
 
+API calls run in the background, so they don't get in the way of whoever is using Zed: threads are loaded and created without switching what Zed shows, projects and new worktrees open as background workspaces, and their hooks and queued messages don't take the focus.
+
 The server is the separate `http_api` executable, which Zed starts and stops.
 
 #### Web UI

@@ -2561,7 +2561,11 @@ impl ThreadView {
 
         cx.emit(AcpThreadViewEvent::Interacted);
 
-        self.message_editor.focus_handle(cx).focus(window, cx);
+        // Queued messages are also sent automatically, e.g. for a thread in the
+        // background, which must not take the focus from what the user is in.
+        if self.focus_handle.contains_focused(window, cx) {
+            self.message_editor.focus_handle(cx).focus(window, cx);
+        }
 
         let content = entry.content;
         let tracked_buffers = entry.tracked_buffers;

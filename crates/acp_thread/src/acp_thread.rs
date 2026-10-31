@@ -6051,7 +6051,9 @@ impl AcpThread {
         self.mark_pending_entries_as_canceled(permission_outcome, cx);
         self.connection.cancel(&self.session_id, cx);
         self.set_foreground_state(
-            acp_v2::StateUpdate::Idle(acp_v2::IdleStateUpdate::new()),
+            acp_v2::StateUpdate::Idle(
+                acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::Cancelled),
+            ),
             cx,
         );
         cx.emit(AcpThreadEvent::StatusChanged);

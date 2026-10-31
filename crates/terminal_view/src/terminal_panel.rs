@@ -909,7 +909,8 @@ impl TerminalPanel {
                 }));
 
                 let take_focus = reveal_strategy == RevealStrategy::Always
-                    && !workspace.has_active_modal(window, cx);
+                    && !workspace.has_active_modal(window, cx)
+                    && is_shown_in_window(workspace, window, cx);
                 match reveal_strategy {
                     RevealStrategy::Always if take_focus => {
                         workspace.focus_panel::<Self>(window, cx);
@@ -989,7 +990,8 @@ impl TerminalPanel {
                     }));
 
                     let take_focus = reveal_strategy == RevealStrategy::Always
-                        && !workspace.has_active_modal(window, cx);
+                        && !workspace.has_active_modal(window, cx)
+                        && is_shown_in_window(workspace, window, cx);
                     match reveal_strategy {
                         RevealStrategy::Always if take_focus => {
                             workspace.focus_panel::<Self>(window, cx);
@@ -1146,6 +1148,14 @@ impl TerminalPanel {
                 }
             })?;
 
+            let is_shown = task_workspace.update_in(cx, |workspace, window, cx| {
+                is_shown_in_window(workspace, window, cx)
+            })?;
+            let reveal = if is_shown {
+                reveal
+            } else {
+                RevealStrategy::Never
+            };
             match reveal {
                 RevealStrategy::Always => match reveal_target {
                     RevealTarget::Center => {
@@ -1322,6 +1332,19 @@ pub fn prepare_task_for_spawn(
 
 fn is_enabled_in_workspace(workspace: &Workspace, cx: &App) -> bool {
     workspace.project().read(cx).supports_terminal(cx)
+}
+
+/// Whether `workspace` is the one its window shows. Tasks of other workspaces
+/// (e.g. the hooks of a worktree an agent created in the background) must not
+/// take the focus, which would leave the user typing into a workspace they
+/// can't see.
+fn is_shown_in_window(workspace: &Workspace, window: &Window, cx: &App) -> bool {
+    window
+        .root::<workspace::MultiWorkspace>()
+        .flatten()
+        .is_none_or(|multi_workspace| {
+            multi_workspace.read(cx).workspace().entity_id() == workspace.weak_handle().entity_id()
+        })
 }
 
 pub fn new_terminal_pane(

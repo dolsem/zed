@@ -943,7 +943,26 @@ pub fn build_run(
 
     // Background work (e.g. a command the agent left running) keeps the run going.
     let is_generating = is_last && thread.is_busy();
-    let error = is_last.then(|| thread_view.error_message(cx)).flatten();
+    // Only the last run's turn is still described by the thread's state.
+    let stop_reason = match thread.foreground_state() {
+        acp_v2::StateUpdate::Idle(idle) if is_last => idle.stop_reason.clone(),
+        _ => None,
+    };
+    let error = is_last
+        .then(|| thread_view.error_message(cx))
+        .flatten()
+        .or_else(|| match stop_reason {
+            Some(acp_v2::StopReason::Refusal) => Some("The agent refused to respond.".to_string()),
+            Some(acp_v2::StopReason::MaxTokens) => {
+                Some("The agent stopped at the output token limit.".to_string())
+            }
+            Some(acp_v2::StopReason::MaxTurnRequests) => {
+                Some("The agent stopped at the limit of requests per turn.".to_string())
+            }
+            _ => None,
+        });
+    let was_cancelled =
+        has_canceled_tool_call || stop_reason == Some(acp_v2::StopReason::Cancelled);
     let status = if pending
         .iter()
         .any(|request| matches!(request, rest::PendingRequest::Permission { .. }))
@@ -955,7 +974,7 @@ pub fn build_run(
         rest::RunStatus::Running
     } else if error.is_some() {
         rest::RunStatus::Failed
-    } else if has_canceled_tool_call {
+    } else if was_cancelled {
         rest::RunStatus::Cancelled
     } else {
         rest::RunStatus::Completed

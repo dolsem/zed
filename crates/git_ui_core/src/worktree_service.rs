@@ -738,10 +738,9 @@ pub struct CreatedWorktreeWorkspace {
 /// Same as [`handle_create_worktree`], but returns a `Task` that resolves to
 /// the new workspace once worktree creation and post-open setup are
 /// complete. The caller receives errors as `Result`s and is expected to
-/// handle them. Note that a small set of early failures (no git repositories,
-/// disconnected remote, mid-creation `git fetch` failure) still surface a
-/// toast on the source workspace so the user understands why the action
-/// didn't take effect; the same error is also returned to the caller.
+/// handle them. The source workspace's UI is left alone: it shows no
+/// progress indicator or error toasts, and the user can keep creating and
+/// switching worktrees meanwhile.
 ///
 /// Used by the `create_thread` agent tool to spawn a sibling thread inside
 /// the newly-opened workspace.
@@ -818,7 +817,10 @@ fn create_worktree_workspace_inner(
     // a hard error here so the caller can surface it; the user-facing
     // wrapper [`handle_create_worktree`] swallows the error via
     // `detach_and_log_err`, matching the pre-existing silent return.
-    if workspace.active_worktree_creation().label.is_some() {
+    // Background creations leave the source workspace's UI alone (see
+    // [`create_worktree_workspace`]), so they neither take part in this
+    // guard nor block the user's own creations and switches.
+    if activate && workspace.active_worktree_creation().label.is_some() {
         return Task::ready(Err(anyhow!("A worktree creation is already in progress")));
     }
 
@@ -831,13 +833,15 @@ fn create_worktree_workspace_inner(
     let (git_repos, non_git_paths) = classify_worktrees(project.read(cx), cx);
 
     if git_repos.is_empty() {
-        let toast_workspace = cx.entity();
-        show_error_toast(
-            toast_workspace,
-            "worktree create",
-            anyhow!("No git repositories found in the project"),
-            cx,
-        );
+        if activate {
+            let toast_workspace = cx.entity();
+            show_error_toast(
+                toast_workspace,
+                "worktree create",
+                anyhow!("No git repositories found in the project"),
+                cx,
+            );
+        }
         return Task::ready(Err(anyhow!("No git repositories found in the project")));
     }
 
@@ -847,13 +851,15 @@ fn create_worktree_workspace_inner(
             .remote_client()
             .is_some_and(|client| client.read(cx).is_disconnected());
         if is_disconnected {
-            let toast_workspace = cx.entity();
-            show_error_toast(
-                toast_workspace,
-                "worktree create",
-                anyhow!("Cannot create worktree: remote connection is not active"),
-                cx,
-            );
+            if activate {
+                let toast_workspace = cx.entity();
+                show_error_toast(
+                    toast_workspace,
+                    "worktree create",
+                    anyhow!("Cannot create worktree: remote connection is not active"),
+                    cx,
+                );
+            }
             return Task::ready(Err(anyhow!(
                 "Cannot create worktree: remote connection is not active"
             )));
@@ -887,7 +893,9 @@ fn create_worktree_workspace_inner(
         .to_string()
         .into();
 
-    workspace.set_active_worktree_creation(Some(display_name), false, cx);
+    if activate {
+        workspace.set_active_worktree_creation(Some(display_name), false, cx);
+    }
 
     cx.spawn_in(window, async move |_workspace_entity, mut cx| {
         let result = do_create_worktree(
@@ -909,6 +917,10 @@ fn create_worktree_workspace_inner(
 
         if let Err(err) = &result {
             log::error!("Failed to create worktree: {err}");
+        }
+        if let Err(err) = &result
+            && activate
+        {
             workspace_handle
                 .update(cx, |workspace, cx| {
                     workspace.set_active_worktree_creation(None, false, cx);
@@ -1684,12 +1696,15 @@ async fn open_worktree_workspace(
     }
 
     // Clear the creation status on the SOURCE workspace so its title bar
-    // stops showing the loading indicator immediately.
-    workspace
-        .update(cx, |ws, cx| {
-            ws.set_active_worktree_creation(None, false, cx);
-        })
-        .ok();
+    // stops showing the loading indicator immediately. Background creations
+    // never set it, and must not clear one the user started.
+    if activate {
+        workspace
+            .update(cx, |ws, cx| {
+                ws.set_active_worktree_creation(None, false, cx);
+            })
+            .ok();
+    }
 
     let setup_hooks = window_handle.update(cx, |multi_workspace, window, cx| {
         if activate {

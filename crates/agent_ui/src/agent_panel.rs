@@ -4605,6 +4605,48 @@ impl AgentPanel {
         );
     }
 
+    /// Loads a thread without showing it, as one of the panel's background
+    /// threads, so it can be driven (e.g. through the HTTP API) while the user
+    /// works on something else. Does nothing if the thread is already loaded.
+    pub fn load_agent_thread_in_background(
+        &mut self,
+        agent: Agent,
+        thread_id: ThreadId,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_loaded = self.conversation_view_for_id(&thread_id, cx).is_some()
+            || self
+                .draft_thread
+                .as_ref()
+                .is_some_and(|draft| draft.read(cx).thread_id == thread_id);
+        if is_loaded {
+            return;
+        }
+        // Creating the thread selects its agent, which must not change the
+        // agent the user's next new thread gets.
+        let selected_agent = self.selected_agent.clone();
+        let thread = self.create_agent_thread_with_server(
+            agent,
+            None,
+            Some(thread_id),
+            work_dirs,
+            title,
+            None,
+            None,
+            source,
+            window,
+            cx,
+        );
+        if self.selected_agent != selected_agent {
+            self.set_selected_agent_and_persist(selected_agent, cx);
+        }
+        self.insert_retained_thread(thread_id, thread.conversation_view, cx);
+    }
+
     pub(crate) fn create_agent_thread_with_server(
         &mut self,
         agent: Agent,
