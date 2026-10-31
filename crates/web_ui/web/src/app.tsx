@@ -203,7 +203,10 @@ function PairingScreen() {
           <img src="/icons/icon-192.png" alt="" width="72" height="72" />
         </div>
         <h1>Pair with Zed</h1>
-        <p class="pairing-lead">Enter the code shown in Zed on your desktop to control it from this device.</p>
+        <p class="pairing-lead">
+          To get a code, run <b>web ui: pair device</b> from the command palette in Zed on your desktop. Enter it here
+          to control Zed from this device.
+        </p>
         {revoked && (
           <div class="callout error compact">
             <Icon name="alert" size={16} />

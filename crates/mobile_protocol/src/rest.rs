@@ -30,6 +30,8 @@
 //! | GET | `/api/operations` | | [`OperationsResponse`] |
 //! | GET | `/api/operations/{operation_id}` | | [`Operation`] |
 //! | GET | `/api/operations/{operation_id}/events` | | SSE, see [`OperationEvent`] |
+//! | POST | `/api/pairing` | | [`PairingResponse`] |
+//! | POST | `/api/mcp` | JSON-RPC | the same API as an MCP server, see [`crate::mcp`] |
 //!
 //! Path segments are percent-decoded. The run and thread endpoints take
 //! `?detail=full` to include every [`RunItem`] instead of only the run's
@@ -317,6 +319,13 @@ pub struct RunItemEvent {
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamError {
     pub message: String,
+}
+
+/// A code that lets one device pair with the web UI until it expires.
+#[derive(Debug, Clone, Serialize)]
+pub struct PairingResponse {
+    pub code: String,
+    pub expires_in_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

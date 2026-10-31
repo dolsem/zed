@@ -6,6 +6,7 @@
 
 mod api;
 mod buffers;
+mod mcp;
 mod operations;
 mod rest;
 mod status_bar;
@@ -49,7 +50,7 @@ actions!(
 );
 
 const PAIRING_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const PAIRING_CODE_TTL_SECONDS: u64 = 300;
+pub(crate) const PAIRING_CODE_TTL_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone, PartialEq, Eq, RegisterSetting)]
 pub struct HttpApiSettings {
@@ -738,31 +739,18 @@ impl MobileBridge {
         let Some(bridge) = Self::global(cx) else {
             return;
         };
-        let code = generate_pairing_code();
         let workspace_handle = cx.entity().downgrade();
         let result = bridge.update(cx, |bridge, _| {
-            let serves_web_ui =
-                matches!(&bridge.configured, Some(Ok(Some(config))) if config.web_ui);
-            if !serves_web_ui {
-                return Err(anyhow!(
-                    "The web UI isn't running. Set `web_ui.enabled` and `http_api.enabled` to true \
-                     and `http_api.secret` in your settings."
-                ));
-            }
+            let code = bridge.begin_pairing()?;
             bridge.pairing_workspace = Some(workspace_handle);
             let listening_address = bridge
                 .server
                 .as_ref()
                 .and_then(|server| server.listening_address.clone());
-            bridge
-                .send_to_server(HostMessage::StartPairing {
-                    code: code.replace('-', ""),
-                    expires_in_seconds: PAIRING_CODE_TTL_SECONDS,
-                })
-                .map(|()| listening_address)
+            anyhow::Ok((code, listening_address))
         });
         let message = match result {
-            Ok(listening_address) => {
+            Ok((code, listening_address)) => {
                 let address = listening_address
                     .map(|address| format!(" (listening on {address})"))
                     .unwrap_or_default();
@@ -778,6 +766,23 @@ impl MobileBridge {
             Toast::new(NotificationId::unique::<PairingToast>(), message),
             cx,
         );
+    }
+
+    /// Allows one web UI device to pair with a fresh code, which is returned.
+    pub(crate) fn begin_pairing(&mut self) -> Result<String> {
+        let serves_web_ui = matches!(&self.configured, Some(Ok(Some(config))) if config.web_ui);
+        if !serves_web_ui {
+            return Err(anyhow!(
+                "The web UI isn't running. Set `web_ui.enabled` and `http_api.enabled` to true \
+                 and `http_api.secret` in your settings."
+            ));
+        }
+        let code = generate_pairing_code();
+        self.send_to_server(HostMessage::StartPairing {
+            code: code.replace('-', ""),
+            expires_in_seconds: PAIRING_CODE_TTL_SECONDS,
+        })?;
+        Ok(code)
     }
 
     fn show_pairing_outcome(&mut self, message: String, cx: &mut Context<Self>) {

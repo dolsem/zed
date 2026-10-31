@@ -78,7 +78,7 @@ pub(crate) fn conflict(error: anyhow::Error) -> anyhow::Error {
     api_error(409, format!("{error:#}"))
 }
 
-fn error_status(error: &anyhow::Error) -> u16 {
+pub(crate) fn error_status(error: &anyhow::Error) -> u16 {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<ApiError>())
@@ -242,7 +242,7 @@ impl MobileBridge {
         self.end_stream(request_id);
     }
 
-    fn route_rest_request(
+    pub(crate) fn route_rest_request(
         &mut self,
         request_id: RequestId,
         method: &str,
@@ -396,6 +396,15 @@ impl MobileBridge {
                     empty()
                 })
             }
+            ("POST", ["mcp"]) => self.handle_mcp_request(body, cx),
+            ("POST", ["pairing"]) => {
+                Task::ready(self.begin_pairing().map_err(conflict).and_then(|code| {
+                    json(rest::PairingResponse {
+                        code,
+                        expires_in_seconds: crate::PAIRING_CODE_TTL_SECONDS,
+                    })
+                }))
+            }
             ("GET", ["operations"]) => Task::ready(json(rest::OperationsResponse {
                 operations: self.operations.list(),
             })),
@@ -484,6 +493,8 @@ fn is_known_path(segments: &[&str]) -> bool {
         segments,
         ["projects"]
             | ["agents"]
+            | ["mcp"]
+            | ["pairing"]
             | ["worktrees"]
             | ["threads"]
             | ["threads", _]

@@ -12,6 +12,7 @@
 //! (see [`rest`]).
 
 pub mod api;
+pub mod mcp;
 pub mod rest;
 
 use std::collections::BTreeMap;
