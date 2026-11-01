@@ -1106,10 +1106,19 @@ fn push_worktree_option(
     {
         return;
     }
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path_string.clone());
+    let file_name = |path: &std::path::Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    };
+    let mut name = file_name(&path).unwrap_or_else(|| path_string.clone());
+    // Zed creates worktrees at `<directory>/<worktree name>/<repository
+    // name>`, which would all be named like the main worktree.
+    if !is_main
+        && worktrees.iter().any(|worktree| worktree.name == name)
+        && let Some(parent_name) = path.parent().and_then(file_name)
+    {
+        name = parent_name;
+    }
     worktrees.push(WorktreeOption {
         path: path_string,
         name,

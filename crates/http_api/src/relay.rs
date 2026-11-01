@@ -106,6 +106,10 @@ pub async fn forward(
     match tokio::time::timeout(REQUEST_TIMEOUT, receiver).await {
         Ok(Ok(Reply::Json { status, body })) => {
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            // E.g. MCP notifications, which are acknowledged without a body.
+            if status == StatusCode::ACCEPTED && body.is_null() {
+                return status.into_response();
+            }
             (status, Json(body)).into_response()
         }
         Ok(Ok(Reply::Stream(events))) => {
