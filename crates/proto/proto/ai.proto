@@ -123,6 +123,7 @@ message AgentThreadMetadata {
   optional string main_worktree_paths = 11;
   optional string main_worktree_paths_order = 12;
   optional string title_override = 13;
+  optional string flair = 14;
 }
 
 message ListAgentThreadMetadata {}

@@ -147,6 +147,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         worktree_paths: WorktreePaths::from_folder_paths(&entry.folder_paths),
                         remote_connection: None,
                         archived: true,
+                        flair: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -328,6 +329,50 @@ pub struct ThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub archived: bool,
+    /// The flair the user (or the API) tagged the thread with, shown as a
+    /// colored line in the sidebar. See [`ThreadMetadataStore::flairs`].
+    pub flair: Option<ThreadFlairId>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct ThreadFlairId(pub SharedString);
+
+impl ThreadFlairId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().hyphenated().to_string().into())
+    }
+}
+
+/// A named color that threads can be tagged with.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ThreadFlair {
+    pub id: ThreadFlairId,
+    pub name: SharedString,
+    /// `#rrggbb`
+    pub color: SharedString,
+}
+
+impl ThreadFlair {
+    pub fn hsla(&self) -> Option<gpui::Hsla> {
+        gpui::Rgba::try_from(self.color.as_ref())
+            .ok()
+            .map(gpui::Hsla::from)
+    }
+}
+
+/// The flair applied to threads created through the HTTP/MCP API.
+pub const MCP_FLAIR_ID: &str = "mcp";
+const MCP_FLAIR_COLOR: &str = "#a855f7";
+
+const THREAD_FLAIRS_KEY: &str = "thread-flairs";
+
+fn default_flairs() -> Vec<ThreadFlair> {
+    vec![ThreadFlair {
+        id: ThreadFlairId(MCP_FLAIR_ID.into()),
+        name: "MCP".into(),
+        color: MCP_FLAIR_COLOR.into(),
+    }]
 }
 
 impl ThreadMetadata {
@@ -533,6 +578,11 @@ pub struct ThreadMetadataStore {
     pending_remote_writes: HashMap<ThreadId, (RemoteConnectionOptions, RemoteWrite, u64)>,
     _persist_remote_state: Option<Task<()>>,
     _quit_subscription: Subscription,
+    flairs: Vec<ThreadFlair>,
+    /// Flairs set on threads that have no metadata yet (e.g. a thread the
+    /// API just created, whose session is still connecting); applied once
+    /// the metadata is first written.
+    pending_flairs: HashMap<ThreadId, ThreadFlairId>,
 }
 
 /// The threads of remote hosts as last seen, so they can be listed before the
@@ -1332,6 +1382,138 @@ impl ThreadMetadataStore {
         self.save(metadata, cx);
     }
 
+    pub fn flairs(&self) -> &[ThreadFlair] {
+        &self.flairs
+    }
+
+    pub fn flair(&self, id: &ThreadFlairId) -> Option<&ThreadFlair> {
+        self.flairs.iter().find(|flair| &flair.id == id)
+    }
+
+    /// The flair of a thread, if it has one that still exists.
+    pub fn thread_flair(&self, thread_id: ThreadId) -> Option<&ThreadFlair> {
+        let metadata = self.entry(thread_id)?;
+        self.flair(metadata.flair.as_ref()?)
+    }
+
+    pub fn create_flair(
+        &mut self,
+        name: SharedString,
+        color: SharedString,
+        cx: &mut Context<Self>,
+    ) -> ThreadFlairId {
+        let id = ThreadFlairId::new();
+        self.flairs.push(ThreadFlair {
+            id: id.clone(),
+            name,
+            color,
+        });
+        self.persist_flairs(cx);
+        cx.notify();
+        id
+    }
+
+    pub fn update_flair(
+        &mut self,
+        id: &ThreadFlairId,
+        name: SharedString,
+        color: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(flair) = self.flairs.iter_mut().find(|flair| &flair.id == id) else {
+            return;
+        };
+        flair.name = name;
+        flair.color = color;
+        self.persist_flairs(cx);
+        cx.notify();
+    }
+
+    /// Removes a flair and clears it from the threads that had it. The
+    /// built-in MCP flair can't be deleted, since the API keeps applying it.
+    pub fn delete_flair(&mut self, id: &ThreadFlairId, cx: &mut Context<Self>) {
+        if id.0.as_ref() == MCP_FLAIR_ID {
+            return;
+        }
+        self.flairs.retain(|flair| &flair.id != id);
+        self.pending_flairs.retain(|_, pending| pending != id);
+        let tagged = self
+            .threads
+            .values()
+            .filter(|thread| thread.flair.as_ref() == Some(id))
+            .map(|thread| thread.thread_id)
+            .collect::<Vec<_>>();
+        for thread_id in tagged {
+            self.set_flair(thread_id, None, cx);
+        }
+        self.persist_flairs(cx);
+        cx.notify();
+    }
+
+    /// Tags the thread with a flair, or clears it. Threads without metadata
+    /// yet get the flair as soon as their metadata is first written.
+    pub fn set_flair(
+        &mut self,
+        thread_id: ThreadId,
+        flair: Option<ThreadFlairId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.entry(thread_id) else {
+            match flair {
+                Some(flair) => {
+                    self.pending_flairs.insert(thread_id, flair);
+                }
+                None => {
+                    self.pending_flairs.remove(&thread_id);
+                }
+            }
+            return;
+        };
+        if existing.flair == flair {
+            return;
+        }
+        let metadata = ThreadMetadata {
+            flair,
+            ..existing.clone()
+        };
+        self.save(metadata, cx);
+    }
+
+    fn load_flairs(cx: &App) -> Vec<ThreadFlair> {
+        // The key-value store is shared by all tests in a process.
+        if cfg!(any(test, feature = "test-support")) {
+            return default_flairs();
+        }
+        let stored = KeyValueStore::global(cx)
+            .read_kvp(THREAD_FLAIRS_KEY)
+            .log_err()
+            .flatten()
+            .and_then(|json| {
+                serde_json::from_str::<Vec<ThreadFlair>>(&json)
+                    .context("deserialize thread flairs")
+                    .log_err()
+            });
+        match stored {
+            Some(flairs) => flairs,
+            None => default_flairs(),
+        }
+    }
+
+    fn persist_flairs(&self, cx: &App) {
+        if cfg!(any(test, feature = "test-support")) {
+            return;
+        }
+        let Some(json) = serde_json::to_string(&self.flairs)
+            .context("serialize thread flairs")
+            .log_err()
+        else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move { kvp.write_kvp(THREAD_FLAIRS_KEY.to_string(), json).await })
+            .detach_and_log_err(cx);
+    }
+
     fn save_internal(&mut self, metadata: ThreadMetadata, cx: &App) {
         // Route the write before caching, which changes whether the thread
         // counts as already persisted.
@@ -1897,6 +2079,8 @@ impl ThreadMetadataStore {
             pending_remote_writes: HashMap::default(),
             _persist_remote_state: None,
             _quit_subscription: cx.on_app_quit(Self::flush_remote_state_on_quit),
+            flairs: Self::load_flairs(cx),
+            pending_flairs: HashMap::default(),
         };
         this.load_remote_state(cx);
         if let Some(thread_store) = ThreadStore::try_global(cx) {
@@ -1993,6 +2177,9 @@ impl ThreadMetadataStore {
             .unwrap_or(worktree_paths.is_empty());
 
         let was_draft = existing_thread.map_or(true, |t| t.is_draft());
+        let flair = existing_thread
+            .and_then(|t| t.flair.clone())
+            .or_else(|| self.pending_flairs.remove(&thread_id));
         if was_draft && !is_draft {
             // Draft has been promoted: drop its persisted prompt since the
             // promoted thread now owns its prompt state via the native
@@ -2012,6 +2199,7 @@ impl ThreadMetadataStore {
             worktree_paths,
             remote_connection,
             archived,
+            flair,
         };
 
         self.save(metadata, cx);
@@ -2124,6 +2312,9 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            ALTER TABLE sidebar_threads ADD COLUMN flair TEXT;
+        ),
     ];
 }
 
@@ -2140,7 +2331,7 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override \
+        main_worktree_paths_order, remote_connection, title_override, flair \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -2191,12 +2382,13 @@ impl ThreadMetadataDb {
             .transpose()
             .context("serialize thread metadata remote connection")?;
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
+        let flair = row.flair.as_ref().map(|flair| flair.0.to_string());
         let thread_id = row.thread_id;
         let archived = row.archived;
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, flair) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -2210,7 +2402,8 @@ impl ThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
+                           title_override = excluded.title_override, \
+                           flair = excluded.flair";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -2225,7 +2418,8 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
+            i = stmt.bind(&title_override, i)?;
+            stmt.bind(&flair, i)?;
             stmt.exec()
         })
         .await
@@ -2383,6 +2577,7 @@ impl Column for ThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (flair, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -2449,10 +2644,17 @@ impl Column for ThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 archived,
+                flair: flair_from_column(flair),
             },
             next,
         ))
     }
+}
+
+fn flair_from_column(flair: Option<String>) -> Option<ThreadFlairId> {
+    flair
+        .filter(|flair| !flair.is_empty())
+        .map(|flair| ThreadFlairId(flair.into()))
 }
 
 /// Converts metadata to the form it is stored in on a remote host. Mirrors
@@ -2498,6 +2700,7 @@ fn metadata_to_proto(metadata: &ThreadMetadata) -> proto::AgentThreadMetadata {
             .title_override
             .as_ref()
             .map(|title| title.to_string()),
+        flair: metadata.flair.as_ref().map(|flair| flair.0.to_string()),
     }
 }
 
@@ -2553,6 +2756,7 @@ fn metadata_from_proto(row: proto::AgentThreadMetadata) -> anyhow::Result<Thread
         worktree_paths,
         remote_connection: None,
         archived: row.archived,
+        flair: flair_from_column(row.flair),
     })
 }
 
@@ -2640,6 +2844,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             remote_connection: None,
+            flair: None,
         }
     }
 
@@ -2934,6 +3139,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&second_paths),
             remote_connection: None,
             archived: false,
+            flair: None,
         };
 
         cx.update(|cx| {
@@ -3019,6 +3225,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_a_paths),
             remote_connection: None,
             archived: false,
+            flair: None,
         };
 
         cx.update(|cx| {
@@ -3145,6 +3352,7 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_paths),
             remote_connection: None,
             archived: false,
+            flair: None,
         };
 
         cx.update(|cx| {
@@ -4046,6 +4254,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths.clone(),
             remote_connection: None,
+            flair: None,
         };
 
         let remote_linked_thread = ThreadMetadata {
@@ -4060,6 +4269,7 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths,
             remote_connection: Some(remote_a.clone()),
+            flair: None,
         };
 
         cx.update(|cx| {

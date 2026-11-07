@@ -1,3 +1,4 @@
+mod flair_modal;
 pub mod mobile;
 mod thread_switcher;
 
@@ -10,7 +11,8 @@ use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
-    ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
+    ThreadFlairId, ThreadMetadata, ThreadMetadataStore, WorktreePaths,
+    worktree_info_from_thread_paths,
 };
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
@@ -79,6 +81,7 @@ use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, OpenRecent};
 
 use zed_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
 
+use crate::flair_modal::{FlairModal, FlairModalTarget};
 use crate::thread_switcher::{
     ThreadSwitcher, ThreadSwitcherEntry, ThreadSwitcherEvent, ThreadSwitcherSelection,
     ThreadSwitcherTerminalEntry, ThreadSwitcherThreadEntry,
@@ -6260,8 +6263,16 @@ impl Sidebar {
                 .regenerating_titles
                 .contains(&thread.metadata.thread_id);
 
+        let flair_color = thread.metadata.flair.as_ref().and_then(|flair_id| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .flair(flair_id)?
+                .hsla()
+        });
+
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
+            .when_some(flair_color, |this, color| this.flair_color(color))
             .icon(icon)
             .when(is_draft, |this| {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
@@ -6439,6 +6450,7 @@ impl Sidebar {
         let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
         let can_open_as_markdown = thread.is_live || is_zed_thread;
         let folder_paths = thread.metadata.folder_paths().clone();
+        let current_flair = thread.metadata.flair.clone();
 
         right_click_menu(context_menu_id)
             .trigger(move |_, _, _| thread_item)
@@ -6454,6 +6466,9 @@ impl Sidebar {
                     let markdown_title = markdown_title.clone();
                     let rename_title = rename_title.clone();
                     let folder_paths = folder_paths.clone();
+                    let current_flair = current_flair.clone();
+                    let flair_modal_workspace =
+                        thread_workspace.clone().or_else(|| active_workspace.clone());
                     ContextMenu::build(_window, cx, move |mut menu, _window, _cx| {
                         menu = menu.entry("Rename Title", None, {
                             let sidebar = sidebar.clone();
@@ -6533,6 +6548,18 @@ impl Sidebar {
                             });
                         }
 
+                        menu = menu.separator().submenu("Flair", {
+                            move |menu, _window, cx| {
+                                Self::build_flair_submenu(
+                                    menu,
+                                    thread_id,
+                                    current_flair.as_ref(),
+                                    flair_modal_workspace.clone(),
+                                    cx,
+                                )
+                            }
+                        });
+
                         menu.separator().entry("Archive Thread", None, {
                             let session_id = session_id.clone();
                             move |window, cx| {
@@ -6547,6 +6574,88 @@ impl Sidebar {
                 }
             })
             .into_any_element()
+    }
+
+    /// One toggleable entry per flair, a "None" entry, and a way to create a
+    /// flair (which is applied to the thread right away).
+    fn build_flair_submenu(
+        mut menu: ContextMenu,
+        thread_id: ThreadId,
+        current_flair: Option<&ThreadFlairId>,
+        modal_workspace: Option<Entity<Workspace>>,
+        cx: &App,
+    ) -> ContextMenu {
+        let store = ThreadMetadataStore::global(cx);
+        for flair in store.read(cx).flairs() {
+            let toggled = current_flair == Some(&flair.id);
+            let flair_id = flair.id.clone();
+            let store = store.clone();
+            let mut entry = ContextMenuEntry::new(flair.name.clone())
+                .toggle(IconPosition::Start, toggled)
+                .handler(move |_window, cx| {
+                    store.update(cx, |store, cx| {
+                        store.set_flair(thread_id, (!toggled).then(|| flair_id.clone()), cx);
+                    });
+                });
+            if let Some(color) = flair.hsla() {
+                entry = entry
+                    .icon(IconName::Circle)
+                    .icon_position(IconPosition::End)
+                    .icon_color(Color::Custom(color));
+            }
+            menu = menu.item(entry);
+        }
+        menu.toggleable_entry("None", current_flair.is_none(), IconPosition::Start, None, {
+            let store = store.clone();
+            move |_window, cx| {
+                store.update(cx, |store, cx| store.set_flair(thread_id, None, cx));
+            }
+        })
+        .separator()
+        .entry("New Flair…", None, {
+            let modal_workspace = modal_workspace.clone();
+            move |window, cx| {
+                Self::open_flair_modal(
+                    &modal_workspace,
+                    FlairModalTarget::Create { thread_id },
+                    window,
+                    cx,
+                );
+            }
+        })
+        .map(|mut menu| {
+            for flair in store.read(cx).flairs() {
+                let flair_id = flair.id.clone();
+                let modal_workspace = modal_workspace.clone();
+                menu = menu.entry(format!("Edit “{}”…", flair.name), None, move |window, cx| {
+                    Self::open_flair_modal(
+                        &modal_workspace,
+                        FlairModalTarget::Edit {
+                            flair_id: flair_id.clone(),
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            }
+            menu
+        })
+    }
+
+    fn open_flair_modal(
+        workspace: &Option<Entity<Workspace>>,
+        target: FlairModalTarget,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(workspace) = workspace else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                FlairModal::new(target, window, cx)
+            });
+        });
     }
 
     fn render_terminal(

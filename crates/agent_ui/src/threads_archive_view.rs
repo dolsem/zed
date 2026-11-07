@@ -742,8 +742,15 @@ impl ThreadsArchiveView {
                 );
 
                 let archived_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
+                let flair_color = thread.flair.as_ref().and_then(|flair_id| {
+                    ThreadMetadataStore::global(cx)
+                        .read(cx)
+                        .flair(flair_id)?
+                        .hsla()
+                });
 
                 let base = ThreadItem::new(id, thread.display_title())
+                    .when_some(flair_color, |this, color| this.flair_color(color))
                     .icon(icon)
                     .when(is_archived, |this| {
                         this.archived(true)

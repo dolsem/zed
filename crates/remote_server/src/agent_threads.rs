@@ -233,16 +233,21 @@ impl AgentThreadsHost {
         cx: AsyncApp,
     ) -> Result<proto::ListAgentThreadMetadataResponse> {
         let threads = Self::with_metadata_db(&this, &cx, |db| {
+            let flair_column = if has_flair_column(db)? {
+                "flair"
+            } else {
+                "NULL"
+            };
             // Threads the host itself opened over a remote connection belong to
             // other machines, so only the host's local threads are shared.
-            let rows = db.select::<ThreadMetadataRow>(
+            let rows = db.select::<ThreadMetadataRow>(&format!(
                 "SELECT thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, \
                  folder_paths, folder_paths_order, archived, main_worktree_paths, \
-                 main_worktree_paths_order, title_override \
+                 main_worktree_paths_order, title_override, {flair_column} \
                  FROM sidebar_threads \
                  WHERE remote_connection IS NULL AND thread_id IS NOT NULL \
-                 ORDER BY updated_at DESC",
-            )?()?;
+                 ORDER BY updated_at DESC"
+            ))?()?;
             Ok(rows.into_iter().map(|row| row.0).collect())
         })
         .await?;
@@ -260,24 +265,32 @@ impl AgentThreadsHost {
             .context("missing thread metadata")?;
         anyhow::ensure!(row.thread_id.len() == 16, "invalid thread id");
         Self::with_metadata_db(&this, &cx, move |db| {
+            let has_flair = has_flair_column(db)?;
+            let (flair_column, flair_value, flair_update) = if has_flair {
+                (", flair", ", ?14", ", flair = excluded.flair")
+            } else {
+                ("", "", "")
+            };
             let mut statement = Statement::prepare(
                 db,
-                "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13) \
-                 ON CONFLICT(thread_id) DO UPDATE SET \
-                     session_id = excluded.session_id, \
-                     agent_id = excluded.agent_id, \
-                     title = excluded.title, \
-                     updated_at = excluded.updated_at, \
-                     created_at = excluded.created_at, \
-                     interacted_at = excluded.interacted_at, \
-                     folder_paths = excluded.folder_paths, \
-                     folder_paths_order = excluded.folder_paths_order, \
-                     archived = excluded.archived, \
-                     main_worktree_paths = excluded.main_worktree_paths, \
-                     main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                     remote_connection = NULL, \
-                     title_override = excluded.title_override",
+                &format!(
+                    "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override{flair_column}) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13{flair_value}) \
+                     ON CONFLICT(thread_id) DO UPDATE SET \
+                         session_id = excluded.session_id, \
+                         agent_id = excluded.agent_id, \
+                         title = excluded.title, \
+                         updated_at = excluded.updated_at, \
+                         created_at = excluded.created_at, \
+                         interacted_at = excluded.interacted_at, \
+                         folder_paths = excluded.folder_paths, \
+                         folder_paths_order = excluded.folder_paths_order, \
+                         archived = excluded.archived, \
+                         main_worktree_paths = excluded.main_worktree_paths, \
+                         main_worktree_paths_order = excluded.main_worktree_paths_order, \
+                         remote_connection = NULL, \
+                         title_override = excluded.title_override{flair_update}"
+                ),
             )?;
             let mut i = statement.bind(&row.thread_id.as_slice(), 1)?;
             i = statement.bind(&row.session_id, i)?;
@@ -291,7 +304,10 @@ impl AgentThreadsHost {
             i = statement.bind(&row.archived, i)?;
             i = statement.bind(&row.main_worktree_paths, i)?;
             i = statement.bind(&row.main_worktree_paths_order, i)?;
-            statement.bind(&row.title_override, i)?;
+            i = statement.bind(&row.title_override, i)?;
+            if has_flair {
+                statement.bind(&row.flair, i)?;
+            }
             statement.exec()?;
             Ok(())
         })
@@ -521,6 +537,15 @@ fn open_metadata_db(in_memory: bool) -> Result<Connection> {
     Ok(connection)
 }
 
+/// Zed adds the `flair` column with a migration that only it may run, so a
+/// host whose Zed predates it is read and written without the column.
+fn has_flair_column(db: &Connection) -> Result<bool> {
+    Ok(db.select_row::<String>(
+        "SELECT name FROM pragma_table_info('sidebar_threads') WHERE name = 'flair'",
+    )?()?
+    .is_some())
+}
+
 struct ThreadSummaryRow(proto::AgentThreadSummary);
 
 impl Column for ThreadSummaryRow {
@@ -596,6 +621,7 @@ impl Column for ThreadMetadataRow {
         let (main_worktree_paths, next) = Column::column(statement, next)?;
         let (main_worktree_paths_order, next) = Column::column(statement, next)?;
         let (title_override, next) = Column::column(statement, next)?;
+        let (flair, next) = Column::column(statement, next)?;
         Ok((
             Self(proto::AgentThreadMetadata {
                 thread_id,
@@ -611,6 +637,7 @@ impl Column for ThreadMetadataRow {
                 main_worktree_paths,
                 main_worktree_paths_order,
                 title_override,
+                flair,
             }),
             next,
         ))

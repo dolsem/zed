@@ -477,6 +477,7 @@ async fn create_thread(
     };
     let thread_id =
         cx.update(|cx| agent_mobile::create_thread(&workspace, window.into(), &agent_id, cx))?;
+    cx.update(|cx| agent_mobile::set_thread_flair(thread_id, agent_mobile::MCP_FLAIR_ID, cx));
     let thread_key = thread_id.to_key_string();
     reporter.report(
         OperationEventKind::ThreadCreated {

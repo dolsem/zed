@@ -60,6 +60,7 @@ pub struct ThreadItem {
     worktrees: Vec<ThreadItemWorktreeInfo>,
     is_remote: bool,
     archived: bool,
+    flair_color: Option<Hsla>,
     on_click: Option<Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
     action_slot: Option<AnyElement>,
@@ -95,6 +96,7 @@ impl ThreadItem {
             worktrees: Vec::new(),
             is_remote: false,
             archived: false,
+            flair_color: None,
             on_click: None,
             on_hover: Box::new(|_, _, _| {}),
             action_slot: None,
@@ -206,6 +208,13 @@ impl ThreadItem {
 
     pub fn archived(mut self, archived: bool) -> Self {
         self.archived = archived;
+        self
+    }
+
+    /// Paints a thin colored line along the item's left edge, without
+    /// taking any space from the content.
+    pub fn flair_color(mut self, color: Hsla) -> Self {
+        self.flair_color = Some(color);
         self
     }
 
@@ -439,6 +448,18 @@ impl RenderOnce for ThreadItem {
             .hover(|s| s.bg(color.ghost_element_hover))
             .active(|s| s.bg(color.ghost_element_active))
             .on_hover(self.on_hover)
+            .when_some(self.flair_color, |this, flair_color| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(3.))
+                        .rounded_full()
+                        .bg(flair_color),
+                )
+            })
             .child(
                 h_flex()
                     .min_w_0()
@@ -948,6 +969,17 @@ impl Component for ThreadItem {
                             .added(15)
                             .removed(4)
                             .timestamp("8h"),
+                    )
+                    .into_any_element(),
+            ),
+            single_example(
+                "With Flair",
+                container()
+                    .child(
+                        ThreadItem::new("ti-6", "Thread started through the MCP API")
+                            .icon(IconName::AiClaude)
+                            .timestamp("4m")
+                            .flair_color(gpui::rgb(0xa855f7).into()),
                     )
                     .into_any_element(),
             ),

@@ -20,7 +20,10 @@ use workspace::{MultiWorkspace, Workspace};
 
 use crate::agent_panel::CreateThreadOptions;
 use crate::conversation_view::ThreadView;
+use crate::thread_metadata_store::{ThreadFlairId, ThreadMetadataStore};
 use crate::{Agent, AgentPanel, AgentThreadSource, ConversationView, ThreadId};
+
+pub use crate::thread_metadata_store::MCP_FLAIR_ID;
 
 pub const MODEL_CONTROL: &str = "model";
 pub const MODE_CONTROL: &str = "mode";
@@ -113,6 +116,19 @@ pub fn create_thread(
             )
         })
     })
+}
+
+/// Tags the thread with a flair, which the sidebar shows as a colored line.
+/// Works before the thread has any metadata, e.g. right after
+/// [`create_thread`].
+pub fn set_thread_flair(thread_id: ThreadId, flair_id: &str, cx: &mut App) {
+    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+        store.set_flair(
+            thread_id,
+            Some(ThreadFlairId(flair_id.to_string().into())),
+            cx,
+        );
+    });
 }
 
 pub fn thread_entries(conversation: &MobileConversation, cx: &App) -> Vec<api::ThreadEntry> {
