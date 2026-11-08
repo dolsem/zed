@@ -351,6 +351,12 @@ pub struct ThreadFlair {
     pub name: SharedString,
     /// `#rrggbb`
     pub color: SharedString,
+    /// Whether opening a thread with this flair only runs what the agent needs,
+    /// leaving indexing, git and language servers off until asked for. Flairs
+    /// saved before this existed have no value, which counts as on for the MCP
+    /// flair and off for the rest.
+    #[serde(default)]
+    pub lazy: Option<bool>,
 }
 
 impl ThreadFlair {
@@ -359,6 +365,10 @@ impl ThreadFlair {
             .ok()
             .map(gpui::Hsla::from)
     }
+
+    pub fn is_lazy(&self) -> bool {
+        self.lazy.unwrap_or(self.id.0.as_ref() == MCP_FLAIR_ID)
+    }
 }
 
 /// The flair applied to threads created through the HTTP/MCP API.
@@ -366,12 +376,14 @@ pub const MCP_FLAIR_ID: &str = "mcp";
 const MCP_FLAIR_COLOR: &str = "#a855f7";
 
 const THREAD_FLAIRS_KEY: &str = "thread-flairs";
+const DEFAULT_FLAIRS_KEY: &str = "worktree-default-flairs";
 
 fn default_flairs() -> Vec<ThreadFlair> {
     vec![ThreadFlair {
         id: ThreadFlairId(MCP_FLAIR_ID.into()),
         name: "MCP".into(),
         color: MCP_FLAIR_COLOR.into(),
+        lazy: Some(true),
     }]
 }
 
@@ -583,6 +595,9 @@ pub struct ThreadMetadataStore {
     /// API just created, whose session is still connecting); applied once
     /// the metadata is first written.
     pending_flairs: HashMap<ThreadId, ThreadFlairId>,
+    /// The flair new threads get in a worktree, keyed by the worktree's folder
+    /// paths. Chosen when the worktree is created.
+    default_flairs: HashMap<PathList, ThreadFlairId>,
 }
 
 /// The threads of remote hosts as last seen, so they can be listed before the
@@ -1400,6 +1415,7 @@ impl ThreadMetadataStore {
         &mut self,
         name: SharedString,
         color: SharedString,
+        lazy: bool,
         cx: &mut Context<Self>,
     ) -> ThreadFlairId {
         let id = ThreadFlairId::new();
@@ -1407,6 +1423,7 @@ impl ThreadMetadataStore {
             id: id.clone(),
             name,
             color,
+            lazy: Some(lazy),
         });
         self.persist_flairs(cx);
         cx.notify();
@@ -1418,6 +1435,7 @@ impl ThreadMetadataStore {
         id: &ThreadFlairId,
         name: SharedString,
         color: SharedString,
+        lazy: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(flair) = self.flairs.iter_mut().find(|flair| &flair.id == id) else {
@@ -1425,6 +1443,7 @@ impl ThreadMetadataStore {
         };
         flair.name = name;
         flair.color = color;
+        flair.lazy = Some(lazy);
         self.persist_flairs(cx);
         cx.notify();
     }
@@ -1437,6 +1456,10 @@ impl ThreadMetadataStore {
         }
         self.flairs.retain(|flair| &flair.id != id);
         self.pending_flairs.retain(|_, pending| pending != id);
+        if self.default_flairs.values().any(|default| default == id) {
+            self.default_flairs.retain(|_, default| default != id);
+            self.persist_default_flairs(cx);
+        }
         let tagged = self
             .threads
             .values()
@@ -1477,6 +1500,67 @@ impl ThreadMetadataStore {
             ..existing.clone()
         };
         self.save(metadata, cx);
+    }
+
+    /// The flair new threads in the worktree with these folder paths get.
+    pub fn default_flair(&self, folder_paths: &PathList) -> Option<&ThreadFlair> {
+        self.flair(self.default_flairs.get(folder_paths)?)
+    }
+
+    pub fn set_default_flair(
+        &mut self,
+        folder_paths: PathList,
+        flair: Option<ThreadFlairId>,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = match flair {
+            Some(flair) => self.default_flairs.insert(folder_paths, flair.clone()) != Some(flair),
+            None => self.default_flairs.remove(&folder_paths).is_some(),
+        };
+        if changed {
+            self.persist_default_flairs(cx);
+            cx.notify();
+        }
+    }
+
+    fn load_default_flairs(cx: &App) -> HashMap<PathList, ThreadFlairId> {
+        // The key-value store is shared by all tests in a process.
+        if cfg!(any(test, feature = "test-support")) {
+            return HashMap::default();
+        }
+        KeyValueStore::global(cx)
+            .read_kvp(DEFAULT_FLAIRS_KEY)
+            .log_err()
+            .flatten()
+            .and_then(|json| {
+                serde_json::from_str::<Vec<(Vec<std::path::PathBuf>, ThreadFlairId)>>(&json)
+                    .context("deserialize worktree default flairs")
+                    .log_err()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(paths, flair)| (PathList::new(&paths), flair))
+            .collect()
+    }
+
+    fn persist_default_flairs(&self, cx: &App) {
+        if cfg!(any(test, feature = "test-support")) {
+            return;
+        }
+        let entries = self
+            .default_flairs
+            .iter()
+            .map(|(paths, flair)| (paths.paths(), flair))
+            .collect::<Vec<_>>();
+        let Some(json) = serde_json::to_string(&entries)
+            .context("serialize worktree default flairs")
+            .log_err()
+        else {
+            return;
+        };
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move { kvp.write_kvp(DEFAULT_FLAIRS_KEY.to_string(), json).await })
+            .detach_and_log_err(cx);
     }
 
     fn load_flairs(cx: &App) -> Vec<ThreadFlair> {
@@ -2081,6 +2165,7 @@ impl ThreadMetadataStore {
             _quit_subscription: cx.on_app_quit(Self::flush_remote_state_on_quit),
             flairs: Self::load_flairs(cx),
             pending_flairs: HashMap::default(),
+            default_flairs: Self::load_default_flairs(cx),
         };
         this.load_remote_state(cx);
         if let Some(thread_store) = ThreadStore::try_global(cx) {
@@ -2177,9 +2262,20 @@ impl ThreadMetadataStore {
             .unwrap_or(worktree_paths.is_empty());
 
         let was_draft = existing_thread.map_or(true, |t| t.is_draft());
+        let is_first_write = existing_thread.is_none();
         let flair = existing_thread
             .and_then(|t| t.flair.clone())
-            .or_else(|| self.pending_flairs.remove(&thread_id));
+            .or_else(|| self.pending_flairs.remove(&thread_id))
+            // Only a thread's first write takes the worktree's default, so
+            // clearing a thread's flair later sticks.
+            .or_else(|| {
+                if !is_first_write {
+                    return None;
+                }
+                self.default_flairs
+                    .get(worktree_paths.folder_path_list())
+                    .cloned()
+            });
         if was_draft && !is_draft {
             // Draft has been promoted: drop its persisted prompt since the
             // promoted thread now owns its prompt state via the native

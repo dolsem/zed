@@ -132,6 +132,11 @@ impl AgentTool for FindPathTool {
                 error: e.to_string(),
             })?;
 
+            // A project that only runs what the agent needs hasn't read its files yet.
+            project
+                .update(cx, |project, cx| project.scan_files(cx))
+                .await;
+
             let search_paths_task = cx.update(|cx| search_paths(&input.glob, project, cx));
 
             let matches = futures::select! {

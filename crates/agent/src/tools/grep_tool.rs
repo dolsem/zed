@@ -129,6 +129,11 @@ impl AgentTool for GrepTool {
                 .await
                 .map_err(|e| e.to_string())?;
 
+            // A project that only runs what the agent needs hasn't read its files yet.
+            project
+                .update(cx, |project, cx| project.scan_files(cx))
+                .await;
+
             let results = cx.update(|cx| {
                 let path_style = project.read(cx).path_style(cx);
 

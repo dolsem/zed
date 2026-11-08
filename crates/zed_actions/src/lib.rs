@@ -79,6 +79,8 @@ actions!(
         OpenTelemetryLog,
         /// Opens the performance profiler.
         OpenPerformanceProfiler,
+        /// Opens the resource manager, which lists what each worktree is running.
+        OpenResourceManager,
         /// Opens the onboarding view.
         OpenOnboarding,
         /// Shows the auto-update notification for testing.
@@ -324,6 +326,29 @@ pub struct CreateWorktree {
     /// When this is None, Zed will randomly generate a worktree name.
     pub worktree_name: Option<String>,
     pub branch_target: NewWorktreeBranchTarget,
+    /// Opens the new worktree running only what the agent needs: no indexing, git
+    /// or language servers until they are asked for.
+    #[serde(default)]
+    pub lightweight: bool,
+}
+
+/// Opens the dialog for creating a new git worktree, where the base, the name and
+/// the flair of the worktree's threads are chosen.
+/// Dispatched by the unified worktree picker when the user selects a "Create new worktree" entry.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCreateWorktreeDialog {
+    /// Name the dialog starts with. When this is None, a random one is generated.
+    #[serde(default)]
+    pub worktree_name: Option<String>,
+    /// The base the dialog starts with.
+    #[serde(default)]
+    pub branch_target: NewWorktreeBranchTarget,
+    /// The remote default branch to offer as a base next to the current branch,
+    /// as `remote/branch`.
+    #[serde(default)]
+    pub default_branch: Option<String>,
 }
 
 /// Switches the workspace to an existing linked worktree.

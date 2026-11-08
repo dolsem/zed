@@ -1809,6 +1809,108 @@ async fn test_is_server_enabled(cx: &mut TestAppContext) {
     })
 }
 
+#[gpui::test]
+async fn test_user_settings_servers_are_shared_between_projects(cx: &mut TestAppContext) {
+    let server_id = ContextServerId("shared-mcp".into());
+
+    let (fs, first_project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let second_project = Project::test(fs.clone(), [path!("/test").as_ref()], cx).await;
+
+    let created_servers = Rc::new(RefCell::new(0));
+    let executor = cx.executor();
+    let app_wide = cx.update(|cx| ContextServerStore::app_wide(fs.clone(), cx));
+    app_wide.update(cx, |store, _| {
+        let created_servers = created_servers.clone();
+        store.set_context_server_factory(Box::new(move |id, _| {
+            *created_servers.borrow_mut() += 1;
+            Arc::new(ContextServer::new(
+                id.clone(),
+                Arc::new(create_fake_transport(id.0.to_string(), executor.clone())),
+            ))
+        }));
+    });
+
+    set_context_server_configuration(
+        vec![(
+            server_id.0.clone(),
+            settings::ContextServerSettingsContent::Stdio {
+                enabled: true,
+                remote: false,
+                command: ContextServerCommand {
+                    path: "somebinary".into(),
+                    args: vec![],
+                    env: None,
+                    timeout: None,
+                },
+            },
+        )],
+        cx,
+    );
+    cx.run_until_parked();
+
+    let first_store = first_project.read_with(cx, |project, _| project.context_server_store());
+    let second_store = second_project.read_with(cx, |project, _| project.context_server_store());
+
+    assert_eq!(*created_servers.borrow(), 1);
+    let first_server = first_store.read_with(cx, |store, _| store.get_running_server(&server_id));
+    let second_server = second_store.read_with(cx, |store, _| store.get_running_server(&server_id));
+    let (first_server, second_server) = (
+        first_server.expect("first project should see the server running"),
+        second_server.expect("second project should see the server running"),
+    );
+    assert!(Arc::ptr_eq(&first_server, &second_server));
+
+    first_store.update(cx, |store, cx| {
+        store.stop_server(&server_id, cx).unwrap();
+    });
+    cx.run_until_parked();
+
+    for store in [&first_store, &second_store] {
+        store.read_with(cx, |store, _| {
+            assert_eq!(
+                store.status_for_server(&server_id),
+                Some(ContextServerStatus::Stopped)
+            );
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_project_override_of_user_server_is_not_shared(cx: &mut TestAppContext) {
+    let server_id = ContextServerId("overridden-mcp".into());
+
+    let (fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let executor = cx.executor();
+    let app_wide = cx.update(|cx| ContextServerStore::app_wide(fs.clone(), cx));
+    let created_servers = Rc::new(RefCell::new(0));
+    app_wide.update(cx, |store, _| {
+        let created_servers = created_servers.clone();
+        store.set_context_server_factory(Box::new(move |id, _| {
+            *created_servers.borrow_mut() += 1;
+            Arc::new(ContextServer::new(
+                id.clone(),
+                Arc::new(create_fake_transport(id.0.to_string(), executor.clone())),
+            ))
+        }));
+    });
+
+    // An extension server depends on the project's worktrees, so it stays with the project.
+    let descriptor = Arc::new(FakeContextServerDescriptor::new(server_id.0.to_string()));
+    let store = project.read_with(cx, |project, _| project.context_server_store());
+    store.update(cx, |store, cx| {
+        store.registry().update(cx, |registry, cx| {
+            registry.register_context_server_descriptor(server_id.0.clone(), descriptor, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        *created_servers.borrow(),
+        0,
+        "extension servers must not be created by the app-wide store"
+    );
+}
+
 fn assert_server_events(
     store: &Entity<ContextServerStore>,
     expected_events: Vec<(ContextServerId, ContextServerStatus)>,

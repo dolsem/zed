@@ -131,6 +131,42 @@ pub fn set_thread_flair(thread_id: ThreadId, flair_id: &str, cx: &mut App) {
     });
 }
 
+/// Whether threads with this flair only run what the agent needs.
+pub fn flair_is_lazy(flair_id: &str, cx: &App) -> bool {
+    ThreadMetadataStore::global(cx)
+        .read(cx)
+        .flair(&ThreadFlairId(flair_id.to_string().into()))
+        .is_some_and(|flair| flair.is_lazy())
+}
+
+/// Makes `flair_id` the flair new threads get in the workspace's worktree.
+pub fn set_default_flair(workspace: &Entity<Workspace>, flair_id: &str, cx: &mut App) {
+    let folder_paths = workspace
+        .read(cx)
+        .project()
+        .read(cx)
+        .worktree_paths(cx)
+        .folder_path_list()
+        .clone();
+    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+        store.set_default_flair(
+            folder_paths,
+            Some(ThreadFlairId(flair_id.to_string().into())),
+            cx,
+        );
+    });
+}
+
+/// The flair new threads get in the workspace's worktree, if one was chosen.
+pub fn default_flair_id(workspace: &Entity<Workspace>, cx: &App) -> Option<String> {
+    let project = workspace.read(cx).project().read(cx);
+    let worktree_paths = project.worktree_paths(cx);
+    ThreadMetadataStore::global(cx)
+        .read(cx)
+        .default_flair(worktree_paths.folder_path_list())
+        .map(|flair| flair.id.0.to_string())
+}
+
 pub fn thread_entries(conversation: &MobileConversation, cx: &App) -> Vec<api::ThreadEntry> {
     let Some(thread) = conversation.thread(cx) else {
         return Vec::new();

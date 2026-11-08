@@ -1,0 +1,27 @@
+[package]
+name = "resource_manager"
+version = "0.1.0"
+publish.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/resource_manager.rs"
+test = false
+doctest = false
+
+[dependencies]
+agent_ui.workspace = true
+gpui.workspace = true
+project.workspace = true
+sysinfo.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

@@ -1,3 +1,6 @@
+mod create_worktree_modal;
+
+pub use create_worktree_modal::handle_open_create_worktree_dialog;
 mod flair_modal;
 pub mod mobile;
 mod thread_switcher;
@@ -75,9 +78,9 @@ use workspace::{
     ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
 };
 
-use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
+use git_ui_core::worktree_service::RemoteBranchName;
 use zed_actions::editor::{MoveDown, MoveUp};
-use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, OpenRecent};
+use zed_actions::OpenRecent;
 
 use zed_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
 
@@ -740,28 +743,6 @@ fn connect_remote(
 enum DefaultBranchCache {
     Pending,
     Resolved(Option<RemoteBranchName>),
-}
-
-// Mirrors the behavior of the worktree picker's "Create new worktree" entries.
-fn create_worktree_in_workspace(
-    workspace: &Entity<Workspace>,
-    branch_target: NewWorktreeBranchTarget,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    workspace.update(cx, |workspace, cx| {
-        let focused_dock = workspace.focused_dock_position(window, cx);
-        git_ui_core::worktree_service::handle_create_worktree(
-            workspace,
-            &CreateWorktree {
-                worktree_name: None,
-                branch_target,
-            },
-            window,
-            focused_dock,
-            cx,
-        );
-    });
 }
 
 /// The sidebar re-derives its entire entry list from scratch on every
@@ -2695,10 +2676,21 @@ impl Sidebar {
                         );
                     }
 
+                    // A workspace that only runs what the agent needs has no git
+                    // repositories to base a worktree on, so prefer one that does.
+                    let has_git = |workspace: &Entity<Workspace>| {
+                        workspace
+                            .read(cx)
+                            .project()
+                            .read(cx)
+                            .resource_mode(cx)
+                            .tracks_git()
+                    };
                     let base_workspace = active_workspace
                         .as_ref()
-                        .filter(|workspace| open_workspaces.contains(workspace))
+                        .filter(|workspace| open_workspaces.contains(workspace) && has_git(workspace))
                         .cloned()
+                        .or_else(|| open_workspaces.iter().find(|w| has_git(w)).cloned())
                         .or_else(|| open_workspaces.first().cloned());
 
                     // Only offer worktree creation when the base project can
@@ -2710,22 +2702,11 @@ impl Sidebar {
                     });
 
                     if let Some(base_workspace) = base_workspace.filter(|_| !creation_blocked) {
-                        menu = menu.separator().submenu("Create New Worktree…", {
+                        menu = menu.separator().entry("Create New Worktree…", None, {
                             let this = this.clone();
-                            move |mut submenu, _window, submenu_cx| {
-                                let project = base_workspace.read(submenu_cx).project().clone();
-                                let project_ref = project.read(submenu_cx);
-                                let has_multiple_repositories =
-                                    project_ref.repositories(submenu_cx).len() > 1;
-                                let current_branch =
-                                    project_ref.active_repository(submenu_cx).and_then(|repo| {
-                                        repo.read(submenu_cx)
-                                            .branch
-                                            .as_ref()
-                                            .map(|branch| branch.name().to_string())
-                                    });
+                            move |window, cx| {
                                 let default_branch = this
-                                    .read_with(submenu_cx, |sidebar, _| {
+                                    .read_with(cx, |sidebar, _| {
                                         match sidebar.worktree_default_branches.get(&key) {
                                             Some(DefaultBranchCache::Resolved(branch)) => {
                                                 branch.clone()
@@ -2735,33 +2716,14 @@ impl Sidebar {
                                     })
                                     .ok()
                                     .flatten();
-
-                                let targets = worktree_create_targets(
-                                    has_multiple_repositories,
+                                create_worktree_modal::open_for_workspace(
+                                    &base_workspace,
                                     default_branch,
-                                    current_branch.as_deref(),
+                                    None,
+                                    None,
+                                    window,
+                                    cx,
                                 );
-                                for target in targets {
-                                    let label = format!(
-                                        "Based on {}",
-                                        target.branch_label(
-                                            has_multiple_repositories,
-                                            current_branch.as_deref(),
-                                        )
-                                    );
-                                    let branch_target = target.branch_target();
-                                    let workspace = base_workspace.clone();
-                                    submenu = submenu.entry(label, None, move |window, cx| {
-                                        create_worktree_in_workspace(
-                                            &workspace,
-                                            branch_target.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }
-
-                                submenu
                             }
                         });
                     }
@@ -3959,6 +3921,30 @@ impl Sidebar {
             })
     }
 
+    fn thread_is_lazy(thread_id: ThreadId, cx: &App) -> bool {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .thread_flair(thread_id)
+            .is_some_and(|flair| flair.is_lazy())
+    }
+
+    /// Opening a thread whose flair isn't lazy brings its workspace up to full
+    /// strength. Opening a lazy one never takes anything away, so that switching
+    /// between threads doesn't churn the background work; shutting it down again
+    /// is up to the resource manager.
+    fn apply_thread_resource_mode(
+        workspace: &Entity<Workspace>,
+        thread_id: ThreadId,
+        cx: &mut App,
+    ) {
+        if Self::thread_is_lazy(thread_id, cx) {
+            return;
+        }
+        workspace.read(cx).project().clone().update(cx, |project, cx| {
+            project.set_resource_mode(project::ResourceMode::Full, cx);
+        });
+    }
+
     fn activate_thread_locally(
         &mut self,
         metadata: &ThreadMetadata,
@@ -3970,6 +3956,7 @@ impl Sidebar {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
+        Self::apply_thread_resource_mode(workspace, metadata.thread_id, cx);
 
         if self.is_thread_active_in_workspace(&metadata.thread_id, workspace, cx) {
             workspace.update(cx, |workspace, cx| {
@@ -4012,6 +3999,7 @@ impl Sidebar {
         let metadata_thread_id = metadata.thread_id;
         let workspace_for_entry = workspace.clone();
 
+        Self::apply_thread_resource_mode(&workspace, metadata_thread_id, cx);
         let activated = target_window
             .update(cx, |multi_workspace, window, cx| {
                 window.activate_window();
@@ -4092,6 +4080,15 @@ impl Sidebar {
         let active_workspace = multi_workspace.read(cx).workspace().clone();
         let modal_workspace = active_workspace.clone();
 
+        if Self::thread_is_lazy(pending_thread_id, cx) {
+            project::ResourceModeRequests::request(
+                &folder_paths,
+                project::ResourceMode::AgentOnly,
+                cx,
+            );
+        }
+        let requested_paths = folder_paths.clone();
+
         let open_task = multi_workspace.update(cx, |this, cx| {
             this.find_or_create_workspace(
                 folder_paths,
@@ -4108,6 +4105,12 @@ impl Sidebar {
 
         cx.spawn_in(window, async move |this, cx| {
             let result = open_task.await;
+            // Creating the workspace takes the request; this drops one that was
+            // never used, e.g. because the workspace was already open.
+            cx.update(|_window, cx| {
+                project::ResourceModeRequests::take(&requested_paths, cx);
+            })
+            .ok();
             // Dismiss the modal as soon as the open attempt completes so
             // failures or cancellations do not leave a stale connection modal behind.
             remote_connection::dismiss_connection_modal(&modal_workspace, cx);

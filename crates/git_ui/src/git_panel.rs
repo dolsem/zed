@@ -9395,6 +9395,10 @@ impl Panel for GitPanel {
         "GitPanel"
     }
 
+    fn required_resource_mode(&self) -> project::ResourceMode {
+        project::ResourceMode::Git
+    }
+
     fn panel_key() -> &'static str {
         GIT_PANEL_KEY
     }

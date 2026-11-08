@@ -298,26 +298,84 @@ async fn create_worktree(
     branch: Option<String>,
     cx: &mut AsyncApp,
 ) -> Result<(Entity<Workspace>, rest::CreatedWorktree)> {
-    let source = match workspaces.first() {
-        Some(workspace) => workspace.clone(),
+    // A worktree is based on a git repository, which a workspace that only runs what
+    // the agent needs doesn't have. Prefer one that does.
+    let preferred = cx.update(|cx| {
+        workspaces
+            .iter()
+            .find(|workspace| {
+                workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .resource_mode(cx)
+                    .tracks_git()
+            })
+            .or(workspaces.first())
+            .cloned()
+    });
+    let source = match preferred {
+        Some(workspace) => workspace,
         None => {
             reporter.step(OperationStep::OpeningProject, "Opening the project", cx);
             cx.update(|cx| find_or_open_workspace(window, key.clone(), key.path_list().clone(), cx))
                 .await?
         }
     };
+    let turned_on_git = cx.update(|cx| {
+        source.update(cx, |workspace, cx| {
+            workspace.project().update(cx, |project, cx| {
+                let agent_only = !project.resource_mode(cx).tracks_git();
+                if agent_only {
+                    // Git is all a worktree needs; language servers stay off.
+                    project.set_resource_mode(project::ResourceMode::Git, cx);
+                }
+                agent_only
+            })
+        })
+    });
+    if turned_on_git {
+        reporter.step(
+            OperationStep::OpeningProject,
+            "Turning on git for the project",
+            cx,
+        );
+        source
+            .update(cx, |workspace, cx| {
+                workspace.project().read(cx).wait_for_initial_scan(cx)
+            })
+            .await;
+        source
+            .update(cx, |workspace, cx| {
+                let repositories = workspace
+                    .project()
+                    .read(cx)
+                    .repositories(cx)
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                futures::future::join_all(
+                    repositories
+                        .into_iter()
+                        .map(|repository| repository.update(cx, |repository, _| repository.barrier())),
+                )
+            })
+            .await;
+    }
 
     reporter.step(
         OperationStep::CreatingWorktree,
         "Creating the git worktree",
         cx,
     );
+    let lightweight = cx.update(|cx| agent_mobile::flair_is_lazy(agent_mobile::MCP_FLAIR_ID, cx));
     let action = zed_actions::CreateWorktree {
         worktree_name: name.filter(|name| !name.trim().is_empty()),
         branch_target: match branch {
             Some(name) => zed_actions::NewWorktreeBranchTarget::ExistingBranch { name },
             None => zed_actions::NewWorktreeBranchTarget::CurrentBranch,
         },
+        lightweight,
     };
     let (hook_sender, mut hook_events) = futures::channel::mpsc::unbounded();
     let on_hook_event: WorktreeHookEventHandler = Rc::new(move |event, _| {
@@ -339,6 +397,7 @@ async fn create_worktree(
     })?;
     let created = creation.await.context("failed to create the worktree")?;
     let workspace = created.workspace.clone();
+    cx.update(|cx| agent_mobile::set_default_flair(&workspace, agent_mobile::MCP_FLAIR_ID, cx));
     let worktree = cx.update(|cx| rest::CreatedWorktree {
         paths: workspace_paths(&workspace, cx),
         branch: workspace
@@ -477,7 +536,11 @@ async fn create_thread(
     };
     let thread_id =
         cx.update(|cx| agent_mobile::create_thread(&workspace, window.into(), &agent_id, cx))?;
-    cx.update(|cx| agent_mobile::set_thread_flair(thread_id, agent_mobile::MCP_FLAIR_ID, cx));
+    cx.update(|cx| {
+        let flair_id = agent_mobile::default_flair_id(&workspace, cx)
+            .unwrap_or_else(|| agent_mobile::MCP_FLAIR_ID.to_string());
+        agent_mobile::set_thread_flair(thread_id, &flair_id, cx)
+    });
     let thread_key = thread_id.to_key_string();
     reporter.report(
         OperationEventKind::ThreadCreated {

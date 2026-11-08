@@ -12,9 +12,11 @@ use context_server::transport::HttpTransport;
 use context_server::{ContextServer, ContextServerCommand, ContextServerId};
 use credentials_provider::CredentialsProvider;
 use futures::future::Either;
+use fs::Fs;
 use futures::{FutureExt as _, StreamExt as _, future::join_all};
 use gpui::{
-    App, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, TaskExt, WeakEntity, actions,
+    App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Global, Subscription, Task,
+    TaskExt, WeakEntity, actions,
 };
 use http_client::HttpClient;
 use itertools::Itertools;
@@ -28,7 +30,7 @@ use util::{ResultExt as _, rel_path::RelPath};
 use crate::{
     DisableAiSettings, Project,
     project_settings::{ContextServerSettings, OAuthClientSettings, ProjectSettings},
-    worktree_store::{WorktreeStore, WorktreeStoreEvent},
+    worktree_store::{WorktreeIdCounter, WorktreeStore, WorktreeStoreEvent},
 };
 
 /// Maximum timeout for context server requests
@@ -152,6 +154,76 @@ impl ContextServerState {
             | ContextServerState::AuthRequired { configuration, .. }
             | ContextServerState::ClientSecretRequired { configuration, .. }
             | ContextServerState::Authenticating { configuration, .. } => configuration.clone(),
+        }
+    }
+
+    /// A copy of this state for a project store that mirrors a server owned by the
+    /// app-wide store. The tasks stay with the owner, which drives every transition.
+    fn mirror(&self) -> ContextServerState {
+        match self {
+            ContextServerState::Starting {
+                server,
+                configuration,
+                ..
+            } => ContextServerState::Starting {
+                server: server.clone(),
+                configuration: configuration.clone(),
+                _task: Task::ready(()),
+            },
+            ContextServerState::Running {
+                server,
+                configuration,
+                ..
+            } => ContextServerState::Running {
+                server: server.clone(),
+                configuration: configuration.clone(),
+                _transport_watch: Task::ready(()),
+            },
+            ContextServerState::Stopped {
+                server,
+                configuration,
+            } => ContextServerState::Stopped {
+                server: server.clone(),
+                configuration: configuration.clone(),
+            },
+            ContextServerState::Error {
+                server,
+                configuration,
+                error,
+            } => ContextServerState::Error {
+                server: server.clone(),
+                configuration: configuration.clone(),
+                error: error.clone(),
+            },
+            ContextServerState::AuthRequired {
+                server,
+                configuration,
+                discovery,
+            } => ContextServerState::AuthRequired {
+                server: server.clone(),
+                configuration: configuration.clone(),
+                discovery: discovery.clone(),
+            },
+            ContextServerState::ClientSecretRequired {
+                server,
+                configuration,
+                discovery,
+                error,
+            } => ContextServerState::ClientSecretRequired {
+                server: server.clone(),
+                configuration: configuration.clone(),
+                discovery: discovery.clone(),
+                error: error.clone(),
+            },
+            ContextServerState::Authenticating {
+                server,
+                configuration,
+                ..
+            } => ContextServerState::Authenticating {
+                server: server.clone(),
+                configuration: configuration.clone(),
+                _task: Task::ready(()),
+            },
         }
     }
 }
@@ -286,7 +358,52 @@ struct ContextServerSettingsEntry {
     settings: ContextServerSettings,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreScope {
+    Project,
+    /// The single store shared by every project in the app. It runs the stdio and
+    /// HTTP servers from user settings once, however many projects are open.
+    AppWide,
+}
+
+struct GlobalAppWideContextServerStore(Entity<ContextServerStore>);
+
+impl Global for GlobalAppWideContextServerStore {}
+
+/// Only servers that don't depend on a particular project can be shared: extension
+/// servers resolve their command from the project's worktrees, and remote servers
+/// run on the remote host.
+fn is_shareable(settings: &ContextServerSettings) -> bool {
+    match settings {
+        ContextServerSettings::Stdio { remote, .. } => !remote,
+        ContextServerSettings::Http { .. } => true,
+        ContextServerSettings::Extension { .. } => false,
+    }
+}
+
+fn shareable_user_settings(cx: &App) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
+    ProjectSettings::get_global(cx)
+        .context_servers
+        .iter()
+        .filter(|(_, settings)| is_shareable(settings))
+        .map(|(id, settings)| {
+            (
+                id.clone(),
+                ContextServerSettingsEntry {
+                    worktree_id: None,
+                    settings: settings.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
 pub struct ContextServerStore {
+    scope: StoreScope,
+    /// The app-wide store this project store delegates shareable servers to.
+    app_wide: Option<Entity<ContextServerStore>>,
+    /// Servers in `servers` that are mirrors of `app_wide`'s rather than owned here.
+    app_wide_server_ids: HashSet<Arc<str>>,
     state: ContextServerStoreState,
     context_server_settings: HashMap<Arc<str>, ContextServerSettingsEntry>,
     servers: HashMap<ContextServerId, ContextServerState>,
@@ -316,10 +433,41 @@ pub struct ServerStatusChangedEvent {
 impl EventEmitter<ServerStatusChangedEvent> for ContextServerStore {}
 
 impl ContextServerStore {
+    /// The store that runs shareable servers for every project in the app, created
+    /// on first use.
+    pub fn app_wide(fs: Arc<dyn Fs>, cx: &mut App) -> Entity<Self> {
+        if let Some(global) = cx.try_global::<GlobalAppWideContextServerStore>() {
+            return global.0.clone();
+        }
+        // The store is a project store without a project: it never has worktrees,
+        // which is what keeps its servers independent of any one project.
+        let worktree_store =
+            cx.new(|cx| WorktreeStore::local(false, fs, WorktreeIdCounter::get(cx)));
+        let store = cx.new(|cx| {
+            Self::new_internal(
+                true,
+                None,
+                ContextServerDescriptorRegistry::default_global(cx),
+                worktree_store,
+                None,
+                ContextServerStoreState::Local {
+                    downstream_client: None,
+                    is_headless: false,
+                },
+                StoreScope::AppWide,
+                None,
+                cx,
+            )
+        });
+        cx.set_global(GlobalAppWideContextServerStore(store.clone()));
+        store
+    }
+
     pub fn local(
         worktree_store: Entity<WorktreeStore>,
         weak_project: Option<WeakEntity<Project>>,
         headless: bool,
+        app_wide: Option<Entity<Self>>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_internal(
@@ -332,6 +480,8 @@ impl ContextServerStore {
                 downstream_client: None,
                 is_headless: headless,
             },
+            StoreScope::Project,
+            app_wide,
             cx,
         )
     }
@@ -353,6 +503,8 @@ impl ContextServerStore {
                 project_id,
                 upstream_client,
             },
+            StoreScope::Project,
+            None,
             cx,
         )
     }
@@ -400,6 +552,8 @@ impl ContextServerStore {
                 downstream_client: None,
                 is_headless: false,
             },
+            StoreScope::Project,
+            None,
             cx,
         )
     }
@@ -422,6 +576,8 @@ impl ContextServerStore {
                 downstream_client: None,
                 is_headless: false,
             },
+            StoreScope::Project,
+            None,
             cx,
         )
     }
@@ -429,6 +585,10 @@ impl ContextServerStore {
     #[cfg(feature = "test-support")]
     pub fn set_context_server_factory(&mut self, factory: ContextServerFactory) {
         self.context_server_factory = Some(factory);
+        // Only the owning store creates processes, so a store with its own factory
+        // has to own its servers.
+        self.app_wide = None;
+        self.app_wide_server_ids.clear();
     }
 
     #[cfg(feature = "test-support")]
@@ -457,6 +617,8 @@ impl ContextServerStore {
         worktree_store: Entity<WorktreeStore>,
         weak_project: Option<WeakEntity<Project>>,
         state: ContextServerStoreState,
+        scope: StoreScope,
+        app_wide: Option<Entity<ContextServerStore>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut subscriptions = vec![cx.observe_global::<SettingsStore>(move |this, cx| {
@@ -464,11 +626,12 @@ impl ContextServerStore {
             let ai_was_disabled = this.ai_disabled;
             this.ai_disabled = ai_disabled;
 
-            let settings = Self::resolve_all_context_server_settings(&this.worktree_store, cx);
+            let settings = this.resolve_settings(cx);
             let settings_changed = this.context_server_settings != settings;
 
             if settings_changed {
                 this.context_server_settings = settings;
+                this.refresh_app_wide_server_ids(cx);
             }
 
             // When AI is disabled, stop all running servers
@@ -499,18 +662,42 @@ impl ContextServerStore {
                         | WorktreeStoreEvent::WorktreeRemoved(_, _)
                 ) && !DisableAiSettings::get_global(cx).disable_ai
                 {
-                    this.context_server_settings =
-                        Self::resolve_all_context_server_settings(&this.worktree_store, cx);
+                    this.context_server_settings = this.resolve_settings(cx);
+                    this.refresh_app_wide_server_ids(cx);
                     this.available_context_servers_changed(cx);
                 }
             }));
         }
 
+        if let Some(app_wide) = &app_wide {
+            subscriptions.push(cx.subscribe(
+                app_wide,
+                |this, _app_wide, event: &ServerStatusChangedEvent, cx| {
+                    if !this.app_wide_server_ids.contains(&event.server_id.0) {
+                        return;
+                    }
+                    this.sync_app_wide_server(&event.server_id, cx);
+                    cx.emit(ServerStatusChangedEvent {
+                        server_id: event.server_id.clone(),
+                        status: event.status.clone(),
+                    });
+                    cx.notify();
+                },
+            ));
+        }
+
         let ai_disabled = DisableAiSettings::get_global(cx).disable_ai;
+        let initial_settings = match scope {
+            StoreScope::Project => Self::resolve_all_context_server_settings(&worktree_store, cx),
+            StoreScope::AppWide => shareable_user_settings(cx),
+        };
         let mut this = Self {
+            scope,
+            app_wide,
+            app_wide_server_ids: HashSet::default(),
             state,
             _subscriptions: subscriptions,
-            context_server_settings: Self::resolve_all_context_server_settings(&worktree_store, cx),
+            context_server_settings: initial_settings,
             worktree_store,
             project: weak_project,
             registry,
@@ -522,10 +709,95 @@ impl ContextServerStore {
             context_server_factory,
             server_working_directories: HashMap::default(),
         };
+        this.refresh_app_wide_server_ids(cx);
         if maintain_server_loop && !DisableAiSettings::get_global(cx).disable_ai {
             this.available_context_servers_changed(cx);
         }
         this
+    }
+
+    fn resolve_settings(&self, cx: &App) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
+        match self.scope {
+            StoreScope::Project => {
+                Self::resolve_all_context_server_settings(&self.worktree_store, cx)
+            }
+            StoreScope::AppWide => shareable_user_settings(cx),
+        }
+    }
+
+    /// The app-wide store, if this project store delegates `id` to it.
+    fn app_wide_owner(&self, id: &ContextServerId) -> Option<Entity<ContextServerStore>> {
+        if self.app_wide_server_ids.contains(&id.0) {
+            self.app_wide.clone()
+        } else {
+            None
+        }
+    }
+
+    /// Delegates every server whose settings come unchanged from user settings, and
+    /// that can run without a project, to the app-wide store. A project that
+    /// overrides a server in its own settings keeps running its own copy.
+    fn refresh_app_wide_server_ids(&mut self, cx: &mut Context<Self>) {
+        if self.app_wide.is_none() {
+            return;
+        }
+        let user_settings = shareable_user_settings(cx);
+        let delegated: HashSet<Arc<str>> = self
+            .context_server_settings
+            .iter()
+            .filter(|(id, entry)| {
+                user_settings
+                    .get(*id)
+                    .is_some_and(|user| user.settings == entry.settings)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let no_longer_delegated: Vec<_> = self
+            .app_wide_server_ids
+            .difference(&delegated)
+            .cloned()
+            .collect();
+        for id in no_longer_delegated {
+            // The process belongs to the app-wide store, so only forget the mirror.
+            self.servers.remove(&ContextServerId(id));
+        }
+
+        let newly_delegated: Vec<_> = delegated
+            .difference(&self.app_wide_server_ids)
+            .cloned()
+            .collect();
+        for id in newly_delegated {
+            // A copy this project started itself is replaced by the shared one.
+            let id = ContextServerId(id);
+            if self.servers.contains_key(&id) {
+                self.stop_server(&id, cx).log_err();
+            }
+        }
+
+        self.app_wide_server_ids = delegated;
+        for id in self.app_wide_server_ids.clone() {
+            self.sync_app_wide_server(&ContextServerId(id), cx);
+        }
+    }
+
+    fn sync_app_wide_server(&mut self, id: &ContextServerId, cx: &mut Context<Self>) {
+        let Some(app_wide) = &self.app_wide else {
+            return;
+        };
+        let mirrored = app_wide
+            .read(cx)
+            .servers
+            .get(id)
+            .map(ContextServerState::mirror);
+        match mirrored {
+            Some(state) => {
+                self.servers.insert(id.clone(), state);
+            }
+            None => {
+                self.servers.remove(id);
+            }
+        }
     }
 
     pub fn get_server(&self, id: &ContextServerId) -> Option<Arc<ContextServer>> {
@@ -651,6 +923,10 @@ impl ContextServerStore {
     }
 
     pub fn start_server(&mut self, server: Arc<ContextServer>, cx: &mut Context<Self>) {
+        if let Some(app_wide) = self.app_wide_owner(&server.id()) {
+            app_wide.update(cx, |app_wide, cx| app_wide.start_server(server, cx));
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let this = this.upgrade().context("Context server store dropped")?;
             let id = server.id();
@@ -686,6 +962,9 @@ impl ContextServerStore {
     }
 
     pub fn stop_server(&mut self, id: &ContextServerId, cx: &mut Context<Self>) -> Result<()> {
+        if let Some(app_wide) = self.app_wide_owner(id) {
+            return app_wide.update(cx, |app_wide, cx| app_wide.stop_server(id, cx));
+        }
         if matches!(
             self.servers.get(id),
             Some(ContextServerState::Stopped { .. })
@@ -893,6 +1172,9 @@ impl ContextServerStore {
     /// directory: the active project directory, falling back to the first visible
     /// worktree. Resolves to `None` before any worktree is available.
     fn resolve_root_path(&self, cx: &App) -> Option<Arc<Path>> {
+        if self.scope == StoreScope::AppWide {
+            return Some(paths::home_dir().as_path().into());
+        }
         self.project
             .as_ref()
             .and_then(|project| {
@@ -1215,6 +1497,9 @@ impl ContextServerStore {
         id: &ContextServerId,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        if let Some(app_wide) = self.app_wide_owner(id) {
+            return app_wide.update(cx, |app_wide, cx| app_wide.authenticate_server(id, cx));
+        }
         let state = self.servers.get(id).context("Context server not found")?;
         let global_timeout = self.timeout_for_server(id, cx);
 
@@ -1318,6 +1603,10 @@ impl ContextServerStore {
         secret: String,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        if let Some(app_wide) = self.app_wide_owner(id) {
+            return app_wide
+                .update(cx, |app_wide, cx| app_wide.submit_client_secret(id, secret, cx));
+        }
         let state = self.servers.get(id).context("Context server not found")?;
         let global_timeout = self.timeout_for_server(id, cx);
 
@@ -1655,6 +1944,9 @@ impl ContextServerStore {
     /// Log out of an OAuth-authenticated MCP server: clear the stored OAuth
     /// session from the keychain and stop the server.
     pub fn logout_server(&mut self, id: &ContextServerId, cx: &mut Context<Self>) -> Result<()> {
+        if let Some(app_wide) = self.app_wide_owner(id) {
+            return app_wide.update(cx, |app_wide, cx| app_wide.logout_server(id, cx));
+        }
         let state = self.servers.get(id).context("Context server not found")?;
         let configuration = state.configuration();
 
@@ -1741,22 +2033,33 @@ impl ContextServerStore {
             return Ok(());
         }
 
-        let (mut configured_servers, registry, worktree_store) = this.update(cx, |this, _| {
-            (
-                this.context_server_settings.clone(),
-                this.registry.clone(),
-                this.worktree_store.clone(),
-            )
-        })?;
+        let (mut configured_servers, registry, worktree_store, scope) =
+            this.update(cx, |this, _| {
+                (
+                    this.context_server_settings.clone(),
+                    this.registry.clone(),
+                    this.worktree_store.clone(),
+                    this.scope,
+                )
+            })?;
 
-        for (id, _) in registry.read_with(cx, |registry, _| registry.context_server_descriptors()) {
-            configured_servers
-                .entry(id)
-                .or_insert(ContextServerSettingsEntry {
-                    worktree_id: None,
-                    settings: ContextServerSettings::default_extension(),
-                });
+        // Extension servers depend on a project's worktrees, so the app-wide store
+        // never runs them.
+        if scope == StoreScope::Project {
+            for (id, _) in
+                registry.read_with(cx, |registry, _| registry.context_server_descriptors())
+            {
+                configured_servers
+                    .entry(id)
+                    .or_insert(ContextServerSettingsEntry {
+                        worktree_id: None,
+                        settings: ContextServerSettings::default_extension(),
+                    });
+            }
         }
+        this.update(cx, |this, _| {
+            configured_servers.retain(|id, _| !this.app_wide_server_ids.contains(id));
+        })?;
 
         let (enabled_servers, disabled_servers): (HashMap<_, _>, HashMap<_, _>) =
             configured_servers
@@ -1786,6 +2089,10 @@ impl ContextServerStore {
 
         this.update(cx, |this, cx| {
             for server_id in this.servers.keys() {
+                // The app-wide store decides when its servers are removed.
+                if this.app_wide_server_ids.contains(&server_id.0) {
+                    continue;
+                }
                 // All servers that are not in desired_servers should be removed from the store.
                 // This can happen if the user removed a server from the context server settings.
                 if !configured_servers.contains_key(server_id) {

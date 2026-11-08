@@ -6,6 +6,7 @@ use crate::{Workspace, status_bar::StatusItemView};
 use anyhow::Context as _;
 use client::proto;
 use db::kvp::KeyValueStore;
+use project::{Project, ResourceMode};
 
 use gpui::{
     Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
@@ -95,6 +96,11 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn is_agent_panel(&self) -> bool {
         false
     }
+    /// What the project has to run for the panel to work. While it runs less, the
+    /// dock shows a button to turn that on in place of the panel.
+    fn required_resource_mode(&self) -> ResourceMode {
+        ResourceMode::AgentOnly
+    }
     /// Returns metadata describing how to hide this panel's button from the
     /// status bar by writing to user settings. Implementors should return
     /// `None` if the panel button cannot be hidden through settings.
@@ -133,6 +139,7 @@ pub trait PanelHandle: Send + Sync {
     fn activation_priority(&self, cx: &App) -> u32;
     fn enabled(&self, cx: &App) -> bool;
     fn is_agent_panel(&self, cx: &App) -> bool;
+    fn required_resource_mode(&self, cx: &App) -> ResourceMode;
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem>;
     fn move_to_next_position(&self, window: &mut Window, cx: &mut App) {
         let current_position = self.position(window, cx);
@@ -263,6 +270,10 @@ where
         self.read(cx).enabled(cx)
     }
 
+    fn required_resource_mode(&self, cx: &App) -> ResourceMode {
+        self.read(cx).required_resource_mode()
+    }
+
     fn is_agent_panel(&self, cx: &App) -> bool {
         self.read(cx).is_agent_panel()
     }
@@ -290,8 +301,11 @@ pub struct Dock {
     focus_follows_mouse: FocusFollowsMouse,
     restoration: DockRestoreState,
     zoom_layer_open: bool,
+    project: Entity<Project>,
+    /// Whether the project only runs what the agent needs.
+    resource_mode: ResourceMode,
     modal_layer: Entity<ModalLayer>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 enum DockRestoreState {
@@ -425,6 +439,7 @@ fn resize_panel_entry(
 impl Dock {
     pub fn new(
         position: DockPosition,
+        project: Entity<Project>,
         modal_layer: Entity<ModalLayer>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -432,6 +447,13 @@ impl Dock {
         let focus_handle = cx.focus_handle();
         let workspace = cx.entity();
         let dock = cx.new(|cx| {
+            let resource_mode_subscription = cx.observe(&project, |dock: &mut Dock, project, cx| {
+                let resource_mode = project.read(cx).resource_mode(cx);
+                if dock.resource_mode != resource_mode {
+                    dock.resource_mode = resource_mode;
+                    cx.notify();
+                }
+            });
             let focus_subscription =
                 cx.on_focus(&focus_handle, window, |dock: &mut Dock, window, cx| {
                     if let Some(active_entry) = dock.active_panel_entry() {
@@ -455,9 +477,15 @@ impl Dock {
                 is_open: false,
                 focus_handle: focus_handle.clone(),
                 focus_follows_mouse: WorkspaceSettings::get_global(cx).focus_follows_mouse,
-                _subscriptions: [focus_subscription, zoom_subscription],
+                _subscriptions: [
+                    focus_subscription,
+                    zoom_subscription,
+                    resource_mode_subscription,
+                ],
                 restoration: DockRestoreState::Restoring { pending: None },
                 zoom_layer_open: false,
+                resource_mode: project.read(cx).resource_mode(cx),
+                project,
                 modal_layer,
             }
         });
@@ -1267,10 +1295,58 @@ impl Dock {
     }
 }
 
+impl Dock {
+    /// Stands in for a panel that can't work while the project only runs what the
+    /// agent needs, with the button that turns the rest on.
+    fn render_resource_placeholder(
+        &self,
+        panel_name: &'static str,
+        required: ResourceMode,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let project = self.project.clone();
+        let button_label = if required.runs_language_servers() {
+            "Turn on git and language servers"
+        } else {
+            "Turn on git"
+        };
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .p_4()
+            .child(Label::new(format!("{panel_name} is off")).color(Color::Muted))
+            .child(
+                Label::new("This thread only runs what the agent needs.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Button::new("enable-full-resources", button_label)
+                    .style(ButtonStyle::Filled)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        project.update(cx, |project, cx| {
+                            project.set_resource_mode(required, cx);
+                        });
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for Dock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dispatch_context = Self::dispatch_context();
         if let Some(entry) = self.visible_entry() {
+            let required = entry.panel.required_resource_mode(cx);
+            let placeholder = (!self.resource_mode.covers(required)).then(|| {
+                let panel_name = entry
+                    .panel
+                    .icon_tooltip(window, cx)
+                    .unwrap_or(entry.panel.persistent_name());
+                self.render_resource_placeholder(panel_name, required, cx)
+            });
             let position = self.position;
             let create_resize_handle = || {
                 let handle = div()
@@ -1357,12 +1433,13 @@ impl Render for Dock {
                             Axis::Horizontal => this.w_full().h_full(),
                             Axis::Vertical => this.h_full().w_full(),
                         })
-                        .child(
+                        .child(placeholder.unwrap_or_else(|| {
                             entry
                                 .panel
                                 .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
+                                .cached(StyleRefinement::default().v_flex().size_full())
+                                .into_any_element()
+                        })),
                 )
                 .when(self.resizable(cx), |this| {
                     this.child(create_resize_handle())
@@ -1597,6 +1674,81 @@ impl StatusItemView for PanelButtons {
     fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
         // Panel buttons are hidden on a per-panel basis through each panel
         // button's own context menu.
+        None
+    }
+}
+
+/// Shown in the status bar while the project only runs what the agent needs, so
+/// that editors and everything else that depends on the rest have a way to turn it
+/// on.
+pub struct ResourceModeIndicator {
+    project: Entity<Project>,
+    _subscription: Subscription,
+}
+
+impl ResourceModeIndicator {
+    pub fn new(project: Entity<Project>, cx: &mut Context<Self>) -> Self {
+        let subscription = cx.observe(&project, |_, _, cx| cx.notify());
+        Self {
+            project,
+            _subscription: subscription,
+        }
+    }
+}
+
+impl Render for ResourceModeIndicator {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.project.read(cx).resource_mode(cx) != ResourceMode::AgentOnly {
+            return div().into_any_element();
+        }
+        let git_project = self.project.clone();
+        let full_project = self.project.clone();
+        h_flex()
+            .gap_1()
+            .child(
+                Label::new("Agent only")
+                    .size(LabelSize::Small)
+                    .color(Color::Warning),
+            )
+            .child(
+                Button::new("turn-on-git", "Turn on git")
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text(
+                        "This thread only runs what the agent needs. Click to track git without language servers.",
+                    ))
+                    .on_click(move |_, _, cx| {
+                        git_project.update(cx, |project, cx| {
+                            project.set_resource_mode(ResourceMode::Git, cx);
+                        });
+                    }),
+            )
+            .child(
+                Button::new("turn-on-full-resources", "Turn on everything")
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text(
+                        "Click to turn on indexing, git and language servers.",
+                    ))
+                    .on_click(move |_, _, cx| {
+                        full_project.update(cx, |project, cx| {
+                            project.set_resource_mode(ResourceMode::Full, cx);
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
+impl StatusItemView for ResourceModeIndicator {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn crate::ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    fn hide_setting(&self, _: &App) -> Option<HideStatusItem> {
+        // Only present while the project is agent only.
         None
     }
 }

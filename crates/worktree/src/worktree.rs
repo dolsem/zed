@@ -152,6 +152,9 @@ pub struct LocalWorktree {
     settings: WorktreeSettings,
     share_private_files: bool,
     scanning_enabled: bool,
+    /// Whether the scanner looks for git repositories. Independent of
+    /// `scanning_enabled` so a tree can be scanned for its files alone.
+    git_tracking_enabled: bool,
     force_defer_watch: bool,
 }
 
@@ -609,6 +612,7 @@ impl Worktree {
                 visible,
                 settings,
                 scanning_enabled,
+                git_tracking_enabled: true,
                 force_defer_watch: false,
             };
             worktree.start_background_scanner(scan_requests_rx, path_prefixes_to_scan_rx, cx);
@@ -1319,6 +1323,42 @@ impl LocalWorktree {
         self.fs_case_sensitive
     }
 
+    pub fn scanning_enabled(&self) -> bool {
+        self.scanning_enabled
+    }
+
+    pub fn git_tracking_enabled(&self) -> bool {
+        self.git_tracking_enabled
+    }
+
+    /// Chooses how much of the tree the background scanner covers: nothing but
+    /// what is asked for (`scanning_enabled: false`, as for a worktree that was
+    /// created without scanning), the files, or the files and the git
+    /// repositories in them. Turning git tracking off forgets the repositories
+    /// already found.
+    pub fn set_scan_level(
+        &mut self,
+        scanning_enabled: bool,
+        git_tracking_enabled: bool,
+        cx: &mut Context<Worktree>,
+    ) {
+        if self.scanning_enabled == scanning_enabled
+            && self.git_tracking_enabled == git_tracking_enabled
+        {
+            return;
+        }
+        let forgets_repositories = self.git_tracking_enabled && !git_tracking_enabled;
+        self.scanning_enabled = scanning_enabled;
+        self.git_tracking_enabled = git_tracking_enabled;
+
+        if forgets_repositories {
+            let mut snapshot = self.snapshot.clone();
+            snapshot.git_repositories = Default::default();
+            self.set_snapshot(snapshot, Default::default(), cx);
+        }
+        self.restart_background_scanners(cx);
+    }
+
     fn restart_background_scanners(&mut self, cx: &Context<Worktree>) {
         let (scan_requests_tx, scan_requests_rx) = async_channel::unbounded();
         let (path_prefixes_to_scan_tx, path_prefixes_to_scan_rx) = async_channel::unbounded();
@@ -1354,7 +1394,7 @@ impl LocalWorktree {
         let fs = self.fs.clone();
         let scanning_enabled = self.scanning_enabled;
         let force_defer_watch = self.force_defer_watch;
-        let track_git_repositories = self.visible;
+        let track_git_repositories = self.visible && self.git_tracking_enabled;
         let settings = self.settings.clone();
         let (scan_states_tx, mut scan_states_rx) = mpsc::unbounded();
         let background_scanner = cx.background_spawn({

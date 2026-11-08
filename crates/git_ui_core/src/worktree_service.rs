@@ -181,6 +181,7 @@ struct WorktreeFetchFailedToast {
     workspace: WeakEntity<Workspace>,
     worktree_name: Option<String>,
     branch_target: NewWorktreeBranchTarget,
+    lightweight: bool,
     focused_dock: Option<DockPosition>,
     remote_branch_name: String,
     operation: SharedString,
@@ -193,6 +194,7 @@ impl WorktreeFetchFailedToast {
         workspace: WeakEntity<Workspace>,
         worktree_name: Option<String>,
         branch_target: NewWorktreeBranchTarget,
+        lightweight: bool,
         focused_dock: Option<DockPosition>,
         fetch_error: &WorktreeFetchError,
         cx: &mut gpui::Context<Self>,
@@ -201,6 +203,7 @@ impl WorktreeFetchFailedToast {
             workspace,
             worktree_name,
             branch_target,
+            lightweight,
             focused_dock,
             remote_branch_name: fetch_error.remote_branch_name(),
             operation: format!("fetch {}", fetch_error.remote_name).into(),
@@ -233,6 +236,7 @@ impl Render for WorktreeFetchFailedToast {
         let workspace_for_retry = self.workspace.clone();
         let worktree_name = self.worktree_name.clone();
         let branch_target = self.branch_target.clone();
+        let lightweight = self.lightweight;
         let focused_dock = self.focused_dock;
 
         let workspace_for_log = self.workspace.clone();
@@ -273,6 +277,7 @@ impl Render for WorktreeFetchFailedToast {
                                 &zed_actions::CreateWorktree {
                                     worktree_name: worktree_name.clone(),
                                     branch_target: branch_target.clone(),
+                                    lightweight,
                                 },
                                 window,
                                 focused_dock,
@@ -720,6 +725,27 @@ pub fn handle_create_worktree(
     task.detach_and_log_err(cx);
 }
 
+/// Same as [`handle_create_worktree`], but the new workspace comes back to the
+/// caller, who can act on it once it exists. Errors are still shown as toasts.
+pub fn create_worktree_workspace_foreground(
+    workspace: &mut Workspace,
+    action: &zed_actions::CreateWorktree,
+    window: &mut gpui::Window,
+    fallback_focused_dock: Option<DockPosition>,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
+    create_worktree_workspace_inner(
+        workspace,
+        action,
+        window,
+        fallback_focused_dock,
+        RemoteBranchFetchMode::Fetch,
+        true,
+        None,
+        cx,
+    )
+}
+
 /// Outcome of [`create_worktree_workspace`].
 pub struct CreatedWorktreeWorkspace {
     /// The newly opened workspace.
@@ -868,6 +894,7 @@ fn create_worktree_workspace_inner(
 
     let worktree_name = action.worktree_name.clone();
     let branch_target = action.branch_target.clone();
+    let lightweight = action.lightweight;
     let fetch_askpass_delegates = if remote_branch_fetch_mode.should_fetch() {
         remote_branch_to_fetch(&branch_target)
             .map(|(remote_name, _branch_name)| {
@@ -910,6 +937,7 @@ fn create_worktree_workspace_inner(
             window_handle,
             remote_connection_options,
             activate,
+            lightweight,
             on_hook_event,
             &mut cx,
         )
@@ -930,6 +958,7 @@ fn create_worktree_workspace_inner(
                                 workspace.weak_handle(),
                                 worktree_name,
                                 branch_target,
+                                lightweight,
                                 fallback_focused_dock,
                                 fetch_error,
                                 cx,
@@ -1311,6 +1340,7 @@ async fn do_create_worktree(
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
     activate: bool,
+    lightweight: bool,
     on_hook_event: Option<WorktreeHookEventHandler>,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<CreatedWorktreeWorkspace> {
@@ -1434,6 +1464,7 @@ async fn do_create_worktree(
         remote_connection_options,
         WorktreeOperation::Create,
         activate,
+        lightweight,
         on_hook_event,
         cx,
     )
@@ -1477,6 +1508,7 @@ async fn do_switch_worktree(
         WorktreeOperation::Switch,
         // Switching is always an explicit, foreground user action.
         true,
+        false,
         None,
         cx,
     )
@@ -1499,6 +1531,7 @@ async fn open_worktree_workspace(
     remote_connection_options: Option<RemoteConnectionOptions>,
     operation: WorktreeOperation,
     activate: bool,
+    lightweight: bool,
     on_hook_event: Option<WorktreeHookEventHandler>,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<(
@@ -1528,6 +1561,9 @@ async fn open_worktree_workspace(
     let (workspace_task, modal_workspace) =
         window_handle.update(cx, |multi_workspace, window, cx| {
             let path_list = util::path_list::PathList::new(&all_paths);
+            if lightweight {
+                project::ResourceModeRequests::request(&path_list, project::ResourceMode::AgentOnly, cx);
+            }
             let active_workspace = multi_workspace.workspace().clone();
             let modal_workspace = active_workspace.clone();
 
@@ -1571,6 +1607,14 @@ async fn open_worktree_workspace(
         })?;
 
     let result = workspace_task.await;
+    if lightweight {
+        // Creating the workspace takes the request; this only drops one that was
+        // never used, so that it can't apply to a later open of the same folders.
+        cx.update(|_, cx| {
+            project::ResourceModeRequests::take(&util::path_list::PathList::new(&all_paths), cx)
+        })
+        .ok();
+    }
     remote_connection::dismiss_connection_modal(&modal_workspace, cx);
     let new_workspace = result?;
 
@@ -1898,6 +1942,7 @@ mod tests {
                 &zed_actions::CreateWorktree {
                     worktree_name: Some("feature".to_string()),
                     branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                    lightweight: false,
                 },
                 window,
                 None,
@@ -2034,6 +2079,7 @@ mod tests {
                 &zed_actions::CreateWorktree {
                     worktree_name: Some("feature".to_string()),
                     branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                    lightweight: false,
                 },
                 window,
                 None,

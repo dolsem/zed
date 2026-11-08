@@ -183,6 +183,7 @@ members = [
     "crates/remote_server",
     "crates/repl",
     "crates/reqwest_client",
+    "crates/resource_manager",
     "crates/rope",
     "crates/rpc",
     "crates/sandbox",
@@ -456,7 +457,8 @@ remote_connection = { path = "crates/remote_connection" }
 remote_server = { path = "crates/remote_server" }
 repl = { path = "crates/repl" }
 reqwest_client = { path = "crates/reqwest_client" }
-rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = ["wav", "playback", "wav_output", "recording", "dither"] }
+resource_manager = { path = "crates/resource_manager" }
+rodio ={ git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = ["wav", "playback", "wav_output", "recording", "dither"] }
 rope = { path = "crates/rope" }
 rpc = { path = "crates/rpc" }
 sandbox = { path = "crates/sandbox" }

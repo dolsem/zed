@@ -8025,6 +8025,15 @@ impl EventEmitter<Event> for ProjectPanel {}
 impl EventEmitter<PanelEvent> for ProjectPanel {}
 
 impl Panel for ProjectPanel {
+    fn set_active(&mut self, active: bool, _: &mut Window, cx: &mut Context<Self>) {
+        // A project that only runs what the agent needs hasn't read its files yet.
+        if active {
+            self.project
+                .update(cx, |project, cx| project.scan_files(cx))
+                .detach();
+        }
+    }
+
     fn position(&self, _: &Window, cx: &App) -> DockPosition {
         match ProjectPanelSettings::get_global(cx).dock {
             DockSide::Left => DockPosition::Left,

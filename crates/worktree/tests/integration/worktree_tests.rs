@@ -4051,6 +4051,96 @@ async fn test_repository_above_root(executor: BackgroundExecutor, cx: &mut TestA
 }
 
 #[gpui::test]
+async fn test_scan_level_can_be_changed(executor: BackgroundExecutor, cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": {},
+            "src": { "a.rs": "" },
+            "b.rs": "",
+        }),
+    )
+    .await;
+    let worktree = Worktree::local(
+        path!("/root").as_ref(),
+        true,
+        fs,
+        Arc::default(),
+        false,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    async fn settle(worktree: &Entity<Worktree>, cx: &mut TestAppContext) {
+        worktree
+            .update(cx, |worktree, _| {
+                worktree.as_local().unwrap().scan_complete()
+            })
+            .await;
+        cx.run_until_parked();
+    }
+    let repositories = |worktree: &Entity<Worktree>, cx: &mut TestAppContext| {
+        worktree.update(cx, |worktree, _| {
+            worktree.as_local().unwrap().repositories()
+        })
+    };
+
+    settle(&worktree, cx).await;
+    worktree.read_with(cx, |worktree, _| {
+        assert!(worktree.entry_for_path(rel_path("b.rs")).is_none());
+    });
+    assert!(repositories(&worktree, cx).is_empty());
+
+    worktree.update(cx, |worktree, cx| {
+        worktree
+            .as_local_mut()
+            .unwrap()
+            .set_scan_level(true, false, cx)
+    });
+    settle(&worktree, cx).await;
+    worktree.read_with(cx, |worktree, _| {
+        assert!(worktree.entry_for_path(rel_path("b.rs")).is_some());
+        assert!(worktree.entry_for_path(rel_path("src/a.rs")).is_some());
+    });
+    assert!(
+        repositories(&worktree, cx).is_empty(),
+        "scanning the files must not look for repositories"
+    );
+
+    worktree.update(cx, |worktree, cx| {
+        worktree
+            .as_local_mut()
+            .unwrap()
+            .set_scan_level(true, true, cx)
+    });
+    settle(&worktree, cx).await;
+    pretty_assertions::assert_eq!(
+        repositories(&worktree, cx),
+        [Path::new(path!("/root")).into()]
+    );
+
+    worktree.update(cx, |worktree, cx| {
+        worktree
+            .as_local_mut()
+            .unwrap()
+            .set_scan_level(false, false, cx)
+    });
+    settle(&worktree, cx).await;
+    assert!(repositories(&worktree, cx).is_empty());
+    worktree.read_with(cx, |worktree, _| {
+        assert!(
+            worktree.entry_for_path(rel_path("b.rs")).is_some(),
+            "entries found earlier stay"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_global_gitignore(executor: BackgroundExecutor, cx: &mut TestAppContext) {
     init_test(cx);
 

@@ -1968,9 +1968,27 @@ impl Workspace {
         )
         .detach();
 
-        let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
-        let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
-        let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
+        let left_dock = Dock::new(
+            DockPosition::Left,
+            project.clone(),
+            modal_layer.clone(),
+            window,
+            cx,
+        );
+        let bottom_dock = Dock::new(
+            DockPosition::Bottom,
+            project.clone(),
+            modal_layer.clone(),
+            window,
+            cx,
+        );
+        let right_dock = Dock::new(
+            DockPosition::Right,
+            project.clone(),
+            modal_layer.clone(),
+            window,
+            cx,
+        );
         let left_dock_buttons = cx.new(|cx| PanelButtons::new(left_dock.clone(), cx));
         let bottom_dock_buttons = cx.new(|cx| PanelButtons::new(bottom_dock.clone(), cx));
         let right_dock_buttons = cx.new(|cx| PanelButtons::new(right_dock.clone(), cx));
@@ -1978,9 +1996,12 @@ impl Workspace {
             .root::<MultiWorkspace>()
             .flatten()
             .map(|mw| mw.downgrade());
+        let resource_mode_indicator =
+            cx.new(|cx| dock::ResourceModeIndicator::new(project.clone(), cx));
         let status_bar = cx.new(|cx| {
             let mut status_bar =
                 StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx);
+            status_bar.add_left_item(resource_mode_indicator, window, cx);
             status_bar.add_left_item(left_dock_buttons, window, cx);
             status_bar.add_right_item(right_dock_buttons, window, cx);
             status_bar.add_right_item(bottom_dock_buttons, window, cx);
@@ -2178,6 +2199,11 @@ impl Workspace {
             Default::default(),
             cx,
         );
+        // The mode has to be in place before the first worktree is added, as that is
+        // when the scanner would otherwise start.
+        if let Some(mode) = project::ResourceModeRequests::take(&PathList::new(&abs_paths), cx) {
+            project_handle.update(cx, |project, cx| project.set_resource_mode(mode, cx));
+        }
 
         let db = WorkspaceDb::global(cx);
         let kvp = db::kvp::KeyValueStore::global(cx);

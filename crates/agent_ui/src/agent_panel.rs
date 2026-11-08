@@ -4988,6 +4988,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 let action = zed_actions::CreateWorktree {
                     worktree_name: request.worktree_name.clone(),
                     branch_target,
+                    lightweight: false,
                 };
                 let creation = window.update(cx, |_root, window, cx| {
                     workspace.update(cx, |workspace, cx| {

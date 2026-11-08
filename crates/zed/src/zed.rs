@@ -1416,6 +1416,7 @@ fn register_actions(
     }
 
     workspace.register_action(sidebar::dump_workspace_info);
+    workspace.register_action(sidebar::handle_open_create_worktree_dialog);
 
     #[cfg(debug_assertions)]
     workspace.register_action(|workspace, _: &ShowWorkspaceError, _, cx| {

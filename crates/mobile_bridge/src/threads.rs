@@ -451,6 +451,7 @@ impl MobileBridge {
                             }
                             None => zed_actions::NewWorktreeBranchTarget::CurrentBranch,
                         },
+                        lightweight: false,
                     };
                     let creation = window.update(cx, |_, window, cx| {
                         source.update(cx, |workspace, cx| {

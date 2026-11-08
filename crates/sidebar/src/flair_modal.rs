@@ -3,6 +3,7 @@ use agent_ui::thread_metadata_store::{MCP_FLAIR_ID, ThreadFlairId, ThreadMetadat
 use editor::Editor;
 use gpui::{DismissEvent, Entity, EventEmitter, Focusable, Rgba};
 use ui::prelude::*;
+use ui::{Checkbox, ToggleState};
 use workspace::ModalView;
 
 /// Colors a flair can take. Stored as `#rrggbb`.
@@ -22,6 +23,7 @@ pub struct FlairModal {
     name_editor: Entity<Editor>,
     colors: Vec<SharedString>,
     selected_color: usize,
+    lazy: bool,
     error: Option<SharedString>,
 }
 
@@ -42,10 +44,12 @@ impl FlairModal {
             .collect::<Vec<_>>();
         let mut selected_color = 0;
         let mut initial_name = SharedString::default();
+        let mut lazy = false;
         if let FlairModalTarget::Edit { flair_id } = &target
             && let Some(flair) = ThreadMetadataStore::global(cx).read(cx).flair(flair_id)
         {
             initial_name = flair.name.clone();
+            lazy = flair.is_lazy();
             selected_color = match colors.iter().position(|color| *color == flair.color) {
                 Some(index) => index,
                 None => {
@@ -67,6 +71,7 @@ impl FlairModal {
             name_editor,
             colors,
             selected_color,
+            lazy,
             error: None,
         }
     }
@@ -85,13 +90,14 @@ impl FlairModal {
         let Some(color) = self.colors.get(self.selected_color).cloned() else {
             return;
         };
+        let lazy = self.lazy;
         ThreadMetadataStore::global(cx).update(cx, |store, cx| match &self.target {
             FlairModalTarget::Create { thread_id } => {
-                let flair_id = store.create_flair(name.into(), color, cx);
+                let flair_id = store.create_flair(name.into(), color, lazy, cx);
                 store.set_flair(*thread_id, Some(flair_id), cx);
             }
             FlairModalTarget::Edit { flair_id } => {
-                store.update_flair(flair_id, name.into(), color, cx);
+                store.update_flair(flair_id, name.into(), color, lazy, cx);
             }
         });
         cx.emit(DismissEvent);
@@ -160,7 +166,15 @@ impl Render for FlairModal {
                     .border_color(colors.border_variant)
                     .child(Label::new(title))
                     .child(self.name_editor.clone())
-                    .child(h_flex().gap_1p5().children(swatches)),
+                    .child(h_flex().gap_1p5().children(swatches))
+                    .child(
+                        Checkbox::new("flair-lazy", self.lazy.into())
+                            .label("Lazy: only run what the agent needs")
+                            .on_click(cx.listener(|this, state: &ToggleState, _window, cx| {
+                                this.lazy = state.selected();
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 h_flex()

@@ -15780,6 +15780,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "resource_manager"
+version = "0.1.0"
+dependencies = [
+ "agent_ui",
+ "gpui",
+ "project",
+ "sysinfo 0.39.6",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "resvg"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23274,6 +23288,7 @@ dependencies = [
  "remote_server",
  "repl",
  "reqwest_client",
+ "resource_manager",
  "rope",
  "sandbox",
  "search",

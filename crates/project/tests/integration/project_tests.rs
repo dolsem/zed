@@ -19856,6 +19856,96 @@ async fn diagnostics_pull_project(
     (project, fake_servers)
 }
 
+#[gpui::test]
+async fn test_agent_only_project_runs_only_what_is_asked_for(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": {},
+            "src": { "a.rs": "fn a() {}" },
+            "b.txt": "",
+        }),
+    )
+    .await;
+
+    // The mode has to be set before the first worktree is added, as a workspace
+    // does when it was asked to open lazily.
+    let project = Project::test(fs.clone(), [], cx).await;
+    project.update(cx, |project, cx| {
+        project.set_resource_mode(project::ResourceMode::AgentOnly, cx)
+    });
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/root"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    worktree.read_with(cx, |worktree, _| {
+        assert!(worktree.entry_for_path(rel_path("b.txt")).is_none());
+    });
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.resource_mode(cx), project::ResourceMode::AgentOnly);
+        assert!(project.repositories(cx).is_empty());
+    });
+
+    project
+        .update(cx, |project, cx| project.scan_files(cx))
+        .await;
+    cx.executor().run_until_parked();
+    worktree.read_with(cx, |worktree, _| {
+        assert!(worktree.entry_for_path(rel_path("b.txt")).is_some());
+        assert!(worktree.entry_for_path(rel_path("src/a.rs")).is_some());
+    });
+    project.read_with(cx, |project, cx| {
+        assert_eq!(
+            project.resource_mode(cx),
+            project::ResourceMode::AgentOnly,
+            "reading the files is not the same as turning everything on"
+        );
+        assert!(project.repositories(cx).is_empty());
+    });
+
+    // Git can be turned on without turning the language servers on with it.
+    project.update(cx, |project, cx| {
+        project.set_resource_mode(project::ResourceMode::Git, cx)
+    });
+    cx.executor().run_until_parked();
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.resource_mode(cx), project::ResourceMode::Git);
+        assert_eq!(project.repositories(cx).len(), 1);
+        assert!(project.lsp_store().read(cx).all_language_servers_stopped());
+    });
+
+    project.update(cx, |project, cx| {
+        project.set_resource_mode(project::ResourceMode::Full, cx)
+    });
+    cx.executor().run_until_parked();
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.resource_mode(cx), project::ResourceMode::Full);
+        assert_eq!(project.repositories(cx).len(), 1);
+        assert!(!project.lsp_store().read(cx).all_language_servers_stopped());
+    });
+}
+
+#[gpui::test]
+async fn test_resource_mode_requests_are_taken_once(cx: &mut gpui::TestAppContext) {
+    let paths = util::path_list::PathList::new(&[path!("/root")]);
+    cx.update(|cx| {
+        assert_eq!(project::ResourceModeRequests::take(&paths, cx), None);
+        project::ResourceModeRequests::request(&paths, project::ResourceMode::AgentOnly, cx);
+        assert_eq!(
+            project::ResourceModeRequests::take(&paths, cx),
+            Some(project::ResourceMode::AgentOnly)
+        );
+        assert_eq!(project::ResourceModeRequests::take(&paths, cx), None);
+    });
+}
+
 pub fn init_test(cx: &mut gpui::TestAppContext) {
     zlog::init_test();
 

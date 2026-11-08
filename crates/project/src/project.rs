@@ -14,6 +14,7 @@ pub mod lsp_store;
 pub mod manifest_tree;
 pub mod prettier_store;
 pub mod project_search;
+mod resource_mode;
 pub mod project_settings;
 pub mod search;
 pub mod task_inventory;
@@ -54,6 +55,7 @@ pub use git_store::{
 };
 pub use manifest_tree::ManifestTree;
 pub use project_search::{Search, SearchResults};
+pub use resource_mode::{ResourceMode, ResourceModeRequests};
 pub use worktree_store::WorktreePaths;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1246,11 +1248,13 @@ impl Project {
                 .detach();
 
             let weak_self = cx.weak_entity();
+            let app_wide_context_servers = ContextServerStore::app_wide(fs.clone(), cx);
             let context_server_store = cx.new(|cx| {
                 ContextServerStore::local(
                     worktree_store.clone(),
                     Some(weak_self.clone()),
                     false,
+                    Some(app_wide_context_servers),
                     cx,
                 )
             });
@@ -1875,7 +1879,7 @@ impl Project {
             let weak_self = cx.weak_entity();
             git_store.update(cx, |git_store, _| git_store.set_project(weak_self.clone()));
             let context_server_store = cx.new(|cx| {
-                ContextServerStore::local(worktree_store.clone(), Some(weak_self), false, cx)
+                ContextServerStore::local(worktree_store.clone(), Some(weak_self), false, None, cx)
             });
 
             let mut worktrees = Vec::new();
@@ -3132,6 +3136,44 @@ impl Project {
         self.worktree_store.update(cx, |worktree_store, _cx| {
             worktree_store.disable_scanner();
         });
+    }
+
+    pub fn resource_mode(&self, cx: &App) -> ResourceMode {
+        match self.worktree_store.read(cx).resource_mode() {
+            ResourceMode::AgentOnly => ResourceMode::AgentOnly,
+            _ if self.lsp_store.read(cx).all_language_servers_stopped() => ResourceMode::Git,
+            _ => ResourceMode::Full,
+        }
+    }
+
+    /// Switches how much the project runs in the background. Only local projects
+    /// have anything to switch: a remote host runs its own scanner and language
+    /// servers.
+    pub fn set_resource_mode(&mut self, mode: ResourceMode, cx: &mut Context<Self>) {
+        if !self.is_local() || self.resource_mode(cx) == mode {
+            return;
+        }
+        self.worktree_store
+            .update(cx, |worktree_store, cx| worktree_store.set_resource_mode(mode, cx));
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            if !mode.runs_language_servers() {
+                lsp_store.stop_all_language_servers(cx)
+            } else {
+                lsp_store.restart_all_language_servers(cx)
+            }
+        });
+        cx.notify();
+    }
+
+    /// Reads the file tree of an [`ResourceMode::AgentOnly`] project, without git
+    /// or language servers, for what needs to look at all the files. Resolves once
+    /// every worktree has been read.
+    pub fn scan_files(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let scan = self
+            .worktree_store
+            .update(cx, |worktree_store, cx| worktree_store.scan_files(cx));
+        cx.notify();
+        scan
     }
 
     #[inline]

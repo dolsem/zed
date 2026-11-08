@@ -5185,7 +5185,17 @@ impl LspStore {
         }
     }
 
+    /// Whether language servers, and the Prettier install that goes with them, are
+    /// switched off for the project.
+    pub fn all_language_servers_stopped(&self) -> bool {
+        self.as_local()
+            .is_some_and(|local| local.all_language_servers_stopped)
+    }
+
     fn on_buffer_settings_changed(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        if self.all_language_servers_stopped() {
+            return;
+        }
         let Some(prettier_store) = self.as_local().map(|s| s.prettier_store.clone()) else {
             return;
         };
@@ -5709,6 +5719,7 @@ impl LspStore {
         }
 
         if settings.prettier.allowed
+            && !self.all_language_servers_stopped()
             && let Some(prettier_plugins) = prettier_store::prettier_plugins_for_language(&settings)
         {
             let prettier_store = self.as_local().map(|s| s.prettier_store.clone());

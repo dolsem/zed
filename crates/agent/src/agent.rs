@@ -557,6 +557,22 @@ async fn expand_worktree_directory(
     Ok(())
 }
 
+/// A worktree that isn't scanned, as in a project that only runs what the agent
+/// needs, has none of its files in the snapshot. This loads the top level, where
+/// the rules files and the skills directory live, and nothing else.
+async fn load_unscanned_root(worktree: &Entity<Worktree>, cx: &mut AsyncApp) {
+    let unscanned = worktree.read_with(cx, |worktree, _| {
+        worktree
+            .as_local()
+            .is_some_and(|local| !local.scanning_enabled())
+    });
+    if unscanned {
+        expand_worktree_directory(worktree, RelPath::empty(), cx)
+            .await
+            .log_err();
+    }
+}
+
 async fn expand_project_skills_directories(
     worktree: &Entity<Worktree>,
     cx: &mut AsyncApp,
@@ -1199,6 +1215,7 @@ impl NativeAgent {
                     if let Some(scan_complete) = scan_complete {
                         scan_complete.await;
                     }
+                    load_unscanned_root(&worktree, cx).await;
                     if let Err(error) = expand_project_skills_directories(&worktree, cx).await {
                         project_skills_results.push(vec![Err(SkillLoadError {
                             path: PathBuf::from(project_skills_relative_path()),
@@ -1341,6 +1358,7 @@ impl NativeAgent {
             if let Some(scan_complete) = scan_complete {
                 scan_complete.await;
             }
+            load_unscanned_root(&worktree, cx).await;
 
             let rules_task = cx.update(|cx| Self::load_worktree_rules_file(worktree, project, cx));
 

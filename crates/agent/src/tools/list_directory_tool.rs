@@ -236,6 +236,11 @@ impl AgentTool for ListDirectoryTool {
                 return Ok(output);
             }
 
+            // A project that only runs what the agent needs hasn't read its files yet.
+            project
+                .update(cx, |project, cx| project.scan_files(cx))
+                .await;
+
             let fs = project.read_with(cx, |project, _cx| project.fs().clone());
 
             // Fast path: a global skill resource lives outside any worktree, so

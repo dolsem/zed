@@ -33,7 +33,7 @@ use worktree::{
     WorktreeId,
 };
 
-use crate::{ProjectPath, trusted_worktrees::TrustedWorktrees};
+use crate::{ProjectPath, ResourceMode, trusted_worktrees::TrustedWorktrees};
 
 /// The current paths for a project's worktrees. Each folder path has a corresponding
 /// main worktree path at the same position. The two lists are always the
@@ -211,6 +211,7 @@ pub struct WorktreeStore {
     retain_worktrees: bool,
     worktrees: Vec<WorktreeHandle>,
     scanning_enabled: bool,
+    git_tracking_enabled: bool,
     #[allow(clippy::type_complexity)]
     loading_worktrees:
         HashMap<Arc<SanitizedPath>, Shared<Task<Result<Entity<Worktree>, Arc<anyhow::Error>>>>>,
@@ -260,6 +261,7 @@ impl WorktreeStore {
             downstream_client: None,
             worktrees: Vec::new(),
             scanning_enabled: true,
+            git_tracking_enabled: true,
             retain_worktrees,
             initial_scan_complete: watch::channel_with(true),
             state: WorktreeStoreState::Local { fs },
@@ -280,6 +282,7 @@ impl WorktreeStore {
             downstream_client: None,
             worktrees: Vec::new(),
             scanning_enabled: true,
+            git_tracking_enabled: true,
             retain_worktrees,
             initial_scan_complete: watch::channel_with(true),
             state: WorktreeStoreState::Remote {
@@ -318,6 +321,83 @@ impl WorktreeStore {
     pub fn disable_scanner(&mut self) {
         self.scanning_enabled = false;
         *self.initial_scan_complete.0.borrow_mut() = true;
+    }
+
+    pub fn resource_mode(&self) -> ResourceMode {
+        if self.scanning_enabled && self.git_tracking_enabled {
+            ResourceMode::Full
+        } else {
+            ResourceMode::AgentOnly
+        }
+    }
+
+    pub fn set_resource_mode(&mut self, mode: ResourceMode, cx: &mut Context<Self>) {
+        if mode.tracks_git() {
+            self.set_scan_level(true, true, cx)
+        } else {
+            self.set_scan_level(false, false, cx)
+        }
+    }
+
+    /// Reads the files of every worktree, leaving git alone unless the store is
+    /// already tracking it.
+    pub fn scan_files(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        if !self.scanning_enabled {
+            self.set_scan_level(true, false, cx);
+        }
+        let scans = self.local_scans(cx);
+        cx.background_spawn(async move {
+            futures::future::join_all(scans).await;
+        })
+    }
+
+    fn local_scans(&self, cx: &App) -> Vec<impl Future<Output = ()> + use<>> {
+        self.visible_worktrees(cx)
+            .filter_map(|worktree| {
+                worktree
+                    .read(cx)
+                    .as_local()
+                    .map(|local| local.scan_complete())
+            })
+            .collect()
+    }
+
+    fn set_scan_level(
+        &mut self,
+        scanning_enabled: bool,
+        git_tracking_enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.scanning_enabled == scanning_enabled
+            && self.git_tracking_enabled == git_tracking_enabled
+        {
+            return;
+        }
+        self.scanning_enabled = scanning_enabled;
+        self.git_tracking_enabled = git_tracking_enabled;
+
+        let worktrees = self.worktrees().collect::<Vec<_>>();
+        for worktree in worktrees {
+            worktree.update(cx, |worktree, cx| {
+                if let Some(local) = worktree.as_local_mut() {
+                    local.set_scan_level(scanning_enabled, git_tracking_enabled, cx);
+                }
+            });
+        }
+
+        if scanning_enabled {
+            *self.initial_scan_complete.0.borrow_mut() = false;
+            let scans = self.local_scans(cx);
+            cx.spawn(async move |this, cx| {
+                futures::future::join_all(scans).await;
+                this.update(cx, |this, cx| this.update_initial_scan_state(cx))
+                    .ok();
+            })
+            .detach();
+        } else {
+            *self.initial_scan_complete.0.borrow_mut() = true;
+        }
+        cx.notify();
     }
 
     /// Returns a future that resolves when all visible worktrees have completed
@@ -929,6 +1009,7 @@ impl WorktreeStore {
     ) -> Task<Result<Entity<Worktree>, Arc<anyhow::Error>>> {
         let next_entry_id = self.next_entry_id.clone();
         let scanning_enabled = self.scanning_enabled;
+        let git_tracking_enabled = self.git_tracking_enabled;
 
         let next_worktree_id = self.next_worktree_id();
 
@@ -944,6 +1025,16 @@ impl WorktreeStore {
                 cx,
             )
             .await?;
+
+            if scanning_enabled && !git_tracking_enabled {
+                // The worktree only starts out looking for git repositories, which
+                // this store doesn't want; the scanner restarts without them.
+                worktree.update(cx, |worktree, cx| {
+                    if let Some(local) = worktree.as_local_mut() {
+                        local.set_scan_level(true, false, cx);
+                    }
+                });
+            }
 
             this.update(cx, |this, cx| this.add(&worktree, cx))?;
 

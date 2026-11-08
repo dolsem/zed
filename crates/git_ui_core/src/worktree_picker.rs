@@ -25,8 +25,8 @@ use workspace::{
 use crate::notifications::show_error_toast;
 use crate::worktree_service::{RemoteBranchName, WorktreeCreateTarget, worktree_create_targets};
 use zed_actions::{
-    CreateWorktree, NewWorktreeBranchTarget, OpenWorktreeInNewWindow, OpenWorktreeSetupTasks,
-    SwitchWorktree,
+    NewWorktreeBranchTarget, OpenCreateWorktreeDialog, OpenWorktreeInNewWindow,
+    OpenWorktreeSetupTasks, SwitchWorktree,
 };
 
 actions!(
@@ -428,6 +428,28 @@ impl WorktreePickerDelegate {
             &self.all_worktrees,
             self.repository_identity_path.as_deref(),
         )
+    }
+
+    /// Opens the dialog for creating a worktree, where the base, the name and the
+    /// flair of its threads get picked, starting from what was selected here.
+    fn open_create_dialog(
+        &self,
+        worktree_name: Option<String>,
+        branch_target: NewWorktreeBranchTarget,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        window.dispatch_action(
+            Box::new(OpenCreateWorktreeDialog {
+                worktree_name,
+                branch_target,
+                default_branch: self
+                    .default_branch
+                    .as_ref()
+                    .map(|default_branch| default_branch.display_name()),
+            }),
+            cx,
+        );
     }
 
     fn build_fixed_entries(&self) -> Vec<WorktreeEntry> {
@@ -975,42 +997,17 @@ impl PickerDelegate for WorktreePickerDelegate {
                 if self.creation_blocked_reason(cx).is_some() {
                     return;
                 }
-                if let Some(workspace) = self.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        crate::worktree_service::handle_create_worktree(
-                            workspace,
-                            &CreateWorktree {
-                                worktree_name: None,
-                                branch_target: NewWorktreeBranchTarget::CurrentBranch,
-                            },
-                            window,
-                            self.focused_dock,
-                            cx,
-                        );
-                    });
-                }
+                self.open_create_dialog(None, NewWorktreeBranchTarget::CurrentBranch, window, cx);
             }
             WorktreeEntry::CreateFromDefaultBranch { default_branch } => {
                 if self.creation_blocked_reason(cx).is_some() {
                     return;
                 }
-                if let Some(workspace) = self.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        crate::worktree_service::handle_create_worktree(
-                            workspace,
-                            &CreateWorktree {
-                                worktree_name: None,
-                                branch_target: NewWorktreeBranchTarget::RemoteBranch {
-                                    remote_name: default_branch.remote_name.clone(),
-                                    branch_name: default_branch.branch_name.clone(),
-                                },
-                            },
-                            window,
-                            self.focused_dock,
-                            cx,
-                        );
-                    });
-                }
+                let branch_target = NewWorktreeBranchTarget::RemoteBranch {
+                    remote_name: default_branch.remote_name.clone(),
+                    branch_name: default_branch.branch_name.clone(),
+                };
+                self.open_create_dialog(None, branch_target, window, cx);
             }
             WorktreeEntry::Worktree { worktree, .. } => {
                 if self.deleting_worktree_paths.contains(&worktree.path) {
@@ -1058,20 +1055,7 @@ impl PickerDelegate for WorktreePickerDelegate {
                     },
                     None => NewWorktreeBranchTarget::CurrentBranch,
                 };
-                if let Some(workspace) = self.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        crate::worktree_service::handle_create_worktree(
-                            workspace,
-                            &CreateWorktree {
-                                worktree_name: Some(name.clone()),
-                                branch_target,
-                            },
-                            window,
-                            self.focused_dock,
-                            cx,
-                        );
-                    });
-                }
+                self.open_create_dialog(Some(name.clone()), branch_target, window, cx);
             }
             WorktreeEntry::CreateNamed {
                 disabled_reason: Some(_),
