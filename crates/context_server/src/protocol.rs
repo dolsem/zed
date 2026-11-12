@@ -119,6 +119,19 @@ impl InitializedContextServerProtocol {
             .await
     }
 
+    /// Sends a request without typing it, for passing on requests from another
+    /// client. Absent params go out as `null`, as they do for typed requests
+    /// without params.
+    pub async fn request_raw(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        self.inner
+            .request(method, params.unwrap_or(serde_json::Value::Null))
+            .await
+    }
+
     pub fn notify<T: Notification>(&self, params: T::Params) -> Result<()> {
         self.inner.notify(T::METHOD, params)
     }

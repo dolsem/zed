@@ -1811,6 +1811,20 @@ async fn test_is_server_enabled(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_user_settings_servers_are_shared_between_projects(cx: &mut TestAppContext) {
+    assert_user_server_is_shared_between_local_projects(false, cx).await;
+}
+
+// A server marked `remote` only runs on the host for remote projects; local
+// projects run it on this machine and share it like any other.
+#[gpui::test]
+async fn test_remote_marked_servers_are_shared_between_local_projects(cx: &mut TestAppContext) {
+    assert_user_server_is_shared_between_local_projects(true, cx).await;
+}
+
+async fn assert_user_server_is_shared_between_local_projects(
+    remote: bool,
+    cx: &mut TestAppContext,
+) {
     let server_id = ContextServerId("shared-mcp".into());
 
     let (fs, first_project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
@@ -1835,7 +1849,7 @@ async fn test_user_settings_servers_are_shared_between_projects(cx: &mut TestApp
             server_id.0.clone(),
             settings::ContextServerSettingsContent::Stdio {
                 enabled: true,
-                remote: false,
+                remote,
                 command: ContextServerCommand {
                     path: "somebinary".into(),
                     args: vec![],
@@ -1873,6 +1887,150 @@ async fn test_user_settings_servers_are_shared_between_projects(cx: &mut TestApp
             );
         });
     }
+}
+
+#[gpui::test]
+async fn test_shared_servers_are_reachable_through_the_proxy(cx: &mut TestAppContext) {
+    let server_id = ContextServerId("proxied-mcp".into());
+
+    let (fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let executor = cx.executor();
+    let app_wide = cx.update(|cx| ContextServerStore::app_wide(fs.clone(), cx));
+    app_wide.update(cx, |store, _| {
+        store.set_context_server_factory(Box::new(move |id, _| {
+            let transport = create_fake_transport(id.0.to_string(), executor.clone())
+                .on_request::<context_server::types::requests::ListTools, _>(|_| async {
+                    context_server::types::ListToolsResponse {
+                        tools: vec![context_server::types::Tool {
+                            name: "shared_tool".into(),
+                            title: None,
+                            description: None,
+                            input_schema: json!({"type": "object"}),
+                            output_schema: None,
+                            annotations: None,
+                        }],
+                        next_cursor: None,
+                        meta: None,
+                    }
+                });
+            Arc::new(ContextServer::new(id.clone(), Arc::new(transport)))
+        }));
+    });
+    set_context_server_configuration(
+        vec![(
+            server_id.0.clone(),
+            settings::ContextServerSettingsContent::Stdio {
+                enabled: true,
+                remote: false,
+                command: ContextServerCommand {
+                    path: "somebinary".into(),
+                    args: vec![],
+                    env: None,
+                    timeout: None,
+                },
+            },
+        )],
+        cx,
+    );
+    cx.run_until_parked();
+
+    let store = project.read_with(cx, |project, _| project.context_server_store());
+    assert!(store.read_with(cx, |store, _| store.is_shared(&server_id)));
+    let endpoint = cx
+        .update(|cx| project::context_server_proxy::endpoint(&server_id, cx))
+        .expect("the proxy should be running");
+
+    let (status, body) = post_to_proxy(
+        cx,
+        &endpoint.url,
+        &endpoint.headers,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#,
+    );
+    assert_eq!(status, 200);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["id"], 7);
+    assert_eq!(body["result"]["tools"][0]["name"], "shared_tool");
+
+    // The handshake is answered from the shared server's, not repeated on it.
+    let (status, body) = post_to_proxy(
+        cx,
+        &endpoint.url,
+        &endpoint.headers,
+        r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+    );
+    assert_eq!(status, 200);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["id"], "init");
+    assert_eq!(body["result"]["serverInfo"]["name"], "proxied-mcp");
+
+    let (status, _) = post_to_proxy(
+        cx,
+        &endpoint.url,
+        &endpoint.headers,
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+    );
+    assert_eq!(status, 202);
+
+    let (status, _) = post_to_proxy(
+        cx,
+        &endpoint.url,
+        &[],
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+    );
+    assert_eq!(status, 401, "requests without the token are refused");
+}
+
+/// Sends one HTTP request to the proxy from another thread, which is how an agent
+/// reaches it, while the test drives the app until the answer comes back.
+fn post_to_proxy(
+    cx: &mut TestAppContext,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> (u16, String) {
+    use std::io::{Read as _, Write as _};
+
+    let rest = url.strip_prefix("http://").unwrap();
+    let (address, path) = rest.split_at(rest.find('/').unwrap());
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+
+    let address = address.to_string();
+    let (response_tx, response_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response_tx.send(response).ok();
+    });
+
+    cx.executor().allow_parking();
+    let response = loop {
+        cx.run_until_parked();
+        match response_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(response) => break response,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(error) => panic!("no response from the proxy: {error}"),
+        }
+    };
+    let status = response
+        .split(' ')
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .unwrap();
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
 }
 
 #[gpui::test]

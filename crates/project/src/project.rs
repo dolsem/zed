@@ -4,6 +4,7 @@ pub mod bookmark_store;
 pub mod buffer_store;
 pub mod color_extractor;
 pub mod connection_manager;
+pub mod context_server_proxy;
 pub mod context_server_store;
 pub mod debounced_delay;
 pub mod debugger;
@@ -1501,12 +1502,16 @@ impl Project {
                 )
             });
 
+            // Servers that run on this machine are shared with local projects; only
+            // the ones marked `remote` run on the host, per project.
+            let app_wide_context_servers = ContextServerStore::app_wide(fs.clone(), cx);
             let context_server_store = cx.new(|cx| {
                 ContextServerStore::remote(
                     rpc::proto::REMOTE_SERVER_PROJECT_ID,
                     remote.clone(),
                     worktree_store.clone(),
                     Some(weak_self.clone()),
+                    Some(app_wide_context_servers),
                     cx,
                 )
             });

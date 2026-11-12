@@ -371,21 +371,27 @@ struct GlobalAppWideContextServerStore(Entity<ContextServerStore>);
 impl Global for GlobalAppWideContextServerStore {}
 
 /// Only servers that don't depend on a particular project can be shared: extension
-/// servers resolve their command from the project's worktrees, and remote servers
-/// run on the remote host.
-fn is_shareable(settings: &ContextServerSettings) -> bool {
+/// servers resolve their command from the project's worktrees. A server marked
+/// `remote` runs on the remote host for a remote project, so only a local project,
+/// where it runs on this machine like any other, can share it.
+fn is_shareable(settings: &ContextServerSettings, for_remote_project: bool) -> bool {
     match settings {
-        ContextServerSettings::Stdio { remote, .. } => !remote,
+        ContextServerSettings::Stdio { remote, .. } => !(for_remote_project && *remote),
         ContextServerSettings::Http { .. } => true,
         ContextServerSettings::Extension { .. } => false,
     }
 }
 
-fn shareable_user_settings(cx: &App) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
+/// The user's servers that a store can share. The app-wide store runs them on this
+/// machine, so it takes what a local project can share.
+fn shareable_user_settings(
+    for_remote_project: bool,
+    cx: &App,
+) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
     ProjectSettings::get_global(cx)
         .context_servers
         .iter()
-        .filter(|(_, settings)| is_shareable(settings))
+        .filter(|(_, settings)| is_shareable(settings, for_remote_project))
         .map(|(id, settings)| {
             (
                 id.clone(),
@@ -460,6 +466,7 @@ impl ContextServerStore {
             )
         });
         cx.set_global(GlobalAppWideContextServerStore(store.clone()));
+        crate::context_server_proxy::start(store.clone(), cx);
         store
     }
 
@@ -491,6 +498,7 @@ impl ContextServerStore {
         upstream_client: Entity<RemoteClient>,
         worktree_store: Entity<WorktreeStore>,
         weak_project: Option<WeakEntity<Project>>,
+        app_wide: Option<Entity<Self>>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_internal(
@@ -504,7 +512,7 @@ impl ContextServerStore {
                 upstream_client,
             },
             StoreScope::Project,
-            None,
+            app_wide,
             cx,
         )
     }
@@ -689,7 +697,7 @@ impl ContextServerStore {
         let ai_disabled = DisableAiSettings::get_global(cx).disable_ai;
         let initial_settings = match scope {
             StoreScope::Project => Self::resolve_all_context_server_settings(&worktree_store, cx),
-            StoreScope::AppWide => shareable_user_settings(cx),
+            StoreScope::AppWide => shareable_user_settings(false, cx),
         };
         let mut this = Self {
             scope,
@@ -721,8 +729,14 @@ impl ContextServerStore {
             StoreScope::Project => {
                 Self::resolve_all_context_server_settings(&self.worktree_store, cx)
             }
-            StoreScope::AppWide => shareable_user_settings(cx),
+            StoreScope::AppWide => shareable_user_settings(false, cx),
         }
+    }
+
+    /// Whether `id` runs in the app-wide store, shared with other projects, rather
+    /// than in this project.
+    pub fn is_shared(&self, id: &ContextServerId) -> bool {
+        self.app_wide.is_some() && self.app_wide_server_ids.contains(&id.0)
     }
 
     /// The app-wide store, if this project store delegates `id` to it.
@@ -741,7 +755,7 @@ impl ContextServerStore {
         if self.app_wide.is_none() {
             return;
         }
-        let user_settings = shareable_user_settings(cx);
+        let user_settings = shareable_user_settings(self.is_remote_project(), cx);
         let delegated: HashSet<Arc<str>> = self
             .context_server_settings
             .iter()
