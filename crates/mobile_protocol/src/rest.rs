@@ -10,6 +10,7 @@
 //!
 //! | Method | Path | Body | Response |
 //! |---|---|---|---|
+//! | GET | `/api/openapi.json` | | this API as an OpenAPI document, see [`crate::openapi`] (needs no secret) |
 //! | GET | `/api/session` | | `{}` (checks the secret) |
 //! | GET | `/api/projects` | | [`ProjectsResponse`] |
 //! | GET | `/api/agents` | | [`AgentsResponse`] |
@@ -40,25 +41,36 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::api::{
     AgentOption, ControlValue, NewThreadProject, PermissionOption, ThreadState, ToolCallStatus,
     WorktreeChoice,
 };
 
-#[derive(Debug, Clone, Serialize)]
+/// The body of every 4xx/5xx response.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+/// `{}`, answered by endpoints that have nothing to report.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EmptyResponse {}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ProjectsResponse {
     pub projects: Vec<NewThreadProject>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AgentsResponse {
     pub agents: Vec<AgentOption>,
     /// The agent Zed would pick for a new thread.
     pub default_agent_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateWorktreeRequest {
     pub project_id: String,
     /// Optional name for the worktree's directory.
@@ -67,7 +79,7 @@ pub struct CreateWorktreeRequest {
     pub branch: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateThreadRequest {
     pub project_id: String,
     pub worktree: WorktreeChoice,
@@ -81,21 +93,21 @@ pub struct CreateThreadRequest {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ThreadDetails {
     pub state: ThreadState,
     pub workspace_paths: Vec<String>,
     pub runs: Vec<Run>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RunsResponse {
     pub runs: Vec<Run>,
 }
 
 /// Everything between one user message and the next: the message itself and
 /// all the agent's output in response to it.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct Run {
     /// The run's position in the thread, starting at "1" ("0" holds anything
     /// the agent said before the first user message). It stays the same
@@ -118,7 +130,7 @@ pub struct Run {
     pub items: Option<Vec<RunItem>>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Running,
@@ -135,7 +147,7 @@ impl RunStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PendingRequest {
     /// Answer with `POST /threads/{thread_id}/permissions/{tool_call_id}`.
@@ -149,7 +161,7 @@ pub enum PendingRequest {
     Question(Question),
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct Question {
     pub question_id: String,
     pub message: String,
@@ -158,7 +170,7 @@ pub struct Question {
     pub mode: QuestionMode,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum QuestionMode {
     /// Accept with `content` matching `schema` (a JSON Schema object whose
@@ -168,7 +180,7 @@ pub enum QuestionMode {
     Url { url: String },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionStatus {
     Pending,
@@ -179,7 +191,7 @@ pub enum QuestionStatus {
 }
 
 /// One per entry of the thread, so an item's index within its run is stable.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunItem {
     /// The run's own message comes first; later ones are prompts the agent
@@ -202,7 +214,7 @@ pub enum RunItem {
     },
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct RunToolCall {
     pub tool_call_id: String,
     /// Markdown, e.g. "Edit `src/main.rs`".
@@ -223,7 +235,7 @@ pub struct RunToolCall {
     pub raw_input: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RunToolCallContent {
     Markdown {
@@ -237,7 +249,7 @@ pub enum RunToolCallContent {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CommandOutput {
     pub tool_call_id: String,
     pub command: Option<String>,
@@ -246,12 +258,12 @@ pub struct CommandOutput {
     pub output: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SendMessageRequest {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SentMessage {
     /// The run the message started. `None` when it was queued because the
     /// agent is still busy; it starts its own run once sent.
@@ -261,14 +273,14 @@ pub struct SentMessage {
 
 /// Either the id of one of the permission's options, or the kind of option
 /// to pick (the first one of that kind).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct PermissionResponse {
     pub option_id: Option<String>,
     /// allow_once, allow_always, reject_once, reject_always
     pub kind: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct QuestionResponse {
     pub action: QuestionAction,
     /// The answers, for `accept` on form questions.
@@ -276,7 +288,7 @@ pub struct QuestionResponse {
     pub content: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionAction {
     Accept,
@@ -284,7 +296,7 @@ pub enum QuestionAction {
     Cancel,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SetControlRequest {
     pub value: ControlValue,
 }
@@ -308,7 +320,7 @@ pub mod thread_events {
     pub const ERROR: &str = "error";
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RunItemEvent {
     pub run_id: String,
     /// Position of the item within the run.
@@ -316,24 +328,24 @@ pub struct RunItemEvent {
     pub item: RunItem,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct StreamError {
     pub message: String,
 }
 
 /// A code that lets one device pair with the web UI until it expires.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PairingResponse {
     pub code: String,
     pub expires_in_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OperationsResponse {
     pub operations: Vec<Operation>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Operation {
     pub operation_id: String,
     pub kind: OperationKind,
@@ -347,14 +359,14 @@ pub struct Operation {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     CreateWorktree,
     CreateThread,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationStatus {
     Running,
@@ -362,21 +374,21 @@ pub enum OperationStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OperationResult {
     Worktree(CreatedWorktree),
     Thread(CreatedThread),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CreatedWorktree {
     /// One per repository of the project (usually just one).
     pub paths: Vec<String>,
     pub branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CreatedThread {
     pub thread_id: String,
     pub workspace_paths: Vec<String>,
@@ -387,7 +399,7 @@ pub struct CreatedThread {
 /// Streamed by `/operations/{operation_id}/events` with the event name set
 /// to the type (`step`, `hook_started`, …). Past events are replayed first,
 /// and the stream ends after `succeeded` or `failed`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OperationEvent {
     /// Increases by one with every event of the operation, starting at 0.
     pub sequence: u64,
@@ -397,7 +409,7 @@ pub struct OperationEvent {
     pub kind: OperationEventKind,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OperationEventKind {
     Step {
@@ -460,7 +472,7 @@ impl OperationEventKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationStep {
     OpeningProject,

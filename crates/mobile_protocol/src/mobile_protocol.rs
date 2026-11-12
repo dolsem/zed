@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod mcp;
+pub mod openapi;
 pub mod rest;
 
 use std::collections::BTreeMap;

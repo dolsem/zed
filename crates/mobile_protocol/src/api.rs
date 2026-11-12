@@ -14,6 +14,7 @@
 //! the given lines joined by `\n`.
 
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 pub type WorkspaceId = u64;
 pub type ItemId = u64;
@@ -359,12 +360,12 @@ pub enum ToastLevel {
 // ---------------------------------------------------------------------------
 // Threads list
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct ThreadsList {
     pub projects: Vec<ProjectThreads>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct ProjectThreads {
     /// Stable key for the project group, used in `CreateThreadParams`.
     pub project_id: String,
@@ -375,7 +376,7 @@ pub struct ProjectThreads {
     pub threads: Vec<ThreadSummary>,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct ThreadSummary {
     pub thread_id: String,
     pub kind: ThreadKind,
@@ -392,7 +393,7 @@ pub struct ThreadSummary {
     pub updated_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadKind {
     Agent,
@@ -400,7 +401,7 @@ pub enum ThreadKind {
     Terminal,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadStatus {
     Idle,
@@ -417,7 +418,7 @@ pub struct NewThreadOptions {
     pub default_agent_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct NewThreadProject {
     pub project_id: String,
     pub name: String,
@@ -430,7 +431,7 @@ pub struct NewThreadProject {
     pub branches: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WorktreeOption {
     pub path: String,
     pub name: String,
@@ -438,7 +439,7 @@ pub struct WorktreeOption {
     pub is_main: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AgentOption {
     /// Zed's native agent has the id `"Zed Agent"`; other ids are external agents.
     pub id: String,
@@ -453,7 +454,7 @@ pub struct CreateThreadParams {
     pub agent_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorktreeChoice {
     /// One of `NewThreadProject::worktrees`, by path.
@@ -483,7 +484,7 @@ pub struct ThreadSnapshot {
     pub state: ThreadState,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct ThreadState {
     pub thread_id: String,
     pub title: String,
@@ -500,19 +501,19 @@ pub struct ThreadState {
     pub needs_desktop_input: bool,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct TokenUsage {
     pub used: u64,
     pub max: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct PlanEntry {
     pub content: String,
     pub status: PlanEntryStatus,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanEntryStatus {
     Pending,
@@ -522,7 +523,7 @@ pub enum PlanEntryStatus {
 
 /// A selector or toggle in the thread's composer toolbar (model, mode,
 /// profile, thinking, effort, fast mode, agent-provided config options).
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct ThreadControl {
     /// e.g. "model", "mode", "profile", "thinking", "effort", "fast",
     /// or "config:<agent config id>".
@@ -532,7 +533,7 @@ pub struct ThreadControl {
     pub kind: ThreadControlKind,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ThreadControlKind {
     Select {
@@ -544,7 +545,7 @@ pub enum ThreadControlKind {
     },
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct ControlOption {
     pub value: String,
     pub label: String,
@@ -553,7 +554,7 @@ pub struct ControlOption {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(untagged)]
 pub enum ControlValue {
     Toggle(bool),
@@ -602,7 +603,7 @@ pub struct ToolCall {
     pub permission_options: Option<Vec<PermissionOption>>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
     Pending,
@@ -633,7 +634,7 @@ pub enum ToolCallContent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]
 pub struct PermissionOption {
     pub id: String,
     pub label: String,

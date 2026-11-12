@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -228,6 +228,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Argume
 
 fn build_router(server: Arc<Server>) -> Router {
     let api = Router::new()
+        .route("/api/openapi.json", get(openapi))
         .route("/api/session", get(session))
         .route("/api/ws", get(websocket::upgrade))
         .route("/api", any(relay::forward))
@@ -255,6 +256,16 @@ pub fn error_response(status: StatusCode, message: &str) -> Response {
 
 async fn not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "not found")
+}
+
+/// Needs no secret, so that API tools can load it; it only describes the API.
+async fn openapi() -> Response {
+    static DOCUMENT: LazyLock<String> = LazyLock::new(mobile_protocol::openapi::json);
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        DOCUMENT.as_str(),
+    )
+        .into_response()
 }
 
 async fn session(State(server): State<Arc<Server>>, headers: HeaderMap) -> Response {
