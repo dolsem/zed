@@ -147,6 +147,23 @@ enum SidebarView {
     Archive(Entity<ThreadsArchiveView>),
 }
 
+/// Restricts the thread list to threads with a given flair.
+#[derive(Clone, Debug, PartialEq)]
+enum FlairFilter {
+    /// Only threads without a flair (terminals count as unflaired).
+    NoFlair,
+    Flair(ThreadFlairId),
+}
+
+impl FlairFilter {
+    fn matches(&self, flair: Option<&ThreadFlairId>) -> bool {
+        match self {
+            FlairFilter::NoFlair => flair.is_none(),
+            FlairFilter::Flair(id) => flair == Some(id),
+        }
+    }
+}
+
 enum ArchiveWorktreeOutcome {
     Success,
     Cancelled,
@@ -812,6 +829,7 @@ pub struct Sidebar {
     /// Display names of other release channels that have threads available to
     /// import.
     cross_channel_import_channels: Vec<SharedString>,
+    flair_filter: Option<FlairFilter>,
 }
 
 impl Sidebar {
@@ -956,6 +974,7 @@ impl Sidebar {
             update_task: None,
             import_banners_use_verbose_labels: None,
             cross_channel_import_channels: Vec::new(),
+            flair_filter: None,
         }
     }
 
@@ -1389,6 +1408,17 @@ impl Sidebar {
 
         let query = self.filter_editor.read(cx).text(cx);
 
+        // Drop a filter whose flair has since been deleted.
+        if let Some(FlairFilter::Flair(flair_id)) = &self.flair_filter
+            && ThreadMetadataStore::global(cx)
+                .read(cx)
+                .flair(flair_id)
+                .is_none()
+        {
+            self.flair_filter = None;
+        }
+        let flair_filter = self.flair_filter.clone();
+
         let previous = mem::take(&mut self.contents);
 
         let old_statuses = &self.live_thread_statuses;
@@ -1573,11 +1603,17 @@ impl Sidebar {
             if group_key.path_list().paths().is_empty() {
                 continue;
             }
+            if let Some(filter) = &flair_filter
+                && !filter.matches(None)
+            {
+                terminals.clear();
+            }
 
             let label = group_key.display_name(&path_detail_map);
 
             let is_collapsed = self.is_group_collapsed(group_key, cx);
-            let should_load_threads = !is_collapsed || !query.is_empty();
+            let should_load_threads =
+                !is_collapsed || !query.is_empty() || flair_filter.is_some();
 
             let is_active = active_workspace
                 .as_ref()
@@ -1719,6 +1755,11 @@ impl Sidebar {
                     }
                 }
                 threads.retain(|thread| thread.draft.is_none() || thread.metadata.title.is_some());
+                if let Some(filter) = &flair_filter {
+                    // Hidden threads keep their notification and last-accessed state.
+                    current_thread_ids.extend(threads.iter().map(|t| t.metadata.thread_id));
+                    threads.retain(|thread| filter.matches(thread.metadata.flair.as_ref()));
+                }
 
                 // Keep empty drafts only while their thread is active; preserve
                 // drafts with content because they hold user-typed state.
@@ -1937,6 +1978,10 @@ impl Sidebar {
                     &mut current_thread_ids,
                 );
             } else {
+                if flair_filter.is_some() && threads.is_empty() && terminals.is_empty() {
+                    continue;
+                }
+
                 let has_terminal_notifications = terminals
                     .iter()
                     .any(|t| notified_terminals.contains(&t.metadata.terminal_id));
@@ -7656,8 +7701,93 @@ impl Sidebar {
                         this.toggle_archive(&ToggleThreadHistory, window, cx);
                     })),
             )
+            .when(!is_archive, |this| {
+                this.child(self.render_flair_filter_button(cx))
+            })
             .child(div().flex_1())
             .child(self.render_recent_projects_button(cx))
+    }
+
+    fn set_flair_filter(&mut self, filter: Option<FlairFilter>, cx: &mut Context<Self>) {
+        if self.flair_filter != filter {
+            self.flair_filter = filter;
+            self.update_entries(cx);
+        }
+    }
+
+    fn render_flair_filter_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = ThreadMetadataStore::global(cx);
+        let active_flair = match &self.flair_filter {
+            Some(FlairFilter::Flair(id)) => store.read(cx).flair(id).cloned(),
+            _ => None,
+        };
+        let icon_color = active_flair
+            .as_ref()
+            .and_then(|flair| flair.hsla())
+            .map(Color::Custom);
+        let tooltip: SharedString = match (&self.flair_filter, &active_flair) {
+            (Some(FlairFilter::NoFlair), _) => "Showing Threads Without Flair".into(),
+            (Some(FlairFilter::Flair(_)), Some(flair)) => {
+                format!("Showing “{}” Threads", flair.name).into()
+            }
+            _ => "Filter Threads by Flair".into(),
+        };
+        let current = self.flair_filter.clone();
+        let this = cx.weak_entity();
+
+        PopoverMenu::new("sidebar-flair-filter-menu")
+            .trigger_with_tooltip(
+                IconButton::new("flair-filter", IconName::Filter)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(current.is_some())
+                    .when_some(icon_color, |this, color| this.icon_color(color)),
+                Tooltip::text(tooltip),
+            )
+            .anchor(gpui::Anchor::BottomLeft)
+            .menu(move |window, cx| {
+                let this = this.clone();
+                let current = current.clone();
+                let flairs = ThreadMetadataStore::global(cx).read(cx).flairs().to_vec();
+                Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                    let set = |filter: Option<FlairFilter>| {
+                        let this = this.clone();
+                        move |_window: &mut Window, cx: &mut App| {
+                            this.update(cx, |sidebar, cx| {
+                                sidebar.set_flair_filter(filter.clone(), cx)
+                            })
+                            .ok();
+                        }
+                    };
+                    menu = menu.toggleable_entry(
+                        "All Threads",
+                        current.is_none(),
+                        IconPosition::Start,
+                        None,
+                        set(None),
+                    );
+                    menu = menu.separator();
+                    for flair in flairs {
+                        let filter = FlairFilter::Flair(flair.id.clone());
+                        let mut entry = ContextMenuEntry::new(flair.name.clone())
+                            .toggle(IconPosition::Start, current.as_ref() == Some(&filter))
+                            .handler(set(Some(filter)));
+                        if let Some(color) = flair.hsla() {
+                            entry = entry
+                                .icon(IconName::Circle)
+                                .icon_position(IconPosition::End)
+                                .icon_color(Color::Custom(color));
+                        }
+                        menu = menu.item(entry);
+                    }
+                    menu.toggleable_entry(
+                        "No Flair",
+                        current == Some(FlairFilter::NoFlair),
+                        IconPosition::Start,
+                        None,
+                        set(Some(FlairFilter::NoFlair)),
+                    )
+                }))
+            })
     }
 
     fn active_workspace(&self, cx: &App) -> Option<Entity<Workspace>> {
