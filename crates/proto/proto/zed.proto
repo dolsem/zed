@@ -542,7 +542,12 @@ message Envelope {
     SaveAgentTerminalThread save_agent_terminal_thread = 509;
     DeleteAgentTerminalThread delete_agent_terminal_thread = 510;
     GetTerminalInitCommand get_terminal_init_command = 511;
-    GetTerminalInitCommandResponse get_terminal_init_command_response = 512; // current max
+    GetTerminalInitCommandResponse get_terminal_init_command_response = 512;
+
+    ContextServerRequest context_server_request = 513;
+    ContextServerResponse context_server_response = 514;
+    GetContextServerProxy get_context_server_proxy = 515;
+    ContextServerProxy context_server_proxy = 516; // current max
   }
 
   reserved 87 to 88;

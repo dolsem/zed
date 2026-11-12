@@ -1558,7 +1558,8 @@ impl AgentConnection for AcpConnection {
             Err(error) => return Task::ready(Err(error)),
         };
         let name = self.id.0.clone();
-        let mcp_servers = mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
+        let mcp_servers =
+            mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
 
         cx.spawn(async move |cx| {
             let response = self
@@ -1688,7 +1689,8 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
+        let mcp_servers =
+            mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -1732,7 +1734,8 @@ impl AgentConnection for AcpConnection {
             ))));
         }
 
-        let mcp_servers = mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
+        let mcp_servers =
+            mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
         self.open_or_create_session(
             session_id,
             project,
@@ -4896,8 +4899,8 @@ exit 7
 }
 
 /// The MCP servers to hand an agent for `project`. An agent that can reach MCP
-/// servers over HTTP gets the app-wide servers through Zed's proxy, so that every
-/// thread shares the one process instead of starting its own.
+/// servers over HTTP gets the shared servers through a Zed proxy on the machine it
+/// runs on, so that every thread shares the one process instead of starting its own.
 fn mcp_servers_for_project(
     project: &Entity<Project>,
     agent_supports_http: bool,
@@ -4909,18 +4912,8 @@ fn mcp_servers_for_project(
         .configured_server_ids()
         .iter()
         .filter_map(|id| {
-            // A shared server can be handed out before it has finished starting:
-            // the proxy holds the agent's requests until it is up. Otherwise a
-            // thread opened while Zed starts would go without it.
-            let proxied = is_local
-                && agent_supports_http
-                && context_server_store.is_shared(id)
-                && matches!(
-                    context_server_store.settings_for_server(id),
-                    Some(project::project_settings::ContextServerSettings::Stdio { .. })
-                );
-            if proxied
-                && let Some(endpoint) = project::context_server_proxy::endpoint(id, cx)
+            if agent_supports_http
+                && let Some(endpoint) = context_server_store.agent_endpoint(id, cx)
             {
                 return Some(acp::McpServer::Http(
                     acp::McpServerHttp::new(id.0.to_string(), endpoint.url).headers(

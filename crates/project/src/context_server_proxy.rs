@@ -1,5 +1,7 @@
 //! Lets agents that run their own MCP client, like external ACP agents, use the
-//! app-wide context servers instead of each starting its own copy.
+//! app-wide context servers instead of each starting its own copy. Other Zed
+//! processes on this machine use it the same way, to share a copy this one runs
+//! (see [`crate::shared_context_server`]).
 //!
 //! The proxy serves every app-wide server over MCP's Streamable HTTP transport on
 //! localhost, at `/mcp/<server id>`, behind a token that only Zed hands out. It
@@ -41,18 +43,27 @@ impl Global for GlobalContextServerProxy {}
 
 /// The endpoint for `server_id`, if the proxy is running.
 pub fn endpoint(server_id: &ContextServerId, cx: &App) -> Option<ProxyEndpoint> {
+    let (base_url, token) = address(cx)?;
+    Some(endpoint_at(&base_url, &token, server_id))
+}
+
+/// The proxy's base URL and token, if it is running.
+pub(crate) fn address(cx: &App) -> Option<(String, String)> {
     let proxy = cx.try_global::<GlobalContextServerProxy>()?;
-    Some(ProxyEndpoint {
-        url: format!(
-            "{}/mcp/{}",
-            proxy.base_url,
-            urlencoding::encode(&server_id.0)
-        ),
-        headers: vec![(
-            "Authorization".to_string(),
-            format!("Bearer {}", proxy.token),
-        )],
-    })
+    Some((proxy.base_url.clone(), proxy.token.clone()))
+}
+
+/// The endpoint for `server_id` on a proxy at `base_url`, which may be another
+/// process's.
+pub(crate) fn endpoint_at(
+    base_url: &str,
+    token: &str,
+    server_id: &ContextServerId,
+) -> ProxyEndpoint {
+    ProxyEndpoint {
+        url: format!("{base_url}/mcp/{}", urlencoding::encode(&server_id.0)),
+        headers: vec![("Authorization".to_string(), format!("Bearer {token}"))],
+    }
 }
 
 /// Starts serving `store`'s servers, once per app.
@@ -154,25 +165,38 @@ async fn handle(
     }
 
     let Ok(message) = serde_json::from_str::<Value>(body) else {
-        return (400, Some(error_response(Value::Null, -32700, "parse error")));
+        return (
+            400,
+            Some(error_response(Value::Null, -32700, "parse error")),
+        );
     };
-    let Some(method) = message.get("method").and_then(Value::as_str) else {
-        // A response to a request the server sent; the proxy sends none.
-        return (202, None);
-    };
-    let Some(id) = message.get("id").cloned() else {
-        // Notifications, like `notifications/initialized`, are for the shared
-        // connection's own handshake, which is already done.
-        return (202, None);
-    };
+    match handle_message(message, &server_id, store, cx).await {
+        Some(response) => (200, Some(response)),
+        None => (202, None),
+    }
+}
 
-    let response = match forward(method, message.get("params").cloned(), &server_id, store, cx)
-        .await
-    {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err(error) => error_response(id, -32603, &format!("{error:#}")),
-    };
-    (200, Some(response))
+/// Answers one JSON-RPC message for `server_id`, a server in the app-wide `store`.
+/// Returns `None` for messages that get no response.
+pub(crate) async fn handle_message(
+    message: Value,
+    server_id: &ContextServerId,
+    store: Entity<ContextServerStore>,
+    cx: &mut AsyncApp,
+) -> Option<Value> {
+    // Without a method, the message is a response to a request the server sent;
+    // the proxy sends none.
+    let method = message.get("method").and_then(Value::as_str)?;
+    // Notifications, like `notifications/initialized`, are for the shared
+    // connection's own handshake, which is already done.
+    let id = message.get("id").cloned()?;
+
+    Some(
+        match forward(method, message.get("params").cloned(), server_id, store, cx).await {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err(error) => error_response(id, -32603, &format!("{error:#}")),
+        },
+    )
 }
 
 async fn forward(
@@ -223,7 +247,7 @@ async fn running_server(
     }
 }
 
-fn error_response(id: Value, code: i64, message: &str) -> Value {
+pub(crate) fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,

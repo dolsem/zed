@@ -21,6 +21,29 @@ message ContextServerCommand {
   map<string, string> env = 3;
 }
 
+// A JSON-RPC message for a context server the remote server shares between
+// projects.
+message ContextServerRequest {
+  uint64 project_id = 1;
+  string server_id = 2;
+  string message = 3;
+}
+
+// The JSON-RPC response, empty if the message needed none.
+message ContextServerResponse {
+  string message = 1;
+}
+
+// Where agents on the remote host reach its shared context servers.
+message GetContextServerProxy {
+  uint64 project_id = 1;
+}
+
+message ContextServerProxy {
+  string base_url = 1;
+  string token = 2;
+}
+
 message AgentServerCommand {
   string path = 1;
   repeated string args = 2;

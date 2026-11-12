@@ -11,8 +11,8 @@ use context_server::oauth::{self, McpOAuthTokenProvider, OAuthDiscovery, OAuthSe
 use context_server::transport::HttpTransport;
 use context_server::{ContextServer, ContextServerCommand, ContextServerId};
 use credentials_provider::CredentialsProvider;
-use futures::future::Either;
 use fs::Fs;
+use futures::future::Either;
 use futures::{FutureExt as _, StreamExt as _, future::join_all};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, Global, Subscription, Task,
@@ -30,6 +30,7 @@ use util::{ResultExt as _, rel_path::RelPath};
 use crate::{
     DisableAiSettings, Project,
     project_settings::{ContextServerSettings, OAuthClientSettings, ProjectSettings},
+    shared_context_server::{ForwardingTransport, SharedStdioConnector, remote_forwarder},
     worktree_store::{WorktreeIdCounter, WorktreeStore, WorktreeStoreEvent},
 };
 
@@ -364,6 +365,26 @@ enum StoreScope {
     /// The single store shared by every project in the app. It runs the stdio and
     /// HTTP servers from user settings once, however many projects are open.
     AppWide,
+    /// The single store in a remote server process. It runs the user's stdio
+    /// servers marked `remote` for every remote project on this host.
+    RemoteServer,
+}
+
+impl StoreScope {
+    /// The user settings a store of this scope runs on its own, rather than per
+    /// project.
+    fn shared_settings(self, cx: &App) -> HashMap<Arc<str>, ContextServerSettingsEntry> {
+        let mut settings = shareable_user_settings(false, cx);
+        if self == StoreScope::RemoteServer {
+            settings.retain(|_, entry| {
+                matches!(
+                    entry.settings,
+                    ContextServerSettings::Stdio { remote: true, .. }
+                )
+            });
+        }
+        settings
+    }
 }
 
 struct GlobalAppWideContextServerStore(Entity<ContextServerStore>);
@@ -410,6 +431,9 @@ pub struct ContextServerStore {
     app_wide: Option<Entity<ContextServerStore>>,
     /// Servers in `servers` that are mirrors of `app_wide`'s rather than owned here.
     app_wide_server_ids: HashSet<Arc<str>>,
+    /// For a remote project, the base URL and token of the remote server's proxy,
+    /// where agents on the host reach the servers it shares.
+    remote_proxy: Option<(String, String)>,
     state: ContextServerStoreState,
     context_server_settings: HashMap<Arc<str>, ContextServerSettingsEntry>,
     servers: HashMap<ContextServerId, ContextServerState>,
@@ -442,6 +466,16 @@ impl ContextServerStore {
     /// The store that runs shareable servers for every project in the app, created
     /// on first use.
     pub fn app_wide(fs: Arc<dyn Fs>, cx: &mut App) -> Entity<Self> {
+        Self::app_wide_with_scope(fs, StoreScope::AppWide, cx)
+    }
+
+    /// The store that runs the servers a remote server process shares between the
+    /// remote projects on its host, created on first use.
+    pub fn remote_server_app_wide(fs: Arc<dyn Fs>, cx: &mut App) -> Entity<Self> {
+        Self::app_wide_with_scope(fs, StoreScope::RemoteServer, cx)
+    }
+
+    fn app_wide_with_scope(fs: Arc<dyn Fs>, scope: StoreScope, cx: &mut App) -> Entity<Self> {
         if let Some(global) = cx.try_global::<GlobalAppWideContextServerStore>() {
             return global.0.clone();
         }
@@ -460,7 +494,7 @@ impl ContextServerStore {
                     downstream_client: None,
                     is_headless: false,
                 },
-                StoreScope::AppWide,
+                scope,
                 None,
                 cx,
             )
@@ -501,6 +535,20 @@ impl ContextServerStore {
         app_wide: Option<Entity<Self>>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let proxy_request = upstream_client
+            .read(cx)
+            .proto_client()
+            .request(proto::GetContextServerProxy { project_id });
+        cx.spawn(async move |this, cx| match proxy_request.await {
+            Ok(proxy) => this.update(cx, |this, _| {
+                this.remote_proxy = Some((proxy.base_url, proxy.token));
+            }),
+            Err(error) => {
+                log::info!("remote server shares no context servers with agents: {error:#}");
+                Ok(())
+            }
+        })
+        .detach_and_log_err(cx);
         Self::new_internal(
             true,
             None,
@@ -519,6 +567,8 @@ impl ContextServerStore {
 
     pub fn init_headless(session: &AnyProtoClient) {
         session.add_entity_request_handler(Self::handle_get_context_server_command);
+        session.add_entity_request_handler(Self::handle_context_server_request);
+        session.add_entity_request_handler(Self::handle_get_context_server_proxy);
     }
 
     pub fn shared(&mut self, project_id: u64, client: AnyProtoClient) {
@@ -697,12 +747,13 @@ impl ContextServerStore {
         let ai_disabled = DisableAiSettings::get_global(cx).disable_ai;
         let initial_settings = match scope {
             StoreScope::Project => Self::resolve_all_context_server_settings(&worktree_store, cx),
-            StoreScope::AppWide => shareable_user_settings(false, cx),
+            StoreScope::AppWide | StoreScope::RemoteServer => scope.shared_settings(cx),
         };
         let mut this = Self {
             scope,
             app_wide,
             app_wide_server_ids: HashSet::default(),
+            remote_proxy: None,
             state,
             _subscriptions: subscriptions,
             context_server_settings: initial_settings,
@@ -729,7 +780,7 @@ impl ContextServerStore {
             StoreScope::Project => {
                 Self::resolve_all_context_server_settings(&self.worktree_store, cx)
             }
-            StoreScope::AppWide => shareable_user_settings(false, cx),
+            StoreScope::AppWide | StoreScope::RemoteServer => self.scope.shared_settings(cx),
         }
     }
 
@@ -737,6 +788,54 @@ impl ContextServerStore {
     /// than in this project.
     pub fn is_shared(&self, id: &ContextServerId) -> bool {
         self.app_wide.is_some() && self.app_wide_server_ids.contains(&id.0)
+    }
+
+    /// Whether `id` runs in the remote server's shared store, for a remote
+    /// project: a stdio server marked `remote`, as the user settings define it.
+    /// The remote server runs those once for every remote project on its host.
+    fn is_shared_by_remote_server(&self, id: &ContextServerId, cx: &App) -> bool {
+        if !self.is_remote_project() {
+            return false;
+        }
+        let Some(settings @ ContextServerSettings::Stdio { remote: true, .. }) =
+            self.settings_for_server(id)
+        else {
+            return false;
+        };
+        ProjectSettings::get_global(cx).context_servers.get(&id.0) == Some(settings)
+    }
+
+    /// Where an agent that speaks MCP over HTTP reaches the shared copy of `id`,
+    /// rather than starting its own. For a remote project, that's on the remote
+    /// host, where the agent runs.
+    ///
+    /// A shared server can be handed out before it has finished starting: the
+    /// proxy holds requests until it is up.
+    pub fn agent_endpoint(
+        &self,
+        id: &ContextServerId,
+        cx: &App,
+    ) -> Option<crate::context_server_proxy::ProxyEndpoint> {
+        let is_stdio = matches!(
+            self.settings_for_server(id),
+            Some(ContextServerSettings::Stdio { .. })
+        );
+        if !is_stdio {
+            return None;
+        }
+        if self.is_remote_project() {
+            if !self.is_shared_by_remote_server(id, cx) {
+                return None;
+            }
+            let (base_url, token) = self.remote_proxy.as_ref()?;
+            Some(crate::context_server_proxy::endpoint_at(
+                base_url, token, id,
+            ))
+        } else if self.is_shared(id) {
+            crate::context_server_proxy::endpoint(id, cx)
+        } else {
+            None
+        }
     }
 
     /// The app-wide store, if this project store delegates `id` to it.
@@ -1186,7 +1285,7 @@ impl ContextServerStore {
     /// directory: the active project directory, falling back to the first visible
     /// worktree. Resolves to `None` before any worktree is available.
     fn resolve_root_path(&self, cx: &App) -> Option<Arc<Path>> {
-        if self.scope == StoreScope::AppWide {
+        if self.scope != StoreScope::Project {
             return Some(paths::home_dir().as_path().into());
         }
         self.project
@@ -1222,6 +1321,43 @@ impl ContextServerStore {
             | ContextServerConfiguration::Extension { .. } => remote,
             ContextServerConfiguration::Http { .. } => false,
         };
+
+        // The remote server runs this one for every project on its host, so talk to
+        // its copy instead of starting another.
+        let shared_by_remote_server = this.update(cx, |this, cx| {
+            let ContextServerStoreState::Remote {
+                project_id,
+                upstream_client,
+            } = &this.state
+            else {
+                return None;
+            };
+            if this.context_server_factory.is_some() || !this.is_shared_by_remote_server(&id, cx) {
+                return None;
+            }
+            let timeout = configuration
+                .command()
+                .and_then(|command| command.timeout)
+                .unwrap_or_else(|| this.timeout_for_server(&id, cx))
+                .min(MAX_TIMEOUT_SECS);
+            Some((
+                *project_id,
+                upstream_client.read(cx).proto_client(),
+                timeout,
+            ))
+        })?;
+        if let Some((project_id, client, timeout)) = shared_by_remote_server {
+            let transport = ForwardingTransport::new(
+                remote_forwarder(client, project_id, id.clone()),
+                cx.background_executor().clone(),
+            );
+            let server = ContextServer::new_with_timeout(
+                id,
+                Arc::new(transport),
+                Some(Duration::from_secs(timeout)),
+            );
+            return Ok((Arc::new(server), configuration));
+        }
 
         let (remote_state, is_remote_project) = this.update(cx, |this, _| {
             let remote_state = match &this.state {
@@ -1353,6 +1489,18 @@ impl ContextServerStore {
 
                     // Don't pass remote paths as working directory for locally-spawned processes
                     let working_directory = if is_remote_project { None } else { root_path };
+                    if this.scope != StoreScope::Project
+                        && crate::shared_context_server::shares_across_processes(cx)
+                    {
+                        // The store's servers are shared with every other Zed
+                        // process on this machine too.
+                        let connector =
+                            SharedStdioConnector::new(id.clone(), command, working_directory);
+                        return anyhow::Ok(Arc::new(ContextServer::with_connector(
+                            id,
+                            Arc::new(connector),
+                        )));
+                    }
                     anyhow::Ok(Arc::new(ContextServer::stdio(
                         id,
                         command,
@@ -1424,6 +1572,43 @@ impl ContextServerStore {
                 .map(|env| env.into_iter().collect())
                 .unwrap_or_default(),
         })
+    }
+
+    /// Passes a message from a remote project on to the copy of the server this
+    /// remote server shares.
+    async fn handle_context_server_request(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::ContextServerRequest>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::ContextServerResponse> {
+        let shared_store = cx
+            .update(|cx| {
+                cx.try_global::<GlobalAppWideContextServerStore>()
+                    .map(|global| global.0.clone())
+            })
+            .context("this remote server shares no context servers")?;
+        let message = serde_json::from_str(&envelope.payload.message)
+            .context("malformed context server message")?;
+        let server_id = ContextServerId(envelope.payload.server_id.into());
+        let response =
+            crate::context_server_proxy::handle_message(message, &server_id, shared_store, &mut cx)
+                .await;
+        Ok(proto::ContextServerResponse {
+            message: response
+                .map(|response| response.to_string())
+                .unwrap_or_default(),
+        })
+    }
+
+    async fn handle_get_context_server_proxy(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::GetContextServerProxy>,
+        cx: AsyncApp,
+    ) -> Result<proto::ContextServerProxy> {
+        let (base_url, token) = cx
+            .update(|cx| crate::context_server_proxy::address(cx))
+            .context("this remote server shares no context servers")?;
+        Ok(proto::ContextServerProxy { base_url, token })
     }
 
     /// Merges context server settings from all visible worktrees so that servers defined
@@ -1618,8 +1803,9 @@ impl ContextServerStore {
         cx: &mut Context<Self>,
     ) -> Result<()> {
         if let Some(app_wide) = self.app_wide_owner(id) {
-            return app_wide
-                .update(cx, |app_wide, cx| app_wide.submit_client_secret(id, secret, cx));
+            return app_wide.update(cx, |app_wide, cx| {
+                app_wide.submit_client_secret(id, secret, cx)
+            });
         }
         let state = self.servers.get(id).context("Context server not found")?;
         let global_timeout = self.timeout_for_server(id, cx);

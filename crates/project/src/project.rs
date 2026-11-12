@@ -15,9 +15,10 @@ pub mod lsp_store;
 pub mod manifest_tree;
 pub mod prettier_store;
 pub mod project_search;
-mod resource_mode;
 pub mod project_settings;
+mod resource_mode;
 pub mod search;
+pub mod shared_context_server;
 pub mod task_inventory;
 pub mod task_store;
 pub mod telemetry_snapshot;
@@ -3158,8 +3159,9 @@ impl Project {
         if !self.is_local() || self.resource_mode(cx) == mode {
             return;
         }
-        self.worktree_store
-            .update(cx, |worktree_store, cx| worktree_store.set_resource_mode(mode, cx));
+        self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.set_resource_mode(mode, cx)
+        });
         self.lsp_store.update(cx, |lsp_store, cx| {
             if !mode.runs_language_servers() {
                 lsp_store.stop_all_language_servers(cx)

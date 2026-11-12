@@ -36,11 +36,32 @@ impl Display for ContextServerId {
 enum ContextServerTransport {
     Stdio(ContextServerCommand, Option<PathBuf>),
     Custom(Arc<dyn crate::transport::Transport>),
+    Connector(Arc<dyn Connector>),
+}
+
+/// Holds a server's connection. A [`Connector`] may replace it while the server
+/// runs, such as when it has to reconnect.
+pub type ClientSlot = Arc<RwLock<Option<Arc<crate::protocol::InitializedContextServerProtocol>>>>;
+
+/// Connects a server in a way that one fixed transport can't express, like
+/// joining a copy of it that another process already runs.
+#[async_trait::async_trait(?Send)]
+pub trait Connector: Send + Sync {
+    /// Returns an initialized connection. `slot` is where the server keeps it, for
+    /// connectors that later replace it.
+    async fn connect(
+        &self,
+        slot: ClientSlot,
+        cx: &AsyncApp,
+    ) -> Result<Arc<crate::protocol::InitializedContextServerProtocol>>;
+
+    /// Called when the server is stopped.
+    fn disconnect(&self) {}
 }
 
 pub struct ContextServer {
     id: ContextServerId,
-    client: RwLock<Option<Arc<crate::protocol::InitializedContextServerProtocol>>>,
+    client: ClientSlot,
     configuration: ContextServerTransport,
     request_timeout: Option<Duration>,
 }
@@ -53,7 +74,7 @@ impl ContextServer {
     ) -> Self {
         Self {
             id,
-            client: RwLock::new(None),
+            client: ClientSlot::default(),
             configuration: ContextServerTransport::Stdio(
                 command,
                 working_directory.map(|directory| directory.to_path_buf()),
@@ -93,9 +114,18 @@ impl ContextServer {
     ) -> Self {
         Self {
             id,
-            client: RwLock::new(None),
+            client: ClientSlot::default(),
             configuration: ContextServerTransport::Custom(transport),
             request_timeout,
+        }
+    }
+
+    pub fn with_connector(id: ContextServerId, connector: Arc<dyn Connector>) -> Self {
+        Self {
+            id,
+            client: ClientSlot::default(),
+            configuration: ContextServerTransport::Connector(connector),
+            request_timeout: None,
         }
     }
 
@@ -112,17 +142,25 @@ impl ContextServer {
     /// [`crate::transport::Transport::auth_challenge`].
     pub fn auth_challenge(&self) -> Option<WwwAuthenticate> {
         match &self.configuration {
-            ContextServerTransport::Stdio(..) => None,
+            ContextServerTransport::Stdio(..) | ContextServerTransport::Connector(..) => None,
             ContextServerTransport::Custom(transport) => transport.auth_challenge(),
         }
     }
 
     pub async fn start(&self, cx: &AsyncApp) -> Result<()> {
+        if let ContextServerTransport::Connector(connector) = &self.configuration {
+            let client = connector.connect(self.client.clone(), cx).await?;
+            *self.client.write() = Some(client);
+            return Ok(());
+        }
         self.initialize(self.new_client(cx)?).await
     }
 
     fn new_client(&self, cx: &AsyncApp) -> Result<Client> {
         Ok(match &self.configuration {
+            ContextServerTransport::Connector(_) => {
+                anyhow::bail!("a connector makes its own client")
+            }
             ContextServerTransport::Stdio(command, working_directory) => Client::stdio(
                 client::ContextServerId(self.id.0.clone()),
                 client::ModelContextServerBinary {
@@ -169,6 +207,10 @@ impl ContextServer {
         let mut client = self.client.write();
         if let Some(protocol) = client.take() {
             drop(protocol);
+        }
+        drop(client);
+        if let ContextServerTransport::Connector(connector) = &self.configuration {
+            connector.disconnect();
         }
         Ok(())
     }

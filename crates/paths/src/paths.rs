@@ -218,6 +218,19 @@ pub fn temp_dir() -> &'static PathBuf {
     })
 }
 
+/// Where Zed processes on this machine coordinate which of them runs a shared
+/// context server. Unlike the other directories, it doesn't depend on the release
+/// channel or a custom data directory, so the desktop app and every remote server
+/// process of the same user find the same one.
+pub fn shared_context_servers_dir() -> &'static PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        dirs::cache_dir()
+            .unwrap_or_else(|| home_dir().join(".cache"))
+            .join("zed-shared-context-servers")
+    })
+}
+
 /// Returns the path to the hang traces directory.
 pub fn hang_traces_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();

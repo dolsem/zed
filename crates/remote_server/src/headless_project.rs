@@ -251,6 +251,9 @@ impl HeadlessProject {
             agent_server_store
         });
 
+        // Runs the servers marked `remote` once for every remote project on this
+        // host, and for the Zed app on it too.
+        ContextServerStore::remote_server_app_wide(fs.clone(), cx);
         let context_server_store = cx.new(|cx| {
             let mut context_server_store =
                 ContextServerStore::local(worktree_store.clone(), None, true, None, cx);

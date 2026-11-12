@@ -1898,8 +1898,9 @@ async fn test_shared_servers_are_reachable_through_the_proxy(cx: &mut TestAppCon
     let app_wide = cx.update(|cx| ContextServerStore::app_wide(fs.clone(), cx));
     app_wide.update(cx, |store, _| {
         store.set_context_server_factory(Box::new(move |id, _| {
-            let transport = create_fake_transport(id.0.to_string(), executor.clone())
-                .on_request::<context_server::types::requests::ListTools, _>(|_| async {
+            let transport =
+                create_fake_transport(id.0.to_string(), executor.clone())
+                    .on_request::<context_server::types::requests::ListTools, _>(|_| async {
                     context_server::types::ListToolsResponse {
                         tools: vec![context_server::types::Tool {
                             name: "shared_tool".into(),
@@ -1913,7 +1914,7 @@ async fn test_shared_servers_are_reachable_through_the_proxy(cx: &mut TestAppCon
                         meta: None,
                     }
                 });
-            Arc::new(ContextServer::new(id.clone(), Arc::new(transport)))
+            Arc::new(ContextServer::new(id, Arc::new(transport)))
         }));
     });
     set_context_server_configuration(
@@ -1978,6 +1979,148 @@ async fn test_shared_servers_are_reachable_through_the_proxy(cx: &mut TestAppCon
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
     );
     assert_eq!(status, 401, "requests without the token are refused");
+}
+
+#[gpui::test]
+async fn test_zed_processes_on_a_machine_share_one_copy(cx: &mut TestAppContext) {
+    use project::shared_context_server::SharedStdioConnector;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    let server_id = ContextServerId("machine-mcp".into());
+    let (fs, _project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let lock_dir = tempfile::tempdir().unwrap();
+    let copies_started = Arc::new(AtomicUsize::new(0));
+    let make_server = {
+        let executor = cx.executor();
+        let copies_started = copies_started.clone();
+        let server_id = server_id.clone();
+        move || {
+            copies_started.fetch_add(1, SeqCst);
+            let transport =
+                create_fake_transport(server_id.0.to_string(), executor.clone())
+                    .on_request::<context_server::types::requests::ListTools, _>(|_| async {
+                    context_server::types::ListToolsResponse {
+                        tools: vec![context_server::types::Tool {
+                            name: "machine_tool".into(),
+                            title: None,
+                            description: None,
+                            input_schema: json!({"type": "object"}),
+                            output_schema: None,
+                            annotations: None,
+                        }],
+                        next_cursor: None,
+                        meta: None,
+                    }
+                });
+            ContextServer::new(server_id.clone(), Arc::new(transport))
+        }
+    };
+    let make_server = Arc::new(make_server);
+    let connector = {
+        let lock_dir = lock_dir.path().to_path_buf();
+        move |id: ContextServerId| {
+            let make_server = make_server.clone();
+            SharedStdioConnector::for_test(id, &lock_dir, move || make_server())
+        }
+    };
+
+    // This process runs the server first, so it hosts it.
+    let app_wide = cx.update(|cx| ContextServerStore::app_wide(fs.clone(), cx));
+    app_wide.update(cx, |store, _| {
+        let connector = connector.clone();
+        store.set_context_server_factory(Box::new(move |id, _| {
+            Arc::new(ContextServer::with_connector(
+                id.clone(),
+                Arc::new(connector(id)),
+            ))
+        }));
+    });
+    set_context_server_configuration(
+        vec![(
+            server_id.0.clone(),
+            settings::ContextServerSettingsContent::Stdio {
+                enabled: true,
+                remote: false,
+                command: ContextServerCommand {
+                    path: "somebinary".into(),
+                    args: vec![],
+                    env: None,
+                    timeout: None,
+                },
+            },
+        )],
+        cx,
+    );
+    cx.run_until_parked();
+    app_wide.read_with(cx, |store, _| {
+        assert_eq!(
+            store.status_for_server(&server_id),
+            Some(ContextServerStatus::Running)
+        );
+    });
+    assert_eq!(copies_started.load(SeqCst), 1);
+
+    // Another process with the same server joins this one's copy.
+    let other = Arc::new(ContextServer::with_connector(
+        server_id.clone(),
+        Arc::new(connector(server_id.clone())),
+    ));
+    let started = Rc::new(RefCell::new(None));
+    cx.spawn({
+        let other = other.clone();
+        let started = started.clone();
+        async move |cx| *started.borrow_mut() = Some(other.start(&cx).await)
+    })
+    .detach();
+    pump_until(cx, || started.borrow().is_some());
+    started.take().unwrap().unwrap();
+    assert_eq!(
+        copies_started.load(SeqCst),
+        1,
+        "it joins instead of starting a copy"
+    );
+
+    let client = other.client().unwrap();
+    let tools = Rc::new(RefCell::new(None));
+    cx.spawn({
+        let tools = tools.clone();
+        async move |_| {
+            *tools.borrow_mut() = Some(
+                client
+                    .request::<context_server::types::requests::ListTools>(())
+                    .await,
+            )
+        }
+    })
+    .detach();
+    pump_until(cx, || tools.borrow().is_some());
+    let tools = tools.take().unwrap().unwrap();
+    assert_eq!(tools.tools[0].name, "machine_tool");
+
+    // Once the host stops it, the other process takes over.
+    let joined_client = other.client().unwrap();
+    app_wide.update(cx, |store, cx| store.stop_server(&server_id, cx).unwrap());
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(3));
+    pump_until(cx, || copies_started.load(SeqCst) == 2);
+    pump_until(cx, || {
+        other
+            .client()
+            .is_some_and(|client| !Arc::ptr_eq(&client, &joined_client))
+    });
+}
+
+/// Drives the app, which waits on real sockets here, until `done`.
+fn pump_until(cx: &mut TestAppContext, mut done: impl FnMut() -> bool) {
+    cx.executor().allow_parking();
+    for _ in 0..1000 {
+        cx.run_until_parked();
+        if done() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("timed out");
 }
 
 /// Sends one HTTP request to the proxy from another thread, which is how an agent

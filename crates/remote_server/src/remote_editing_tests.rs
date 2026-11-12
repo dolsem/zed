@@ -5835,6 +5835,102 @@ async fn test_log_store_keys_remote_events_by_primary_kind_on_supplementary_id_c
     });
 }
 
+#[gpui::test]
+async fn test_remote_marked_context_servers_run_on_the_remote_server(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    use context_server::{
+        ContextServer, ContextServerId, test::create_fake_transport, types::requests::ListTools,
+    };
+    use project::context_server_store::{ContextServerStatus, ContextServerStore};
+
+    let server_id = ContextServerId("remote-mcp".into());
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(path!("/code"), json!({"project1": {"lib.rs": ""}}))
+        .await;
+    let (project, _headless) = init_test(&fs, cx, server_cx).await;
+
+    let fake_server = |name: &'static str, executor: gpui::BackgroundExecutor| {
+        Box::new(move |id: ContextServerId, _| {
+            let transport = create_fake_transport(id.0.to_string(), executor.clone())
+                .on_request::<ListTools, _>(move |_| async move {
+                    context_server::types::ListToolsResponse {
+                        tools: vec![context_server::types::Tool {
+                            name: name.into(),
+                            title: None,
+                            description: None,
+                            input_schema: json!({"type": "object"}),
+                            output_schema: None,
+                            annotations: None,
+                        }],
+                        next_cursor: None,
+                        meta: None,
+                    }
+                });
+            Arc::new(ContextServer::new(id, Arc::new(transport)))
+        })
+    };
+    // Fakes stand in for the server's process, on the remote host and here.
+    let shared_on_host = server_cx
+        .update(|cx| ContextServerStore::remote_server_app_wide(fs.clone() as Arc<dyn Fs>, cx));
+    let server_executor = server_cx.executor();
+    shared_on_host.update(server_cx, |store, _| {
+        store.set_context_server_factory(fake_server("host_tool", server_executor))
+    });
+    let shared_here = cx.update(|cx| {
+        ContextServerStore::app_wide(FakeFs::new(cx.background_executor().clone()), cx)
+    });
+    let executor = cx.executor();
+    shared_here.update(cx, |store, _| {
+        store.set_context_server_factory(fake_server("local_tool", executor))
+    });
+
+    cx.update_global(|settings_store: &mut SettingsStore, cx| {
+        settings_store.set_user_settings(
+            r#"{"context_servers": {"remote-mcp": {"command": "somebinary", "args": [], "remote": true}}}"#,
+            cx,
+        )
+    })
+    .unwrap();
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+
+    shared_on_host.read_with(server_cx, |store, _| {
+        assert_eq!(
+            store.status_for_server(&server_id),
+            Some(ContextServerStatus::Running),
+            "the remote server runs it"
+        );
+    });
+    let store = project.read_with(cx, |project, _| project.context_server_store());
+    let server = store
+        .read_with(cx, |store, _| store.get_running_server(&server_id))
+        .expect("the project reaches the remote server's copy");
+    let tools = server
+        .client()
+        .unwrap()
+        .request::<ListTools>(())
+        .await
+        .unwrap();
+    assert_eq!(tools.tools[0].name, "host_tool");
+
+    // Agents run on the remote host, so they get its proxy.
+    let endpoint = store
+        .read_with(cx, |store, cx| store.agent_endpoint(&server_id, cx))
+        .expect("agents can reach the shared copy");
+    let host_endpoint = server_cx
+        .update(|cx| project::context_server_proxy::endpoint(&server_id, cx))
+        .unwrap();
+    assert_eq!(endpoint.url, host_endpoint.url);
+    assert_eq!(endpoint.headers, host_endpoint.headers);
+}
+
 pub async fn init_test(
     server_fs: &Arc<FakeFs>,
     cx: &mut TestAppContext,
