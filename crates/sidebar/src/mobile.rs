@@ -24,6 +24,9 @@ pub struct MobileThread {
     pub has_notification: bool,
     pub is_active: bool,
     pub updated_at: DateTime<Utc>,
+    pub archived: bool,
+    /// Always `None` for terminals.
+    pub flair: Option<ThreadFlairId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,6 +190,8 @@ pub fn threads_snapshot(cx: &App) -> Vec<MobileProject> {
                         })
                     }),
                     updated_at: Sidebar::thread_display_time(metadata),
+                    archived: metadata.archived,
+                    flair: metadata.flair.clone(),
                 });
             }
 
@@ -222,6 +227,8 @@ pub fn threads_snapshot(cx: &App) -> Vec<MobileProject> {
                         })
                     }),
                     updated_at: metadata.created_at,
+                    archived: metadata.archived,
+                    flair: None,
                 });
             }
 
@@ -233,6 +240,173 @@ pub fn threads_snapshot(cx: &App) -> Vec<MobileProject> {
                 threads,
             });
         }
+    }
+    projects
+}
+
+/// Lists every thread Zed knows of, archived ones included, whether or not its
+/// project is open or the thread is loaded, grouped by project: the open
+/// project groups first, as in [`threads_snapshot`], then the others, most
+/// recently used first. Threads that aren't loaded are reported idle.
+pub fn all_threads_snapshot(cx: &App) -> Vec<MobileProject> {
+    let mut projects = threads_snapshot(cx);
+    let mut listed_thread_ids = HashSet::new();
+    let mut listed_terminal_ids = HashSet::new();
+    for thread in projects.iter().flat_map(|project| &project.threads) {
+        match thread.id {
+            MobileThreadId::Agent(thread_id) => listed_thread_ids.insert(thread_id),
+            MobileThreadId::Terminal(terminal_id) => listed_terminal_ids.insert(terminal_id),
+        };
+    }
+
+    let mut live_infos: HashMap<acp::SessionId, ActiveThreadInfo> = HashMap::new();
+    let mut branch_by_path = HashMap::new();
+    for window in cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<MultiWorkspace>())
+    {
+        let Ok(multi_workspace) = window.read(cx) else {
+            continue;
+        };
+        for workspace in multi_workspace.workspaces() {
+            live_infos.extend(
+                all_thread_infos_for_workspace(workspace, cx)
+                    .map(|info| (info.session_id.clone(), info)),
+            );
+            for repository in workspace.read(cx).project().read(cx).repositories(cx).values() {
+                let snapshot = repository.read(cx).snapshot();
+                if let Some(branch) = &snapshot.branch {
+                    branch_by_path.insert(
+                        snapshot.work_directory_abs_path.to_path_buf(),
+                        SharedString::from(Arc::<str>::from(branch.name())),
+                    );
+                }
+                for linked_worktree in snapshot.linked_worktrees() {
+                    if let Some(branch) = linked_worktree.branch_name() {
+                        branch_by_path.insert(
+                            linked_worktree.path.clone(),
+                            SharedString::from(Arc::<str>::from(branch)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Threads not listed yet, by the project they belong to.
+    let mut unlisted: Vec<(ProjectGroupKey, MobileThread)> = Vec::new();
+    let thread_store = ThreadMetadataStore::global(cx).read(cx);
+    for metadata in thread_store.entries() {
+        // Drafts have no messages yet, so there's nothing to show remotely.
+        let Some(session_id) = metadata.session_id.as_ref() else {
+            continue;
+        };
+        if listed_thread_ids.contains(&metadata.thread_id) {
+            continue;
+        }
+        let (title, status, diff_stats) = match live_infos.get(session_id) {
+            Some(info) => (info.title.clone(), info.status, info.diff_stats),
+            None => (
+                metadata.display_title(),
+                AgentThreadStatus::Completed,
+                DiffStats::default(),
+            ),
+        };
+        unlisted.push((
+            ProjectGroupKey::from_worktree_paths(
+                &metadata.worktree_paths,
+                metadata.remote_connection.clone(),
+            ),
+            MobileThread {
+                id: MobileThreadId::Agent(metadata.thread_id),
+                title,
+                status,
+                agent_id: Some(metadata.agent_id.clone()),
+                worktrees: worktree_labels(&worktree_info_from_thread_paths(
+                    &metadata.worktree_paths,
+                    &branch_by_path,
+                )),
+                lines_added: diff_stats.lines_added,
+                lines_removed: diff_stats.lines_removed,
+                has_notification: false,
+                is_active: false,
+                updated_at: Sidebar::thread_display_time(metadata),
+                archived: metadata.archived,
+                flair: metadata.flair.clone(),
+            },
+        ));
+    }
+    let terminal_store = TerminalThreadMetadataStore::global(cx).read(cx);
+    for metadata in terminal_store.entries() {
+        if listed_terminal_ids.contains(&metadata.terminal_id) {
+            continue;
+        }
+        unlisted.push((
+            ProjectGroupKey::from_worktree_paths(
+                &metadata.worktree_paths,
+                metadata.remote_connection.clone(),
+            ),
+            MobileThread {
+                id: MobileThreadId::Terminal(metadata.terminal_id),
+                title: metadata.display_title(),
+                status: AgentThreadStatus::Completed,
+                agent_id: None,
+                worktrees: worktree_labels(&worktree_info_from_thread_paths(
+                    &metadata.worktree_paths,
+                    &branch_by_path,
+                )),
+                lines_added: 0,
+                lines_removed: 0,
+                has_notification: false,
+                is_active: false,
+                updated_at: metadata.created_at,
+                archived: metadata.archived,
+                flair: None,
+            },
+        ));
+    }
+
+    let open_project_count = projects.len();
+    for (key, thread) in unlisted {
+        if key.path_list().paths().is_empty() {
+            continue;
+        }
+        match projects
+            .iter_mut()
+            .find(|project| project.key.matches(&key))
+        {
+            Some(project) => project.threads.push(thread),
+            None => projects.push(MobileProject {
+                key,
+                name: SharedString::default(),
+                is_active: false,
+                threads: vec![thread],
+            }),
+        }
+    }
+    for project in &mut projects {
+        project
+            .threads
+            .sort_by_key(|thread| std::cmp::Reverse(thread.updated_at));
+    }
+    projects[open_project_count..].sort_by_key(|project| {
+        std::cmp::Reverse(project.threads.first().map(|thread| thread.updated_at))
+    });
+
+    // Names are disambiguated against every project listed, open or not.
+    let mut all_paths: Vec<PathBuf> = projects
+        .iter()
+        .flat_map(|project| project.key.path_list().paths().iter().cloned())
+        .collect();
+    all_paths.sort_unstable();
+    all_paths.dedup();
+    let path_details = util::disambiguate::compute_disambiguation_details(&all_paths, |path, detail| {
+        project::path_suffix(path, detail)
+    });
+    let path_detail_map: HashMap<PathBuf, usize> = all_paths.into_iter().zip(path_details).collect();
+    for project in &mut projects {
+        project.name = project.key.display_name(&path_detail_map);
     }
     projects
 }

@@ -15,7 +15,7 @@
 //! | GET | `/api/projects` | | [`ProjectsResponse`] |
 //! | GET | `/api/agents` | | [`AgentsResponse`] |
 //! | POST | `/api/worktrees` | [`CreateWorktreeRequest`] | [`Operation`] |
-//! | GET | `/api/threads` | | [`crate::api::ThreadsList`] |
+//! | GET | `/api/threads` | | [`crate::api::ThreadsList`], filtered by [`ThreadsQuery`] |
 //! | POST | `/api/threads` | [`CreateThreadRequest`] | [`Operation`] |
 //! | GET | `/api/threads/{thread_id}` | | [`ThreadDetails`] |
 //! | GET | `/api/threads/{thread_id}/events` | | SSE, see [`thread_events`] |
@@ -68,6 +68,67 @@ pub struct AgentsResponse {
     pub agents: Vec<AgentOption>,
     /// The agent Zed would pick for a new thread.
     pub default_agent_id: String,
+}
+
+/// The query of `GET /api/threads`, which lists every thread Zed knows of,
+/// whether or not its project is open or the thread is loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadsQuery {
+    pub archived: ArchivedFilter,
+    /// Only threads whose agent is generating (`ThreadStatus::Running`).
+    pub running: bool,
+    pub flair: Option<FlairFilter>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchivedFilter {
+    /// Only threads that aren't archived.
+    #[default]
+    Unarchived,
+    /// Only archived threads.
+    Archived,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlairFilter {
+    /// Threads without a flair.
+    None,
+    /// A flair's id or name (names compare case-insensitively).
+    Flair(String),
+}
+
+impl ThreadsQuery {
+    /// Reads `?archived=unarchived|archived|all` (`true`/`false` work too),
+    /// `?running=true` and `?flair=<id or name>|none`.
+    pub fn parse(query: &BTreeMap<String, String>) -> Result<Self, String> {
+        let archived = match query.get("archived").map(String::as_str) {
+            None | Some("unarchived" | "false") => ArchivedFilter::Unarchived,
+            Some("archived" | "true") => ArchivedFilter::Archived,
+            Some("all") => ArchivedFilter::All,
+            Some(other) => {
+                return Err(format!(
+                    "archived must be unarchived, archived or all, not {other:?}"
+                ));
+            }
+        };
+        let running = match query.get("running").map(String::as_str) {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(other) => return Err(format!("running must be true or false, not {other:?}")),
+        };
+        let flair = match query.get("flair").map(String::as_str) {
+            None | Some("") => None,
+            Some("none") => Some(FlairFilter::None),
+            Some(flair) => Some(FlairFilter::Flair(flair.to_string())),
+        };
+        Ok(Self {
+            archived,
+            running,
+            flair,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -536,5 +597,36 @@ mod tests {
         .unwrap();
         assert_eq!(response.action, QuestionAction::Accept);
         assert_eq!(response.content["choice"], "B");
+    }
+
+    #[test]
+    fn test_threads_query_parse() {
+        let parse = |pairs: &[(&str, &str)]| {
+            ThreadsQuery::parse(
+                &pairs
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            )
+        };
+        assert_eq!(parse(&[]).unwrap(), ThreadsQuery::default());
+        assert_eq!(
+            parse(&[("archived", "all"), ("running", "true"), ("flair", "MCP")]).unwrap(),
+            ThreadsQuery {
+                archived: ArchivedFilter::All,
+                running: true,
+                flair: Some(FlairFilter::Flair("MCP".into())),
+            }
+        );
+        assert_eq!(
+            parse(&[("archived", "true"), ("flair", "none")]).unwrap(),
+            ThreadsQuery {
+                archived: ArchivedFilter::Archived,
+                running: false,
+                flair: Some(FlairFilter::None),
+            }
+        );
+        assert!(parse(&[("archived", "maybe")]).is_err());
+        assert!(parse(&[("running", "yes")]).is_err());
     }
 }

@@ -178,8 +178,18 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "list_threads",
-            "Lists the agent threads of every project, with their status.",
-            object_schema(json!({}), &[]),
+            "Lists every thread of every project, whether or not the project is open in Zed or the thread is loaded, with their status and flair. Threads that aren't loaded are idle.",
+            object_schema(
+                json!({
+                    "archived": {
+                        "enum": ["unarchived", "archived", "all"],
+                        "description": "Which threads to list by whether they're archived (default unarchived).",
+                    },
+                    "running": { "type": "boolean", "description": "Only threads whose agent is generating." },
+                    "flair": { "type": "string", "description": "Only threads with this flair, by id or name, or \"none\" for threads without one." },
+                }),
+                &[],
+            ),
             true,
         ),
         tool(

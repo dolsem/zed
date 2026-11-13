@@ -391,6 +391,17 @@ pub struct ThreadSummary {
     pub has_notification: bool,
     pub is_active: bool,
     pub updated_at: Option<String>,
+    pub archived: bool,
+    /// The flair the thread is tagged with. Terminals have none.
+    pub flair: Option<FlairSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
+pub struct FlairSummary {
+    pub id: String,
+    pub name: String,
+    /// `#rrggbb`
+    pub color: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]

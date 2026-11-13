@@ -127,14 +127,32 @@ fn agents() {}
 )]
 fn create_worktree() {}
 
-/// Lists the threads of every project.
+/// Lists every thread of every project, whether or not the project is open or
+/// the thread is loaded. Threads that aren't loaded are `idle`. Projects
+/// without matching threads are left out.
 #[utoipa::path(
     get,
     path = "/api/threads",
     tag = "threads",
-    responses((status = 200, body = ThreadsList)),
+    params(ThreadsQueryParams),
+    responses(
+        (status = 200, body = ThreadsList),
+        (status = 400, body = ErrorResponse, description = "A filter has an invalid value."),
+    ),
 )]
 fn threads() {}
+
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct ThreadsQueryParams {
+    /// Which threads to list by whether they're archived (default `unarchived`).
+    archived: Option<ArchivedFilter>,
+    /// `true` to only list threads whose agent is generating.
+    running: Option<bool>,
+    /// Only threads with this flair, by id or name, or `none` for threads
+    /// without one.
+    flair: Option<String>,
+}
 
 /// Starts a thread, optionally in a new worktree and with a first message.
 #[utoipa::path(

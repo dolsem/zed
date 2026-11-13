@@ -278,7 +278,22 @@ async fn call_tool(
     match name {
         "list_projects" => rest_ok(bridge, "GET", &["projects"], &[], None, cx).await,
         "list_agents" => rest_ok(bridge, "GET", &["agents"], &[], None, cx).await,
-        "list_threads" => rest_ok(bridge, "GET", &["threads"], &[], None, cx).await,
+        "list_threads" => {
+            let running = if flag(arguments, "running", false)? {
+                Some(("running", "true"))
+            } else {
+                None
+            };
+            let query = [
+                optional_string(arguments, "archived")?.map(|archived| ("archived", archived)),
+                running,
+                optional_string(arguments, "flair")?.map(|flair| ("flair", flair)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            rest_ok(bridge, "GET", &["threads"], &query, None, cx).await
+        }
         "list_operations" => rest_ok(bridge, "GET", &["operations"], &[], None, cx).await,
         "start_pairing" => rest_ok(bridge, "POST", &["pairing"], &[], None, cx).await,
         "create_worktree" => {

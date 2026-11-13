@@ -1180,8 +1180,40 @@ pub(crate) async fn wait_for_agent_panel(
     }
 }
 
+/// The threads of the open projects, as the sidebar lists them.
 pub(crate) fn build_threads_list(cx: &App) -> ThreadsList {
-    let projects = threads_snapshot(cx)
+    threads_list(threads_snapshot(cx), cx)
+}
+
+/// Every thread Zed knows of, filtered by `query`, without the projects left
+/// with no threads.
+pub(crate) fn build_all_threads_list(query: &rest::ThreadsQuery, cx: &App) -> ThreadsList {
+    let mut list = threads_list(sidebar::mobile::all_threads_snapshot(cx), cx);
+    for project in &mut list.projects {
+        project.threads.retain(|thread| {
+            let archived = match query.archived {
+                rest::ArchivedFilter::Unarchived => !thread.archived,
+                rest::ArchivedFilter::Archived => thread.archived,
+                rest::ArchivedFilter::All => true,
+            };
+            let running = !query.running || thread.status == api::ThreadStatus::Running;
+            let flair = match &query.flair {
+                None => true,
+                Some(rest::FlairFilter::None) => thread.flair.is_none(),
+                Some(rest::FlairFilter::Flair(flair)) => thread.flair.as_ref().is_some_and(|f| {
+                    f.id == *flair || f.name.to_lowercase() == flair.to_lowercase()
+                }),
+            };
+            archived && running && flair
+        });
+    }
+    list.projects.retain(|project| !project.threads.is_empty());
+    list
+}
+
+fn threads_list(snapshot: Vec<sidebar::mobile::MobileProject>, cx: &App) -> ThreadsList {
+    let flair_store = agent_ui::thread_metadata_store::ThreadMetadataStore::global(cx).read(cx);
+    let projects = snapshot
         .into_iter()
         .map(|project| ProjectThreads {
             project_id: project_id(&project.key),
@@ -1223,6 +1255,16 @@ pub(crate) fn build_threads_list(cx: &App) -> ThreadsList {
                         has_notification: thread.has_notification,
                         is_active: thread.is_active,
                         updated_at: Some(thread.updated_at.to_rfc3339()),
+                        archived: thread.archived,
+                        flair: thread
+                            .flair
+                            .as_ref()
+                            .and_then(|flair_id| flair_store.flair(flair_id))
+                            .map(|flair| api::FlairSummary {
+                                id: flair.id.0.to_string(),
+                                name: flair.name.to_string(),
+                                color: flair.color.to_string(),
+                            }),
                     }
                 })
                 .collect(),

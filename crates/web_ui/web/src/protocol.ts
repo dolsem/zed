@@ -97,6 +97,15 @@ export interface ThreadSummary {
   has_notification: boolean;
   is_active: boolean;
   updated_at: string | null;
+  archived: boolean;
+  flair: FlairSummary | null;
+}
+
+export interface FlairSummary {
+  id: string;
+  name: string;
+  /** `#rrggbb` */
+  color: string;
 }
 
 export type ThreadKind = "agent" | "terminal";

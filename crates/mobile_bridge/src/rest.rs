@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use util::ResultExt as _;
 
 use crate::MobileBridge;
-use crate::threads::{build_new_thread_options, build_threads_list, thread_details};
+use crate::threads::{build_all_threads_list, build_new_thread_options, thread_details};
 
 #[derive(Default)]
 pub(crate) struct RestState {
@@ -275,7 +275,11 @@ impl MobileBridge {
             ("POST", ["worktrees"]) => Task::ready(
                 parse_body(body).and_then(|request| self.start_create_worktree(request, cx)),
             ),
-            ("GET", ["threads"]) => Task::ready(json(build_threads_list(cx))),
+            ("GET", ["threads"]) => Task::ready(
+                rest::ThreadsQuery::parse(&query)
+                    .map_err(bad_request)
+                    .and_then(|query| json(build_all_threads_list(&query, cx))),
+            ),
             ("POST", ["threads"]) => Task::ready(
                 parse_body(body).and_then(|request| self.start_create_thread(request, cx)),
             ),
