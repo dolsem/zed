@@ -1488,7 +1488,16 @@ impl LocalWorktree {
     ) {
         let repo_changes = self.changed_repos(&self.snapshot, &mut new_snapshot);
 
-        if let Some((common_dir, is_linked_worktree)) = new_snapshot
+        // Without git tracking the scanner finds no repositories, which says
+        // nothing about whether the root is one. Keep what was discovered when
+        // the worktree was created, or the project would lose its main repo
+        // path and land in its own project group.
+        let tracks_git_repositories =
+            self.scanning_enabled && self.visible && self.git_tracking_enabled;
+        if !tracks_git_repositories {
+            new_snapshot.root_repo_common_dir = self.snapshot.root_repo_common_dir.clone();
+            new_snapshot.root_repo_is_linked_worktree = self.snapshot.root_repo_is_linked_worktree;
+        } else if let Some((common_dir, is_linked_worktree)) = new_snapshot
             .local_repo_for_work_directory_path(RelPath::empty())
             .map(|repo| {
                 (
@@ -7196,6 +7205,34 @@ fn resolve_commondir_path(repository_dir_abs_path: &Path, commondir_path: &str) 
     }
 }
 
+/// The git paths of a repository whose working directory is a worktree's root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootRepositoryPaths {
+    pub dot_git_abs_path: Arc<Path>,
+    pub repository_dir_abs_path: Arc<Path>,
+    pub common_dir_abs_path: Arc<Path>,
+}
+
+/// Finds the repository rooted at `root_abs_path` by reading its `.git`
+/// directly, without scanning the tree.
+pub async fn discover_root_repository(
+    root_abs_path: &Path,
+    fs: &dyn Fs,
+) -> Option<RootRepositoryPaths> {
+    let root_dot_git = root_abs_path.join(DOT_GIT);
+    if !fs.metadata(&root_dot_git).await.is_ok_and(|m| m.is_some()) {
+        return None;
+    }
+    let dot_git_abs_path: Arc<Path> = root_dot_git.into();
+    let (repository_dir_abs_path, common_dir_abs_path) =
+        discover_git_paths(&dot_git_abs_path, fs).await;
+    Some(RootRepositoryPaths {
+        dot_git_abs_path,
+        repository_dir_abs_path,
+        common_dir_abs_path,
+    })
+}
+
 pub async fn discover_root_repo_common_dir(root_abs_path: &Path, fs: &dyn Fs) -> Option<Arc<Path>> {
     discover_root_repo_metadata(root_abs_path, fs)
         .await
@@ -7206,14 +7243,9 @@ async fn discover_root_repo_metadata(
     root_abs_path: &Path,
     fs: &dyn Fs,
 ) -> Option<(Arc<Path>, bool)> {
-    let root_dot_git = root_abs_path.join(DOT_GIT);
-    if !fs.metadata(&root_dot_git).await.is_ok_and(|m| m.is_some()) {
-        return None;
-    }
-    let dot_git_path: Arc<Path> = root_dot_git.into();
-    let (repository_dir, common_dir) = discover_git_paths(&dot_git_path, fs).await;
-    let is_linked_worktree = repository_dir != common_dir;
-    Some((common_dir, is_linked_worktree))
+    let paths = discover_root_repository(root_abs_path, fs).await?;
+    let is_linked_worktree = paths.repository_dir_abs_path != paths.common_dir_abs_path;
+    Some((paths.common_dir_abs_path, is_linked_worktree))
 }
 
 async fn discover_git_paths(dot_git_abs_path: &Arc<Path>, fs: &dyn Fs) -> (Arc<Path>, Arc<Path>) {

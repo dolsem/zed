@@ -703,6 +703,13 @@ pub struct Repository {
     initial_graph_data: HashMap<(LogSource, LogOrder), InitialGitGraphData>,
     commit_data_handler: CommitDataHandlerState,
     commit_data: HashMap<Oid, CommitDataState>,
+    /// Registered for a worktree that doesn't track git (see
+    /// [`crate::ResourceMode::AgentOnly`]). Scans only read what identifies
+    /// the checkout — its branch, HEAD, worktrees and remotes — and skip the
+    /// statuses, diff stats, stashes and merge state, and changed files don't
+    /// refresh statuses. Cleared once the worktree's scanner tracks the
+    /// repository.
+    light: bool,
 }
 
 type RemoteAskPassDelegates = Arc<Mutex<HashMap<u64, RemoteAskPassDelegate>>>;
@@ -2488,7 +2495,17 @@ impl GitStore {
                     fs.clone(),
                     cx,
                 );
-                self.local_worktree_git_repos_changed(worktree, changed_repos, cx);
+                self.local_worktree_git_repos_changed(worktree.clone(), changed_repos, cx);
+                // Turning git tracking off forgets the root repository.
+                self.register_light_root_repository(&worktree, cx);
+            }
+            WorktreeStoreEvent::WorktreeAdded(worktree) => {
+                self.register_light_root_repository(worktree, cx);
+            }
+            WorktreeStoreEvent::WorktreeUpdatedRootRepoCommonDir(worktree_id) => {
+                if let Some(worktree) = worktree_store.read(cx).worktree_for_id(*worktree_id, cx) {
+                    self.register_light_root_repository(&worktree, cx);
+                }
             }
             WorktreeStoreEvent::WorktreeRemoved(_entity_id, worktree_id) => {
                 self.parked_repositories
@@ -2659,6 +2676,8 @@ impl GitStore {
                         && let Some(common_dir_abs_path) = update.common_dir_abs_path.clone()
                     {
                         existing.update(cx, |existing, cx| {
+                            // The worktree's scanner tracks it now.
+                            existing.light = false;
                             existing.reinitialize_local_backend(
                                 new_work_directory_abs_path,
                                 dot_git_abs_path,
@@ -2673,6 +2692,7 @@ impl GitStore {
                         });
                     } else {
                         existing.update(cx, |existing, cx| {
+                            existing.light = false;
                             existing.snapshot.work_directory_abs_path = new_work_directory_abs_path;
                             existing.schedule_scan(updates_tx.clone(), cx);
                         });
@@ -2715,7 +2735,7 @@ impl GitStore {
                     });
                     self.parked_repositories.push(parked_repository);
                 } else {
-                    self.register_local_repository(parked_repository, cx);
+                    self.register_local_repository(parked_repository, false, cx);
                 }
             }
         }
@@ -2857,7 +2877,7 @@ impl GitStore {
             .partition::<Vec<_>, _>(|parked| should_activate(parked));
         self.parked_repositories = to_keep;
         for parked in to_activate {
-            self.register_local_repository(parked, cx);
+            self.register_local_repository(parked, false, cx);
         }
     }
 
@@ -2877,15 +2897,29 @@ impl GitStore {
         );
     }
 
-    fn register_local_repository(&mut self, repository: ParkedRepository, cx: &mut Context<Self>) {
+    /// Registers a repository found by a worktree's scanner, or with `light`,
+    /// a [light](Repository::light) one for a worktree that doesn't track git.
+    fn register_local_repository(
+        &mut self,
+        repository: ParkedRepository,
+        light: bool,
+        cx: &mut Context<Self>,
+    ) {
         if !matches!(self.state, GitStoreState::Local { .. }) {
             return;
         }
         let mut worktree_ids = self.take_parked_at(&repository.work_directory_abs_path);
         worktree_ids.insert(repository.worktree_id);
-        if let Some((&existing_id, _)) = self.repositories.iter().find(|(_, existing)| {
+        if let Some((&existing_id, existing)) = self.repositories.iter().find(|(_, existing)| {
             existing.read(cx).work_directory_abs_path == repository.work_directory_abs_path
         }) {
+            if !light && existing.read(cx).light {
+                let updates_tx = self.downstream_updates_tx();
+                existing.update(cx, |existing, cx| {
+                    existing.light = false;
+                    existing.schedule_scan(updates_tx, cx);
+                });
+            }
             self.worktree_ids
                 .entry(existing_id)
                 .or_default()
@@ -2933,6 +2967,7 @@ impl GitStore {
                 object_read_limiter,
                 cx,
             );
+            repo.light = light;
             if let Some(updates_tx) = updates_tx.as_ref() {
                 // trigger an empty `UpdateRepository` to ensure remote active_repo_id is set correctly
                 updates_tx
@@ -2955,6 +2990,86 @@ impl GitStore {
             id
         });
         self.activate_parked_repositories_under(&repository.work_directory_abs_path, cx);
+    }
+
+    fn downstream_updates_tx(&self) -> Option<mpsc::UnboundedSender<DownstreamUpdate>> {
+        match &self.state {
+            GitStoreState::Local { downstream, .. } => downstream
+                .as_ref()
+                .map(|downstream| downstream.updates_tx.clone()),
+            GitStoreState::Remote { .. } => None,
+        }
+    }
+
+    /// Whether `worktree`'s scanner looks for git repositories, so that its
+    /// repositories come from it rather than from
+    /// [`Self::register_light_root_repository`].
+    fn worktree_tracks_git(worktree: &Worktree) -> bool {
+        worktree
+            .as_local()
+            .is_none_or(|local| local.scanning_enabled() && local.git_tracking_enabled())
+    }
+
+    /// Gives a local worktree that doesn't track git its root repository
+    /// anyway, as a [light](Repository::light) one, so that what the checkout
+    /// is (its branch, whether it's a linked worktree) stays known without
+    /// reading its statuses.
+    fn register_light_root_repository(
+        &mut self,
+        worktree: &Entity<Worktree>,
+        cx: &mut Context<Self>,
+    ) {
+        let GitStoreState::Local { fs, .. } = &self.state else {
+            return;
+        };
+        let worktree = worktree.read(cx);
+        if !worktree.is_visible()
+            || Self::worktree_tracks_git(worktree)
+            || worktree.root_repo_common_dir().is_none()
+        {
+            return;
+        }
+        let worktree_id = worktree.id();
+        let root = worktree.abs_path();
+        let already_registered = self.repositories.iter().any(|(id, repository)| {
+            repository.read(cx).work_directory_abs_path == root
+                && self
+                    .worktree_ids
+                    .get(id)
+                    .is_some_and(|worktree_ids| worktree_ids.contains(&worktree_id))
+        });
+        if already_registered {
+            return;
+        }
+        let fs = fs.clone();
+        cx.spawn(async move |this, cx| {
+            let Some(paths) = worktree::discover_root_repository(&root, fs.as_ref()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                // The worktree may have gone, or started tracking git, meanwhile.
+                let still_untracked = this
+                    .worktree_store
+                    .read(cx)
+                    .worktree_for_id(worktree_id, cx)
+                    .is_some_and(|worktree| !Self::worktree_tracks_git(worktree.read(cx)));
+                if still_untracked {
+                    this.register_local_repository(
+                        ParkedRepository {
+                            worktree_id,
+                            work_directory_abs_path: root,
+                            dot_git_abs_path: paths.dot_git_abs_path,
+                            repository_dir_abs_path: paths.repository_dir_abs_path,
+                            common_dir_abs_path: paths.common_dir_abs_path,
+                        },
+                        true,
+                        cx,
+                    );
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn activate_parked_repositories_under(
@@ -6579,6 +6694,7 @@ impl Repository {
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
+            light: false,
         };
         repo.respawn_local_worker(project_environment, fs, is_trusted, cx);
         cx.subscribe_self(Self::handle_subscribe_self).detach();
@@ -6631,7 +6747,13 @@ impl Repository {
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             commit_data_handler: CommitDataHandlerState::Closed,
+            light: false,
         }
+    }
+
+    /// Whether this is a light repository: see [`Repository::light`].
+    pub fn is_light(&self) -> bool {
+        self.light
     }
 
     fn handle_subscribe_self(&mut self, event: &RepositoryEvent, _: &mut Context<Self>) {
@@ -10457,6 +10579,9 @@ impl Repository {
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
         cx: &mut Context<Self>,
     ) {
+        if self.light {
+            return;
+        }
         if !paths.is_empty() {
             self.paths_needing_status_update.push(paths);
         }
@@ -12506,6 +12631,64 @@ mod tests {
 /// running the git commands on the background thread. We update branch, head,
 /// remotes, and worktrees first so the UI can react sooner, then compute file
 /// state and emit those events immediately after.
+/// The scan of a light repository (see [`Repository::light`]): what identifies
+/// the checkout, without statuses or anything that compares every branch.
+async fn compute_light_snapshot(
+    this: Entity<Repository>,
+    backend: Arc<dyn GitRepository>,
+    id: RepositoryId,
+    work_directory_abs_path: Arc<Path>,
+    prev_snapshot: RepositorySnapshot,
+    cx: &mut AsyncApp,
+) -> RepositorySnapshot {
+    let branch_future = {
+        let backend = backend.clone();
+        async move { backend.head_branch().await.log_err().flatten() }
+    };
+    let head_commit_future = {
+        let backend = backend.clone();
+        async move { backend.show("HEAD".to_string()).await.ok() }
+    };
+    let worktrees_future = {
+        let backend = backend.clone();
+        async move { backend.worktrees().await.log_err().unwrap_or_default() }
+    };
+    let (branch, head_commit, all_worktrees) =
+        futures::future::join3(branch_future, head_commit_future, worktrees_future).await;
+    let linked_worktrees: Arc<[GitWorktree]> = all_worktrees
+        .into_iter()
+        .filter(|wt| wt.path != *work_directory_abs_path)
+        .collect();
+    let mut remote_urls = backend.remote_urls().await;
+    let remote_origin_url = remote_urls.remove("origin");
+    let remote_upstream_url = remote_urls.remove("upstream");
+
+    this.update(cx, |this, cx| {
+        let head_changed =
+            branch != this.snapshot.branch || head_commit != this.snapshot.head_commit;
+        let worktrees_changed = *linked_worktrees != *this.snapshot.linked_worktrees;
+        this.snapshot = RepositorySnapshot {
+            id,
+            work_directory_abs_path,
+            branch_list: branch.iter().cloned().collect(),
+            branch,
+            head_commit,
+            remote_origin_url,
+            remote_upstream_url,
+            linked_worktrees,
+            scan_id: prev_snapshot.scan_id + 1,
+            ..prev_snapshot
+        };
+        if head_changed {
+            cx.emit(RepositoryEvent::HeadChanged);
+        }
+        if worktrees_changed {
+            cx.emit(RepositoryEvent::GitWorktreeListChanged);
+        }
+        this.snapshot.clone()
+    })
+}
+
 async fn compute_snapshot(
     this: Entity<Repository>,
     backend: Arc<dyn GitRepository>,
@@ -12513,14 +12696,20 @@ async fn compute_snapshot(
 ) -> RepositorySnapshot {
     log::debug!("starting compute snapshot");
 
-    let (id, work_directory_abs_path, prev_snapshot) = this.update(cx, |this, _| {
+    let (id, work_directory_abs_path, prev_snapshot, light) = this.update(cx, |this, _| {
         this.paths_needing_status_update.clear();
         (
             this.id,
             this.work_directory_abs_path.clone(),
             this.snapshot.clone(),
+            this.light,
         )
     });
+
+    if light {
+        return compute_light_snapshot(this, backend, id, work_directory_abs_path, prev_snapshot, cx)
+            .await;
+    }
 
     let branches_future = {
         let backend = backend.clone();

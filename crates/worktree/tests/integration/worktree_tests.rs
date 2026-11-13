@@ -4111,6 +4111,16 @@ async fn test_scan_level_can_be_changed(executor: BackgroundExecutor, cx: &mut T
         repositories(&worktree, cx).is_empty(),
         "scanning the files must not look for repositories"
     );
+    let root_repo_common_dir = |worktree: &Entity<Worktree>, cx: &mut TestAppContext| {
+        worktree.read_with(cx, |worktree, _| {
+            worktree.snapshot().root_repo_common_dir().cloned()
+        })
+    };
+    pretty_assertions::assert_eq!(
+        root_repo_common_dir(&worktree, cx),
+        Some(Path::new(path!("/root/.git")).into()),
+        "a scan without git must keep the root's repository, which groups the project by it"
+    );
 
     worktree.update(cx, |worktree, cx| {
         worktree
@@ -4132,6 +4142,11 @@ async fn test_scan_level_can_be_changed(executor: BackgroundExecutor, cx: &mut T
     });
     settle(&worktree, cx).await;
     assert!(repositories(&worktree, cx).is_empty());
+    pretty_assertions::assert_eq!(
+        root_repo_common_dir(&worktree, cx),
+        Some(Path::new(path!("/root/.git")).into()),
+        "turning git tracking off must keep the root's repository"
+    );
     worktree.read_with(cx, |worktree, _| {
         assert!(
             worktree.entry_for_path(rel_path("b.rs")).is_some(),

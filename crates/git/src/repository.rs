@@ -853,6 +853,21 @@ pub trait GitRepository: Send + Sync {
 
     fn branches(&self) -> BoxFuture<'_, Result<BranchesScanResult>>;
 
+    /// The branch HEAD is on, without its upstream or commit details, or
+    /// `None` when HEAD is detached. Much cheaper than [`Self::branches`],
+    /// which compares every branch with its upstream.
+    fn head_branch(&self) -> BoxFuture<'_, Result<Option<Branch>>> {
+        async move {
+            Ok(self
+                .branches()
+                .await?
+                .branches
+                .into_iter()
+                .find(|branch| branch.is_head))
+        }
+        .boxed()
+    }
+
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
     fn create_branch(&self, name: String, base_branch: Option<String>)
     -> BoxFuture<'_, Result<()>>;
@@ -2193,6 +2208,29 @@ impl GitRepository for RealGitRepository {
                 }
 
                 Ok(BranchesScanResult { branches, error })
+            })
+            .boxed()
+    }
+
+    fn head_branch(&self) -> BoxFuture<'_, Result<Option<Branch>>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                // Exits with a non-zero code when HEAD isn't on a branch.
+                let output = git
+                    .build_command(&["symbolic-ref", "--quiet", "HEAD"])
+                    .output()
+                    .await?;
+                if !output.status.success() {
+                    return Ok(None);
+                }
+                let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok(Some(Branch {
+                    ref_name: name.into(),
+                    is_head: true,
+                    upstream: None,
+                    most_recent_commit: None,
+                }))
             })
             .boxed()
     }

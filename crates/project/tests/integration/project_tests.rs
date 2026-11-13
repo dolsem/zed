@@ -19870,6 +19870,11 @@ async fn test_agent_only_project_runs_only_what_is_asked_for(cx: &mut gpui::Test
         }),
     )
     .await;
+    fs.set_branch_name(path!("/root/.git").as_ref(), Some("work"));
+    fs.set_status_for_repo(
+        path!("/root/.git").as_ref(),
+        &[("b.txt", StatusCode::Modified.worktree())],
+    );
 
     // The mode has to be set before the first worktree is added, as a workspace
     // does when it was asked to open lazily.
@@ -19885,13 +19890,34 @@ async fn test_agent_only_project_runs_only_what_is_asked_for(cx: &mut gpui::Test
         .unwrap();
     cx.executor().run_until_parked();
 
+    // Without git tracking, the root repository is still known, but only as
+    // much of it as identifies the checkout.
+    let assert_light_repository = |light: bool, cx: &mut gpui::TestAppContext| {
+        project.read_with(cx, |project, cx| {
+            let repositories = project.repositories(cx);
+            assert_eq!(repositories.len(), 1);
+            let repository = repositories.values().next().unwrap().read(cx);
+            assert_eq!(repository.is_light(), light);
+            let snapshot = repository.snapshot();
+            assert_eq!(
+                snapshot.branch.as_ref().map(|branch| branch.name().to_string()),
+                Some("work".to_string())
+            );
+            assert_eq!(
+                snapshot.status_for_path(&repo_path("b.txt")).is_some(),
+                !light,
+                "statuses are only read when git is tracked"
+            );
+        });
+    };
+
     worktree.read_with(cx, |worktree, _| {
         assert!(worktree.entry_for_path(rel_path("b.txt")).is_none());
     });
     project.read_with(cx, |project, cx| {
         assert_eq!(project.resource_mode(cx), project::ResourceMode::AgentOnly);
-        assert!(project.repositories(cx).is_empty());
     });
+    assert_light_repository(true, cx);
 
     project
         .update(cx, |project, cx| project.scan_files(cx))
@@ -19907,8 +19933,8 @@ async fn test_agent_only_project_runs_only_what_is_asked_for(cx: &mut gpui::Test
             project::ResourceMode::AgentOnly,
             "reading the files is not the same as turning everything on"
         );
-        assert!(project.repositories(cx).is_empty());
     });
+    assert_light_repository(true, cx);
 
     // Git can be turned on without turning the language servers on with it.
     project.update(cx, |project, cx| {
@@ -19917,9 +19943,25 @@ async fn test_agent_only_project_runs_only_what_is_asked_for(cx: &mut gpui::Test
     cx.executor().run_until_parked();
     project.read_with(cx, |project, cx| {
         assert_eq!(project.resource_mode(cx), project::ResourceMode::Git);
-        assert_eq!(project.repositories(cx).len(), 1);
         assert!(project.lsp_store().read(cx).all_language_servers_stopped());
     });
+    assert_light_repository(false, cx);
+
+    // Turning git off again keeps the repository, light again.
+    project.update(cx, |project, cx| {
+        project.set_resource_mode(project::ResourceMode::AgentOnly, cx)
+    });
+    cx.executor().run_until_parked();
+    project.read_with(cx, |project, cx| {
+        assert_eq!(project.resource_mode(cx), project::ResourceMode::AgentOnly);
+    });
+    assert_light_repository(true, cx);
+
+    project.update(cx, |project, cx| {
+        project.set_resource_mode(project::ResourceMode::Git, cx)
+    });
+    cx.executor().run_until_parked();
+    assert_light_repository(false, cx);
 
     project.update(cx, |project, cx| {
         project.set_resource_mode(project::ResourceMode::Full, cx)
