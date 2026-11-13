@@ -4,6 +4,9 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
+use gpui::AsyncApp;
+
 use super::*;
 
 pub struct MobileProject {
@@ -452,6 +455,54 @@ pub fn find_or_open_workspace(
     }
 }
 
+/// Unarchives the thread if it's archived, restoring the worktrees archiving
+/// removed from disk, like [`Sidebar`]'s `open_thread_from_archive` does.
+async fn unarchive_thread(thread_id: ThreadId, cx: &mut AsyncApp) -> anyhow::Result<()> {
+    let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+    let Some((remote_connection, archived_worktrees)) = cx.update(|cx| {
+        let metadata = store.read(cx).entry(thread_id)?;
+        metadata.archived.then(|| {
+            (
+                metadata.remote_connection.clone(),
+                store.read(cx).get_archived_worktrees_for_thread(thread_id, cx),
+            )
+        })
+    }) else {
+        return Ok(());
+    };
+
+    let mut path_replacements = Vec::new();
+    for row in &archived_worktrees.await? {
+        let restored_path = thread_worktree_archive::restore_worktree_via_git(
+            row,
+            remote_connection.as_ref(),
+            cx,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to restore the thread's worktree {}",
+                row.worktree_path.display()
+            )
+        })?;
+        thread_worktree_archive::cleanup_archived_worktree_record(
+            row,
+            remote_connection.as_ref(),
+            cx,
+        )
+        .await;
+        path_replacements.push((row.worktree_path.clone(), restored_path));
+    }
+
+    store.update(cx, |store, cx| {
+        if !path_replacements.is_empty() {
+            store.update_restored_worktree_paths(thread_id, &path_replacements, cx);
+        }
+        store.unarchive(thread_id, cx);
+    });
+    Ok(())
+}
+
 /// Where a thread lives: the window to open it in, and its workspace if
 /// that's already open.
 struct ThreadTarget {
@@ -513,21 +564,21 @@ fn thread_target(thread_id: ThreadId, cx: &App) -> anyhow::Result<ThreadTarget> 
 /// Loads an agent thread in its workspace's agent panel without showing it,
 /// opening the workspace in the background first if needed, so that the
 /// user's view stays as it is.
+///
+/// An archived thread is unarchived first, as restoring it from Thread
+/// History does: the worktrees archiving removed are restored through git.
 pub fn load_thread_in_background(thread_id: ThreadId, cx: &mut App) -> Task<anyhow::Result<()>> {
     const PANEL_TIMEOUT: Duration = Duration::from_secs(90);
     const PANEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-    let target = match thread_target(thread_id, cx) {
-        Ok(target) => target,
-        Err(error) => return Task::ready(Err(error)),
-    };
     cx.spawn(async move |cx| {
+        unarchive_thread(thread_id, cx).await?;
         let ThreadTarget {
             metadata,
             window,
             open_workspace,
             key,
-        } = target;
+        } = cx.update(|cx| thread_target(thread_id, cx))?;
         let workspace = match open_workspace {
             Some(workspace) => workspace,
             None => {

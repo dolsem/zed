@@ -37,6 +37,17 @@
 //! Path segments are percent-decoded. The run and thread endpoints take
 //! `?detail=full` to include every [`RunItem`] instead of only the run's
 //! outcome.
+//!
+//! Starting work in a new worktree takes separate requests: create the
+//! worktree, create the thread in it, then set its controls and send it
+//! messages. Those last two need the agent's session, and answer `409` with
+//! [`SESSION_NOT_READY`] until it's loaded rather than waiting for it (a
+//! thread that isn't loaded starts loading). `GET /api/threads/{thread_id}`
+//! waits for the session, so it tells when the thread is ready.
+
+/// The error of setting a control or sending a message before the agent's
+/// session is loaded.
+pub const SESSION_NOT_READY: &str = "the agent's session is not ready yet";
 
 use std::collections::BTreeMap;
 
@@ -45,7 +56,6 @@ use utoipa::ToSchema;
 
 use crate::api::{
     AgentOption, ControlValue, NewThreadProject, PermissionOption, ThreadState, ToolCallStatus,
-    WorktreeChoice,
 };
 
 /// The body of every 4xx/5xx response.
@@ -140,18 +150,18 @@ pub struct CreateWorktreeRequest {
     pub branch: Option<String>,
 }
 
+/// Only creates the thread: create a worktree for it with `POST
+/// /api/worktrees` first, and set its controls and send it messages once its
+/// session is ready (`GET /api/threads/{thread_id}` waits for that).
 #[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateThreadRequest {
     pub project_id: String,
-    pub worktree: WorktreeChoice,
+    /// One of the project's worktree paths (see `WorktreeOption::path`).
+    /// Defaults to the project itself, its main worktree.
+    pub worktree_path: Option<String>,
     /// Defaults to the agent Zed would pick for a new thread.
     pub agent_id: Option<String>,
-    /// Controls (see [`crate::api::ThreadControl`]) to set before the first
-    /// message is sent, e.g. `{"mode": "plan"}`.
-    #[serde(default)]
-    pub controls: BTreeMap<String, ControlValue>,
-    /// The first message. Without it the thread stays a draft.
-    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -453,8 +463,6 @@ pub struct CreatedWorktree {
 pub struct CreatedThread {
     pub thread_id: String,
     pub workspace_paths: Vec<String>,
-    /// The run started by `message`, if one was given.
-    pub run_id: Option<String>,
 }
 
 /// Streamed by `/operations/{operation_id}/events` with the event name set
@@ -498,12 +506,6 @@ pub enum OperationEventKind {
     ThreadCreated {
         thread_id: String,
     },
-    ControlSet {
-        control_id: String,
-    },
-    MessageSent {
-        run_id: Option<String>,
-    },
     /// Something went wrong without failing the operation.
     Warning {
         message: String,
@@ -524,8 +526,6 @@ impl OperationEventKind {
             Self::HookStarted { .. } => "hook_started",
             Self::HookFinished { .. } => "hook_finished",
             Self::ThreadCreated { .. } => "thread_created",
-            Self::ControlSet { .. } => "control_set",
-            Self::MessageSent { .. } => "message_sent",
             Self::Warning { .. } => "warning",
             Self::Succeeded { .. } => "succeeded",
             Self::Failed { .. } => "failed",
@@ -540,7 +540,6 @@ pub enum OperationStep {
     CreatingWorktree,
     RunningHooks,
     StartingAgent,
-    SendingMessage,
 }
 
 #[cfg(test)]
@@ -578,17 +577,27 @@ mod tests {
     fn test_requests_parse() {
         let request: CreateThreadRequest = serde_json::from_value(serde_json::json!({
             "project_id": "local|/repo",
-            "worktree": { "kind": "new", "branch": "main" },
+            "worktree_path": "/worktrees/repo/a/repo",
             "agent_id": "claude-acp",
-            "controls": { "mode": "plan", "fast": true },
-            "message": "Fix the bug",
         }))
         .unwrap();
-        assert!(matches!(request.worktree, WorktreeChoice::New { .. }));
-        assert!(matches!(
-            request.controls.get("fast"),
-            Some(ControlValue::Toggle(true))
-        ));
+        assert_eq!(
+            request.worktree_path.as_deref(),
+            Some("/worktrees/repo/a/repo")
+        );
+        // Creating a thread no longer sends a message, so a request that asks
+        // for one fails rather than leaving it unsent.
+        assert!(
+            serde_json::from_value::<CreateThreadRequest>(serde_json::json!({
+                "project_id": "local|/repo",
+                "message": "Fix the bug",
+            }))
+            .is_err()
+        );
+
+        let request: SetControlRequest =
+            serde_json::from_value(serde_json::json!({ "value": true })).unwrap();
+        assert!(matches!(request.value, ControlValue::Toggle(true)));
 
         let response: QuestionResponse = serde_json::from_value(serde_json::json!({
             "action": "accept",

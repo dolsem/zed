@@ -210,40 +210,13 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "create_thread",
-            "Starts an agent thread in a project, in an existing or a new git worktree, and optionally sends its first message. Waits for the thread to start, and with a message, for its first run.",
+            "Creates an agent thread in one of a project's worktrees (make a new one with create_worktree first). Returns once the thread exists; its agent's session keeps loading, and set_thread_control and send_message fail until it's ready. get_thread waits for the session.",
             object_schema(
                 merge(
                     json!({
                         "project_id": { "type": "string", "description": "From list_projects." },
-                        "worktree": {
-                            "description": "Where the thread works. Defaults to the project's main worktree.",
-                            "oneOf": [
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "kind": { "const": "existing" },
-                                        "path": { "type": "string", "description": "One of the project's worktree paths (empty for projects without git)." },
-                                    },
-                                    "required": ["kind", "path"],
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "kind": { "const": "new" },
-                                        "name": { "type": "string" },
-                                        "branch": { "type": "string" },
-                                    },
-                                    "required": ["kind"],
-                                },
-                            ],
-                        },
+                        "worktree_path": { "type": "string", "description": "One of the project's worktree paths, from list_projects or create_worktree. Defaults to the project's main worktree." },
                         "agent_id": { "type": "string", "description": "From list_agents (default: Zed's default agent)." },
-                        "controls": {
-                            "type": "object",
-                            "description": "Controls to set before the first message, by id, e.g. {\"config:mode\": \"plan\"}. The ids are in get_thread's state.controls.",
-                            "additionalProperties": { "type": ["string", "boolean"] },
-                        },
-                        "message": { "type": "string", "description": "The first message." },
                     }),
                     wait_properties(),
                 ),
@@ -291,7 +264,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "send_message",
-            "Sends a message to a thread, which starts a new run (or is queued while the agent is busy). Waits for the run by default.",
+            "Sends a message to a thread, which starts a new run (or is queued while the agent is busy). Waits for the run by default. Fails while the agent's session isn't ready yet (call get_thread to wait for it).",
             object_schema(
                 merge(
                     json!({
@@ -355,7 +328,7 @@ pub fn tools() -> Vec<Value> {
         ),
         tool(
             "set_thread_control",
-            "Sets a thread's control, e.g. its model or mode. The ids and options are in get_thread's state.controls.",
+            "Sets a thread's control, e.g. its model or mode. The ids and options are in get_thread's state.controls. Fails while the agent's session isn't ready yet (call get_thread to wait for it).",
             object_schema(
                 json!({
                     "thread_id": thread_id_property(),

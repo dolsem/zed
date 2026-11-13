@@ -338,9 +338,9 @@ impl MobileBridge {
                 if request.text.trim().is_empty() {
                     return Task::ready(Err(bad_request("the message is empty")));
                 }
-                self.with_thread(thread_id, cx, move |_, conversation, cx| {
+                Task::ready(self.ready_conversation(thread_id, cx).and_then(|conversation| {
                     json(send_message(&conversation, request.text, cx).map_err(conflict)?)
-                })
+                }))
             }
             ("POST", ["threads", thread_id, "cancel"]) => {
                 self.with_thread(thread_id, cx, move |_, conversation, cx| {
@@ -378,13 +378,13 @@ impl MobileBridge {
                     Err(error) => return Task::ready(Err(error)),
                 };
                 let thread_id = thread_id.to_string();
-                let control_id = control_id.to_string();
-                let conversation = self.ensure_conversation(&thread_id, cx);
+                let conversation = match self.ready_conversation(&thread_id, cx) {
+                    Ok(conversation) => conversation,
+                    Err(error) => return Task::ready(Err(error)),
+                };
+                let task =
+                    agent_mobile::set_control(&conversation, control_id, request.value, cx);
                 cx.spawn(async move |this, cx| {
-                    let conversation = conversation.await?;
-                    let task = cx.update(|cx| {
-                        agent_mobile::set_control(&conversation, &control_id, request.value, cx)
-                    });
                     task.await.map_err(conflict)?;
                     this.update(cx, |this, cx| this.mark_thread_state_dirty(&thread_id, cx))?;
                     empty()
@@ -453,6 +453,37 @@ impl MobileBridge {
         }
         let conversation = self.load_conversation(thread_id, cx);
         cx.background_spawn(async move { conversation.await.map_err(conflict) })
+    }
+
+    /// The thread's conversation if its agent's session is loaded, without
+    /// waiting for it: until then, this fails with
+    /// [`rest::SESSION_NOT_READY`], having started loading a thread that
+    /// wasn't loaded.
+    fn ready_conversation(
+        &mut self,
+        thread_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<MobileConversation> {
+        let Ok(parsed_thread_id) = ThreadId::from_key_string(thread_id) else {
+            return Err(bad_request("invalid thread id"));
+        };
+        if let Ok(conversation) = self.conversation_for(thread_id, cx) {
+            if conversation.thread(cx).is_some() {
+                return Ok(conversation);
+            }
+            if let Some(error) = agent_mobile::conversation_error(&conversation, cx) {
+                return Err(api_error(409, error));
+            }
+            return Err(api_error(409, rest::SESSION_NOT_READY));
+        }
+        let is_known = agent_ui::thread_metadata_store::ThreadMetadataStore::try_global(cx)
+            .is_some_and(|store| store.read(cx).entry(parsed_thread_id).is_some());
+        if !is_known {
+            return Err(not_found(format!("no thread {thread_id:?}")));
+        }
+        // The bridge keeps the load until it's done.
+        let _load = self.thread_load(parsed_thread_id, cx);
+        Err(api_error(409, rest::SESSION_NOT_READY))
     }
 
     fn with_thread(

@@ -12,7 +12,6 @@ use collections::HashSet;
 use futures::StreamExt as _;
 use gpui::{App, AsyncApp, Context, Entity, Task, WeakEntity, WindowHandle};
 use mobile_protocol::RequestId;
-use mobile_protocol::api::WorktreeChoice;
 use mobile_protocol::rest::{
     self, OperationEventKind, OperationKind, OperationResult, OperationStatus, OperationStep,
 };
@@ -24,10 +23,8 @@ use workspace::tasks::{WorktreeHookEvent, WorktreeHookEventHandler};
 use workspace::{MultiWorkspace, ProjectGroupKey, Workspace};
 
 use crate::MobileBridge;
-use crate::rest::{Reply, StreamTarget, not_found, send_message};
-use crate::threads::{
-    find_project_group, wait_for_agent_panel, wait_for_conversation, workspace_paths,
-};
+use crate::rest::{Reply, StreamTarget, not_found};
+use crate::threads::{find_project_group, wait_for_agent_panel, workspace_paths};
 use crate::workspace_items::all_panes;
 
 /// Finished operations beyond this many are forgotten, oldest first.
@@ -276,13 +273,13 @@ impl MobileBridge {
         request: rest::CreateThreadRequest,
         cx: &mut Context<Self>,
     ) -> Result<Reply> {
-        let (window, key, workspaces) = find_project_group(&request.project_id, cx)
+        let (window, key, _) = find_project_group(&request.project_id, cx)
             .ok_or_else(|| not_found(format!("no open project {:?}", request.project_id)))?;
         self.start_operation(
             OperationKind::CreateThread,
             cx,
             async move |reporter, cx| {
-                let thread = create_thread(reporter, request, window, key, workspaces, cx).await?;
+                let thread = create_thread(reporter, request, window, key, cx).await?;
                 Ok(OperationResult::Thread(thread))
             },
         )
@@ -499,28 +496,21 @@ async fn create_thread(
     request: rest::CreateThreadRequest,
     window: WindowHandle<MultiWorkspace>,
     key: ProjectGroupKey,
-    workspaces: Vec<Entity<Workspace>>,
     cx: &mut AsyncApp,
 ) -> Result<rest::CreatedThread> {
-    let workspace = match request.worktree {
-        WorktreeChoice::Existing { path } => {
-            reporter.step(OperationStep::OpeningProject, "Opening the project", cx);
-            // Projects without git have no worktrees to pick from, so an
-            // empty path stands for the project itself.
-            let folder_paths = if key.path_list().paths().len() > 1 || path.is_empty() {
-                key.path_list().clone()
-            } else {
-                PathList::new(&[std::path::PathBuf::from(&path)])
-            };
-            cx.update(|cx| find_or_open_workspace(window, key.clone(), folder_paths, cx))
-                .await?
+    reporter.step(OperationStep::OpeningProject, "Opening the project", cx);
+    // No path, or an empty one, stands for the project itself (its main
+    // worktree, or the folders of a project without git).
+    let worktree_path = request.worktree_path.filter(|path| !path.is_empty());
+    let folder_paths = match worktree_path {
+        Some(path) if key.path_list().paths().len() == 1 => {
+            PathList::new(&[std::path::PathBuf::from(&path)])
         }
-        WorktreeChoice::New { name, branch } => {
-            create_worktree(reporter, window, key, workspaces, name, branch, cx)
-                .await?
-                .0
-        }
+        _ => key.path_list().clone(),
     };
+    let workspace = cx
+        .update(|cx| find_or_open_workspace(window, key.clone(), folder_paths, cx))
+        .await?;
 
     reporter.step(OperationStep::StartingAgent, "Starting the agent", cx);
     wait_for_agent_panel(&workspace, cx).await?;
@@ -548,31 +538,10 @@ async fn create_thread(
         },
         cx,
     );
-    let conversation = wait_for_conversation(thread_id, cx).await?;
-
-    for (control_id, value) in request.controls {
-        let task = cx.update(|cx| agent_mobile::set_control(&conversation, &control_id, value, cx));
-        task.await
-            .with_context(|| format!("failed to set {control_id:?}"))?;
-        reporter.report(OperationEventKind::ControlSet { control_id }, cx);
-    }
-
-    let mut run_id = None;
-    if let Some(message) = request.message.filter(|message| !message.trim().is_empty()) {
-        reporter.step(OperationStep::SendingMessage, "Sending the message", cx);
-        let sent = cx.update(|cx| send_message(&conversation, message, cx))?;
-        reporter.report(
-            OperationEventKind::MessageSent {
-                run_id: sent.run_id.clone(),
-            },
-            cx,
-        );
-        run_id = sent.run_id;
-    }
-
+    // The agent's session keeps loading after this: controls and messages are
+    // refused until it's ready.
     Ok(rest::CreatedThread {
         thread_id: thread_key,
         workspace_paths: cx.update(|cx| workspace_paths(&workspace, cx)),
-        run_id,
     })
 }

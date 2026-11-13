@@ -1,6 +1,10 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
+
+use futures::FutureExt as _;
+use futures::future::Shared;
 
 use acp_thread::AcpThreadEvent;
 use agent_ui::mobile::{self as agent_mobile, MobileConversation};
@@ -34,8 +38,12 @@ pub(crate) struct ThreadsState {
     list_refresh_task: Option<Task<()>>,
     observed_sidebars: HashMap<EntityId, Subscription>,
     threads: HashMap<String, ThreadSubscription>,
+    /// Threads being loaded in the background.
+    loads: HashMap<ThreadId, ThreadLoad>,
     _global_subscriptions: Vec<Subscription>,
 }
+
+type ThreadLoad = Shared<Task<Result<(), Arc<anyhow::Error>>>>;
 
 struct ThreadSubscription {
     /// Web UI clients with the thread open.
@@ -229,19 +237,39 @@ impl MobileBridge {
             Err(error) => return Task::ready(Err(error.context("invalid thread id"))),
         };
         let load = if agent_mobile::find_conversation(parsed_thread_id, cx).is_none() {
-            Some(sidebar::mobile::load_thread_in_background(
-                parsed_thread_id,
-                cx,
-            ))
+            Some(self.thread_load(parsed_thread_id, cx))
         } else {
             None
         };
         cx.spawn(async move |_, cx| {
             if let Some(load) = load {
-                load.await?;
+                load.await.map_err(|error| anyhow!("{error:#}"))?;
             }
             wait_for_conversation(parsed_thread_id, cx).await
         })
+    }
+
+    /// Loads the thread in the background, unless it's being loaded already:
+    /// requests retried while a thread loads (and an archived one has its
+    /// worktrees restored) share the one load.
+    pub(crate) fn thread_load(&mut self, thread_id: ThreadId, cx: &mut Context<Self>) -> ThreadLoad {
+        if let Some(load) = self.threads.loads.get(&thread_id) {
+            return load.clone();
+        }
+        let load = sidebar::mobile::load_thread_in_background(thread_id, cx);
+        let load = cx
+            .spawn(async move |this, cx| {
+                let result = load.await.map_err(Arc::new);
+                if let Err(error) = &result {
+                    log::error!("failed to load thread {thread_id:?}: {error:#}");
+                }
+                this.update(cx, |this, _| this.threads.loads.remove(&thread_id))
+                    .ok();
+                result
+            })
+            .shared();
+        self.threads.loads.insert(thread_id, load.clone());
+        load
     }
 }
 

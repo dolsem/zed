@@ -10474,6 +10474,76 @@ async fn test_unarchive_only_shows_restored_thread(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_loading_archived_thread_in_background_unarchives_it(cx: &mut TestAppContext) {
+    // The HTTP API loads a thread to send it a message or set its controls;
+    // an archived one comes back from Thread History first.
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    cx.run_until_parked();
+
+    let connection = acp_thread::StubAgentConnection::new();
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Hello".into()),
+    )]);
+    agent_ui::test_support::open_thread_with_connection(&panel, connection, cx);
+    agent_ui::test_support::send_message(&panel, cx);
+    let session_id = agent_ui::test_support::active_session_id(&panel, cx);
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread(&session_id, window, cx);
+    });
+    cx.run_until_parked();
+    let thread_id = cx.update(|_, cx| {
+        let store = ThreadMetadataStore::global(cx);
+        let metadata = store
+            .read(cx)
+            .entries()
+            .find(|e| e.session_id.as_ref() == Some(&session_id))
+            .expect("thread should exist");
+        assert!(metadata.archived);
+        metadata.thread_id
+    });
+
+    let load = cx.update(|_, cx| crate::mobile::load_thread_in_background(thread_id, cx));
+    cx.run_until_parked();
+    load.await.expect("the thread should load");
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let metadata = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .cloned()
+            .expect("metadata should exist");
+        assert!(!metadata.archived, "loading the thread unarchives it");
+        // (`agent_ui::mobile::find_conversation` can't read the window while
+        // the test holds it, so look in the panels directly.)
+        let is_loaded = multi_workspace.read(cx).workspaces().any(|workspace| {
+            workspace
+                .read(cx)
+                .panel::<AgentPanel>(cx)
+                .is_some_and(|panel| panel.read(cx).conversation_view_for_id(&thread_id, cx).is_some())
+        });
+        assert!(is_loaded, "the thread is loaded");
+    });
+    let entries = visible_entries_as_strings(&sidebar, cx);
+    let title = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(thread_id)
+            .unwrap()
+            .display_title()
+    });
+    assert!(
+        entries.iter().any(|e| e.contains(title.as_ref())),
+        "expected the unarchived thread in the sidebar, got entries: {entries:?}"
+    );
+}
+
+#[gpui::test]
 async fn test_unarchive_first_thread_in_group_does_not_create_spurious_draft(
     cx: &mut TestAppContext,
 ) {

@@ -308,29 +308,13 @@ async fn call_tool(
         }
         "create_thread" => {
             string(arguments, "project_id")?;
-            let mut body = body_of(
-                arguments,
-                &["project_id", "worktree", "agent_id", "controls", "message"],
-            );
-            if body.get("worktree").is_none() {
-                // An empty path stands for the project's main worktree.
-                body["worktree"] = json!({ "kind": "existing", "path": "" });
-            }
+            let body = body_of(arguments, &["project_id", "worktree_path", "agent_id"]);
             let operation = rest_ok(bridge, "POST", &["threads"], &[], Some(body), cx).await?;
             if !flag(arguments, "wait", true)? {
                 return Ok(operation);
             }
             let deadline = cx.background_executor().now() + wait_timeout(arguments)?;
-            let operation =
-                wait_for_operation(bridge, operation_id(&operation)?, deadline, cx).await?;
-            let result = &operation["result"];
-            let (Some(thread_id), Some(run_id)) =
-                (result["thread_id"].as_str(), result["run_id"].as_str())
-            else {
-                return Ok(operation);
-            };
-            let run = wait_for_run(bridge, thread_id, Some(run_id), deadline, cx).await?;
-            Ok(json!({ "operation": operation, "run": run }))
+            wait_for_operation(bridge, operation_id(&operation)?, deadline, cx).await
         }
         "get_thread" => {
             let thread_id = string(arguments, "thread_id")?;

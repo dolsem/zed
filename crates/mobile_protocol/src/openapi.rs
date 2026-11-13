@@ -154,7 +154,11 @@ struct ThreadsQueryParams {
     flair: Option<String>,
 }
 
-/// Starts a thread, optionally in a new worktree and with a first message.
+/// Creates a thread in one of the project's worktrees.
+///
+/// The operation succeeds once the thread exists. Its agent's session keeps
+/// loading after that: setting controls and sending messages answer `409`
+/// until it's ready, which `GET /api/threads/{thread_id}` waits for.
 #[utoipa::path(
     post,
     path = "/api/threads",
@@ -162,7 +166,7 @@ struct ThreadsQueryParams {
     request_body = CreateThreadRequest,
     responses(
         (status = 202, body = Operation, description = "The operation that creates the thread."),
-        (status = 400, body = ErrorResponse),
+        (status = 400, body = ErrorResponse, description = "Invalid body, e.g. with a field this request no longer takes."),
         (status = 404, body = ErrorResponse, description = "No such project."),
     ),
 )]
@@ -257,7 +261,7 @@ fn command_output() {}
         (status = 200, body = SentMessage),
         (status = 400, body = ErrorResponse, description = "The message is empty."),
         (status = 404, body = ErrorResponse, description = "No such thread."),
-        (status = 409, body = ErrorResponse, description = "The thread can't take messages right now."),
+        (status = 409, body = ErrorResponse, description = "The agent's session isn't ready yet (`the agent's session is not ready yet`; a thread that wasn't loaded starts loading), or the thread can't take messages right now."),
     ),
 )]
 fn send_message() {}
@@ -316,7 +320,7 @@ fn answer_question() {}
     responses(
         (status = 200, body = EmptyResponse),
         (status = 404, body = ErrorResponse, description = "No such thread."),
-        (status = 409, body = ErrorResponse, description = "No such control, or the value doesn't fit it."),
+        (status = 409, body = ErrorResponse, description = "The agent's session isn't ready yet (`the agent's session is not ready yet`; a thread that wasn't loaded starts loading), no such control, or the value doesn't fit it."),
     ),
 )]
 fn set_control() {}
