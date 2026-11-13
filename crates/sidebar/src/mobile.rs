@@ -20,6 +20,8 @@ pub struct MobileThread {
     pub id: MobileThreadId,
     pub title: SharedString,
     pub status: AgentThreadStatus,
+    /// The agent finished its turn but left work running, e.g. a dev server.
+    pub has_background_work: bool,
     pub agent_id: Option<AgentId>,
     pub worktrees: Vec<SharedString>,
     pub lines_added: u32,
@@ -180,6 +182,7 @@ pub fn threads_snapshot(cx: &App) -> Vec<MobileProject> {
                     id: MobileThreadId::Agent(metadata.thread_id),
                     title,
                     status,
+                    has_background_work: live_info.is_some_and(|info| info.has_background_work),
                     agent_id: Some(metadata.agent_id.clone()),
                     worktrees,
                     lines_added: diff_stats.lines_added,
@@ -211,6 +214,7 @@ pub fn threads_snapshot(cx: &App) -> Vec<MobileProject> {
                     id: MobileThreadId::Terminal(metadata.terminal_id),
                     title: metadata.display_title(),
                     status: AgentThreadStatus::Completed,
+                    has_background_work: false,
                     agent_id: None,
                     worktrees: worktree_labels(&worktree_info_from_thread_paths(
                         &metadata.worktree_paths,
@@ -308,7 +312,8 @@ pub fn all_threads_snapshot(cx: &App) -> Vec<MobileProject> {
         if listed_thread_ids.contains(&metadata.thread_id) {
             continue;
         }
-        let (title, status, diff_stats) = match live_infos.get(session_id) {
+        let live_info = live_infos.get(session_id);
+        let (title, status, diff_stats) = match live_info {
             Some(info) => (info.title.clone(), info.status, info.diff_stats),
             None => (
                 metadata.display_title(),
@@ -325,6 +330,7 @@ pub fn all_threads_snapshot(cx: &App) -> Vec<MobileProject> {
                 id: MobileThreadId::Agent(metadata.thread_id),
                 title,
                 status,
+                has_background_work: live_info.is_some_and(|info| info.has_background_work),
                 agent_id: Some(metadata.agent_id.clone()),
                 worktrees: worktree_labels(&worktree_info_from_thread_paths(
                     &metadata.worktree_paths,
@@ -354,6 +360,7 @@ pub fn all_threads_snapshot(cx: &App) -> Vec<MobileProject> {
                 id: MobileThreadId::Terminal(metadata.terminal_id),
                 title: metadata.display_title(),
                 status: AgentThreadStatus::Completed,
+                has_background_work: false,
                 agent_id: None,
                 worktrees: worktree_labels(&worktree_info_from_thread_paths(
                     &metadata.worktree_paths,

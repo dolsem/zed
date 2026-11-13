@@ -382,6 +382,9 @@ pub struct ThreadSummary {
     pub kind: ThreadKind,
     pub title: String,
     pub status: ThreadStatus,
+    /// The agent finished its turn but left work running, e.g. a dev server.
+    /// [`ThreadState::background_tasks`] lists it.
+    pub has_background_work: bool,
     pub agent_name: Option<String>,
     /// Labels for the worktrees the thread runs in, e.g. a linked worktree's
     /// branch name. Empty when it runs in the project's main worktree.
@@ -412,6 +415,8 @@ pub enum ThreadKind {
     Terminal,
 }
 
+/// `running` only while the agent works on a turn: work it left running
+/// after the turn, such as a dev server, is reported separately.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadStatus {
@@ -419,6 +424,45 @@ pub enum ThreadStatus {
     Running,
     WaitingForConfirmation,
     Error,
+}
+
+/// A command the agent sent to the background or left running after its turn.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
+pub struct BackgroundTask {
+    pub tool_call_id: String,
+    pub title: String,
+    /// Whether Zed runs the command and can stop it. Claude runs its commands
+    /// itself, so Zed only shows their output.
+    pub can_stop: bool,
+}
+
+/// What the agent reported at the end of its turn (Claude only, for now).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
+pub struct TurnStatus {
+    pub status: TurnOutcome,
+    /// The decisions the agent asked the user for and waits on.
+    pub pending_decisions: Vec<String>,
+    /// The parts of the task the agent could not do or verify.
+    pub incomplete: Vec<IncompleteTask>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    /// Everything requested was done, and nothing waits on the user.
+    Done,
+    /// The agent waits on at least one decision in `pending_decisions`.
+    NeedsDecision,
+    /// Some of the work in `incomplete` could not be done; the rest was.
+    Partial,
+    /// None of the work could proceed, see `incomplete`.
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, ToSchema)]
+pub struct IncompleteTask {
+    pub task: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,6 +554,11 @@ pub struct ThreadState {
     /// Whether the thread has unanswered prompts (elicitations) that can only
     /// be answered from Zed's desktop UI.
     pub needs_desktop_input: bool,
+    /// Commands the agent sent to the background or left running.
+    pub background_tasks: Vec<BackgroundTask>,
+    /// What the agent reported at the end of its last turn. `None` while it
+    /// works, and for agents and turns that report nothing.
+    pub turn_status: Option<TurnStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, ToSchema)]

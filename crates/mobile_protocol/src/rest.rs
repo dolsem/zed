@@ -194,6 +194,10 @@ pub struct Run {
     pub pending: Vec<PendingRequest>,
     /// Why the run failed, for [`RunStatus::Failed`].
     pub error: Option<String>,
+    /// What the agent reported at the end of the run: whether it is done,
+    /// waits on decisions, or could not do some of the work. Only for the
+    /// thread's last run once it finished, and only from agents that report it.
+    pub turn_status: Option<crate::api::TurnStatus>,
     pub message_count: usize,
     pub tool_call_count: usize,
     /// Only with `?detail=full`. Command output is omitted, see

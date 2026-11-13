@@ -90,6 +90,8 @@ export interface ThreadSummary {
   kind: ThreadKind;
   title: string;
   status: ThreadStatus;
+  /** The agent finished its turn but left work running, e.g. a dev server. */
+  has_background_work: boolean;
   agent_name: string | null;
   worktrees: string[];
   lines_added: number;
@@ -176,6 +178,30 @@ export interface ThreadState {
   token_usage: TokenUsage | null;
   error: string | null;
   needs_desktop_input: boolean;
+  /** Commands the agent sent to the background or left running. */
+  background_tasks: BackgroundTask[];
+  /** What the agent reported at the end of its last turn. */
+  turn_status: TurnStatus | null;
+}
+
+export interface BackgroundTask {
+  tool_call_id: string;
+  title: string;
+  /** Whether Zed runs the command and can stop it. */
+  can_stop: boolean;
+}
+
+export interface TurnStatus {
+  status: TurnOutcome;
+  pending_decisions: string[];
+  incomplete: IncompleteTask[];
+}
+
+export type TurnOutcome = "done" | "needs_decision" | "partial" | "blocked";
+
+export interface IncompleteTask {
+  task: string;
+  reason: string;
 }
 
 export interface TokenUsage {

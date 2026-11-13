@@ -48,6 +48,7 @@ pub struct ThreadItem {
     timestamp: SharedString,
     notified: bool,
     status: AgentThreadStatus,
+    has_background_work: bool,
     selected: bool,
     focused: bool,
     hovered: bool,
@@ -84,6 +85,7 @@ impl ThreadItem {
             timestamp: "".into(),
             notified: false,
             status: AgentThreadStatus::default(),
+            has_background_work: false,
             selected: false,
             focused: false,
             hovered: false,
@@ -143,6 +145,13 @@ impl ThreadItem {
 
     pub fn status(mut self, status: AgentThreadStatus) -> Self {
         self.status = status;
+        self
+    }
+
+    /// The agent finished its turn but left work running, e.g. a dev server.
+    /// Shown as a pulsing agent icon while the thread isn't running.
+    pub fn has_background_work(mut self, has_background_work: bool) -> Self {
+        self.has_background_work = has_background_work;
         self
     }
 
@@ -352,6 +361,17 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         } else if let Some(status_icon) = status_icon {
             icon_container().child(status_icon).into_any_element()
+        } else if self.has_background_work {
+            icon_container()
+                .child(agent_icon)
+                .with_animation(
+                    "background-work",
+                    Animation::new(Duration::from_secs(2))
+                        .repeat()
+                        .with_easing(pulsating_between(0.3, 1.0)),
+                    |container, delta| container.opacity(delta),
+                )
+                .into_any_element()
         } else {
             icon_container().child(agent_icon).into_any_element()
         };

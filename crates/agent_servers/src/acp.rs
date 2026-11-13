@@ -47,7 +47,7 @@ use acp_thread::{AcpThread, AuthRequired, LoadError, TerminalProviderEvent};
 use terminal::TerminalBuilder;
 use terminal::terminal_settings::{AlternateScroll, CursorShape};
 
-use crate::{CURSOR_ID, GEMINI_ID};
+use crate::{CLAUDE_AGENT_ID, CURSOR_ID, GEMINI_ID};
 
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
@@ -1397,31 +1397,56 @@ struct SessionDirectories {
 }
 
 impl SessionDirectories {
-    fn into_new_session_request(self, mcp_servers: Vec<acp::McpServer>) -> acp::NewSessionRequest {
+    fn into_new_session_request(
+        self,
+        mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
+    ) -> acp::NewSessionRequest {
         acp::NewSessionRequest::new(self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_load_session_request(
         self,
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
     ) -> acp::LoadSessionRequest {
         acp::LoadSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
 
     fn into_resume_session_request(
         self,
         session_id: acp::SessionId,
         mcp_servers: Vec<acp::McpServer>,
+        meta: Option<acp::Meta>,
     ) -> acp::ResumeSessionRequest {
         acp::ResumeSessionRequest::new(session_id, self.cwd)
             .additional_directories(self.additional_directories)
             .mcp_servers(mcp_servers)
+            .meta(meta)
     }
+}
+
+fn reports_turn_status(agent_id: &AgentId) -> bool {
+    agent_id.as_ref() == CLAUDE_AGENT_ID
+}
+
+/// The `_meta` of a session request. Claude's adapter appends
+/// `_meta.systemPrompt.append` to Claude Code's own system prompt, on every
+/// request that starts a session process (new, load and resume).
+fn session_request_meta(agent_id: &AgentId) -> Option<acp::Meta> {
+    reports_turn_status(agent_id).then(|| {
+        acp::Meta::from_iter([(
+            "systemPrompt".to_string(),
+            serde_json::json!({ "append": acp_thread::TURN_STATUS_INSTRUCTIONS }),
+        )])
+    })
 }
 
 fn session_directories_from_work_dirs(
@@ -1547,6 +1572,10 @@ impl AgentConnection for AcpConnection {
         self.agent_version.clone()
     }
 
+    fn reports_turn_status(&self) -> bool {
+        reports_turn_status(&self.id)
+    }
+
     fn new_session(
         self: Rc<Self>,
         project: Entity<Project>,
@@ -1560,11 +1589,12 @@ impl AgentConnection for AcpConnection {
         let name = self.id.0.clone();
         let mcp_servers =
             mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
+        let meta = session_request_meta(&self.id);
 
         cx.spawn(async move |cx| {
             let response = self
                 .connection
-                .send_request(directories.into_new_session_request(mcp_servers))
+                .send_request(directories.into_new_session_request(mcp_servers, meta))
                 .block_task()
             .await
             .map_err(map_acp_error)?;
@@ -1691,6 +1721,7 @@ impl AgentConnection for AcpConnection {
 
         let mcp_servers =
             mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
+        let meta = session_request_meta(&self.id);
         self.open_or_create_session(
             session_id,
             project,
@@ -1699,9 +1730,11 @@ impl AgentConnection for AcpConnection {
             move |connection, session_id, directories| {
                 Box::pin(async move {
                     let response = connection
-                        .send_request(
-                            directories.into_load_session_request(session_id.clone(), mcp_servers),
-                        )
+                        .send_request(directories.into_load_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            meta,
+                        ))
                         .block_task()
                         .await
                         .map_err(map_acp_error)?;
@@ -1736,6 +1769,7 @@ impl AgentConnection for AcpConnection {
 
         let mcp_servers =
             mcp_servers_for_project(&project, self.agent_capabilities.mcp_capabilities.http, cx);
+        let meta = session_request_meta(&self.id);
         self.open_or_create_session(
             session_id,
             project,
@@ -1744,10 +1778,11 @@ impl AgentConnection for AcpConnection {
             move |connection, session_id, directories| {
                 Box::pin(async move {
                     let response = connection
-                        .send_request(
-                            directories
-                                .into_resume_session_request(session_id.clone(), mcp_servers),
-                        )
+                        .send_request(directories.into_resume_session_request(
+                            session_id.clone(),
+                            mcp_servers,
+                            meta,
+                        ))
                         .block_task()
                         .await
                         .map_err(map_acp_error)?;
@@ -3149,12 +3184,15 @@ mod tests {
         );
 
         let session_id = acp::SessionId::new("session-1");
-        let new_session_request = directories.clone().into_new_session_request(Vec::new());
-        let load_session_request = directories
+        let new_session_request = directories
             .clone()
-            .into_load_session_request(session_id.clone(), Vec::new());
+            .into_new_session_request(Vec::new(), None);
+        let load_session_request =
+            directories
+                .clone()
+                .into_load_session_request(session_id.clone(), Vec::new(), None);
         let resume_session_request =
-            directories.into_resume_session_request(session_id, Vec::new());
+            directories.into_resume_session_request(session_id, Vec::new(), None);
 
         assert_eq!(
             new_session_request.cwd,

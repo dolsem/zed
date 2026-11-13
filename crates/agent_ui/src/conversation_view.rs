@@ -1946,8 +1946,9 @@ impl ConversationView {
 
                 // Skip notifying when a queued message was just auto-sent: the agent
                 // is not actually idle and a notification here would fire just before the
-                // next turn starts. Background work notifies once it ends instead.
-                if !sent_queued_message && !thread.read(cx).has_background_work() {
+                // next turn starts. Work the agent left running (e.g. a dev server) doesn't
+                // hold this back: it is shown as background work, and notifies again once it ends.
+                if !sent_queued_message {
                     let used_tools = thread.read(cx).used_tools_since_last_user_message();
                     self.notify_with_sound(
                         if used_tools {

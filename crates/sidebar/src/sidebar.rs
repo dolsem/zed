@@ -231,6 +231,7 @@ struct ActiveThreadInfo {
     session_id: acp::SessionId,
     title: SharedString,
     status: AgentThreadStatus,
+    has_background_work: bool,
     icon: IconName,
     icon_from_external_svg: Option<SharedString>,
     is_background: bool,
@@ -381,6 +382,7 @@ struct ThreadEntry {
     icon: IconName,
     icon_from_external_svg: Option<SharedString>,
     status: AgentThreadStatus,
+    has_background_work: bool,
     workspace: ThreadEntryWorkspace,
     is_live: bool,
     is_background: bool,
@@ -409,6 +411,7 @@ impl ThreadEntry {
     fn apply_active_info(&mut self, info: &ActiveThreadInfo) {
         self.metadata.title = Some(info.title.clone());
         self.status = info.status;
+        self.has_background_work = info.has_background_work;
         self.icon = info.icon;
         self.icon_from_external_svg = info.icon_from_external_svg.clone();
         self.is_live = true;
@@ -1646,6 +1649,7 @@ impl Sidebar {
                             icon,
                             icon_from_external_svg,
                             status: AgentThreadStatus::default(),
+                            has_background_work: false,
                             workspace,
                             is_live: false,
                             is_background: false,
@@ -6326,6 +6330,7 @@ impl Sidebar {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
             })
             .status(thread.status)
+            .has_background_work(thread.has_background_work)
             .is_remote(is_remote)
             .when_some(icon_svg, |this, svg| {
                 this.custom_icon_from_external_svg(svg)
@@ -8423,15 +8428,18 @@ fn all_thread_infos_for_workspace(
             let session_id = thread.session_id().clone();
             let is_background = agent_panel.is_retained_thread(&conversation_thread_id);
 
+            // Work the agent left running doesn't count as running: the
+            // thread shows it with a pulsing icon instead.
             let status = if has_pending_tool_call {
                 AgentThreadStatus::WaitingForConfirmation
             } else if thread.had_error() {
                 AgentThreadStatus::Error
-            } else if thread.is_busy() {
+            } else if thread.status() == ThreadStatus::Generating {
                 AgentThreadStatus::Running
             } else {
                 AgentThreadStatus::Completed
             };
+            let has_background_work = thread.has_background_work();
 
             let diff_stats = thread.action_log().read(cx).diff_stats(cx);
 
@@ -8439,6 +8447,7 @@ fn all_thread_infos_for_workspace(
                 session_id,
                 title,
                 status,
+                has_background_work,
                 icon,
                 icon_from_external_svg,
                 is_background,

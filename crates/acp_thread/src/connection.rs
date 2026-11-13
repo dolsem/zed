@@ -97,6 +97,12 @@ pub trait AgentConnection {
         None
     }
 
+    /// Whether the agent was asked to end each turn with a turn status tag
+    /// (see [`crate::TURN_STATUS_INSTRUCTIONS`]).
+    fn reports_turn_status(&self) -> bool {
+        false
+    }
+
     fn new_session(
         self: Rc<Self>,
         project: Entity<Project>,

@@ -189,16 +189,51 @@ pub fn thread_entry(
     Some(convert_entry(entry, cx))
 }
 
+/// Work the agent left running doesn't make the thread `Running`; see
+/// [`background_tasks`].
 pub fn thread_status(thread: &AcpThread) -> api::ThreadStatus {
     if thread.is_waiting_for_confirmation() {
         api::ThreadStatus::WaitingForConfirmation
-    } else if thread.is_busy() {
+    } else if thread.status() == ThreadStatus::Generating {
         api::ThreadStatus::Running
     } else if thread.had_error() {
         api::ThreadStatus::Error
     } else {
         api::ThreadStatus::Idle
     }
+}
+
+pub fn background_tasks(thread: &AcpThread, cx: &App) -> Vec<api::BackgroundTask> {
+    thread
+        .background_tasks(cx)
+        .into_iter()
+        .map(|task| api::BackgroundTask {
+            tool_call_id: task.tool_call_id.0.to_string(),
+            title: task.title,
+            can_stop: task.terminal.read(cx).is_process_backed(),
+        })
+        .collect()
+}
+
+pub fn turn_status(thread: &AcpThread) -> Option<api::TurnStatus> {
+    let status = thread.turn_status()?;
+    Some(api::TurnStatus {
+        status: match status.status {
+            acp_thread::TurnOutcome::Done => api::TurnOutcome::Done,
+            acp_thread::TurnOutcome::NeedsDecision => api::TurnOutcome::NeedsDecision,
+            acp_thread::TurnOutcome::Partial => api::TurnOutcome::Partial,
+            acp_thread::TurnOutcome::Blocked => api::TurnOutcome::Blocked,
+        },
+        pending_decisions: status.pending_decisions,
+        incomplete: status
+            .incomplete
+            .into_iter()
+            .map(|incomplete| api::IncompleteTask {
+                task: incomplete.task,
+                reason: incomplete.reason,
+            })
+            .collect(),
+    })
 }
 
 pub fn thread_state(
@@ -257,6 +292,8 @@ pub fn thread_state(
         token_usage,
         error: thread_view.error_message(cx),
         needs_desktop_input,
+        background_tasks: background_tasks(thread, cx),
+        turn_status: turn_status(thread),
     })
 }
 
@@ -1021,8 +1058,9 @@ pub fn build_run(
         }
     }
 
-    // Background work (e.g. a command the agent left running) keeps the run going.
-    let is_generating = is_last && thread.is_busy();
+    // Work the agent left running (e.g. a dev server) doesn't keep the run
+    // going; the thread state lists it as background tasks.
+    let is_generating = is_last && thread.status() == ThreadStatus::Generating;
     // Only the last run's turn is still described by the thread's state.
     let stop_reason = match thread.foreground_state() {
         acp_v2::StateUpdate::Idle(idle) if is_last => idle.stop_reason.clone(),
@@ -1073,6 +1111,10 @@ pub fn build_run(
         final_message: final_message.filter(|_| status.is_finished()),
         pending,
         error,
+        turn_status: is_last
+            .then(|| turn_status(thread))
+            .flatten()
+            .filter(|_| status.is_finished()),
         message_count,
         tool_call_count,
         items,

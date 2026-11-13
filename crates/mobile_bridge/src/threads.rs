@@ -1272,6 +1272,7 @@ fn threads_list(snapshot: Vec<sidebar::mobile::MobileProject>, cx: &App) -> Thre
                             ui::AgentThreadStatus::Error => api::ThreadStatus::Error,
                             ui::AgentThreadStatus::Completed => api::ThreadStatus::Idle,
                         },
+                        has_background_work: thread.has_background_work,
                         agent_name: thread.agent_id.map(|agent_id| agent_name(&agent_id, cx)),
                         worktrees: thread
                             .worktrees

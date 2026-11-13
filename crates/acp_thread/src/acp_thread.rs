@@ -4,6 +4,7 @@ mod diff;
 mod mention;
 mod submission;
 mod terminal;
+mod turn_status;
 pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
 use agent_client_protocol::schema::{MaybeUndefined, v1 as acp_v1, v2 as acp_v2};
@@ -48,6 +49,10 @@ pub use submission::*;
 use task::{Shell, ShellBuilder};
 pub use terminal::*;
 use text::Bias;
+use turn_status::TurnStatusFilter;
+pub use turn_status::{
+    IncompleteTask, TURN_STATUS_INSTRUCTIONS, TurnOutcome, TurnStatus, TurnStatusParse,
+};
 use ui::App;
 use util::markdown::{MarkdownCodeBlock, MarkdownEscaped};
 use util::path_list::PathList;
@@ -428,6 +433,43 @@ fn can_merge_message_chunks(
         (Some(existing), Some(incoming)) => existing == incoming,
         _ => true,
     }
+}
+
+/// A command that runs on after its tool call finished, e.g. a dev server.
+#[derive(Clone)]
+pub struct BackgroundTask {
+    pub tool_call_id: acp_v1::ToolCallId,
+    pub entry_index: usize,
+    pub title: String,
+    /// Can be stopped from Zed only when it is
+    /// [`Terminal::is_process_backed`]: agents that run commands themselves
+    /// only show their output.
+    pub terminal: Entity<Terminal>,
+}
+
+/// The terminal of `call` whose command still runs.
+fn running_terminal(call: &ToolCall, cx: &App) -> Option<Entity<Terminal>> {
+    // Failed and cancelled calls may never report their terminal's exit.
+    if !matches!(
+        call.status(),
+        ToolCallStatus::Pending | ToolCallStatus::InProgress | ToolCallStatus::Completed
+    ) {
+        return None;
+    }
+    call.content().iter().find_map(|content| match content {
+        ToolCallContent::Terminal { terminal, .. } if terminal.read(cx).output().is_none() => {
+            Some(terminal.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Whether Claude's adapter attributed the update to a subagent.
+fn is_subagent_update(meta: &Option<acp_v1::Meta>) -> bool {
+    meta.as_ref()
+        .and_then(|meta| meta.get("claudeCode"))
+        .and_then(|claude_code| claude_code.get("parentToolUseId"))
+        .is_some_and(|parent| !parent.is_null())
 }
 
 #[derive(Clone, Copy)]
@@ -3325,6 +3367,7 @@ pub struct AcpThread {
     had_error: bool,
     /// See [`AcpThread::has_background_work`].
     has_background_work: bool,
+    running_terminal_count: usize,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp_v1::ContentBlock>>,
     /// The initial scroll position for the thread view, set during session registration.
@@ -3333,6 +3376,16 @@ pub struct AcpThread {
     /// reveal text gradually without changing the authoritative message.
     streaming_text_buffer: Option<StreamingTextBuffer>,
     idle_sleep_prevention: IdleSleepPrevention,
+    /// Set when the agent ends its turns with a turn status tag.
+    turn_status_filter: Option<TurnStatusFilter>,
+    /// The status the last finished turn reported.
+    turn_status: Option<TurnStatus>,
+    /// Zed is asking the agent for a missing turn status tag, so the agent's
+    /// output belongs to that hidden exchange and is not shown.
+    repairing_turn_status: bool,
+    /// A replayed session is between one of those hidden prompts and the next
+    /// user message.
+    replaying_turn_status_repair: bool,
 }
 
 enum IdleSleepPrevention {
@@ -3624,6 +3677,8 @@ impl AcpThread {
         });
 
         let receipt_submissions = connection.receipt_submissions(&session_id, cx);
+        let turn_status_filter = (parent_session_id.is_none() && connection.reports_turn_status())
+            .then(TurnStatusFilter::default);
         Self {
             parent_session_id,
             work_dirs,
@@ -3660,10 +3715,15 @@ impl AcpThread {
             pending_terminal_exit: HashMap::default(),
             had_error: false,
             has_background_work: false,
+            running_terminal_count: 0,
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
             idle_sleep_prevention: IdleSleepPrevention::Inactive,
+            turn_status_filter,
+            turn_status: None,
+            repairing_turn_status: false,
+            replaying_turn_status_repair: false,
         }
     }
 
@@ -3837,24 +3897,51 @@ impl AcpThread {
         self.status() == ThreadStatus::Generating || self.has_background_work
     }
 
-    fn sync_background_work(&mut self, cx: &mut Context<Self>) {
-        let has_background_work = self.entries.iter().any(|entry| {
-            let AgentThreadEntry::ToolCall(call) = entry else {
-                return false;
-            };
-            // Failed and cancelled calls may never report their terminal's exit.
-            matches!(
-                call.status(),
-                ToolCallStatus::Pending | ToolCallStatus::InProgress | ToolCallStatus::Completed
-            ) && call.content().iter().any(|content| {
-                matches!(content, ToolCallContent::Terminal { terminal, .. }
-                    if terminal.read(cx).output().is_none())
+    /// The commands the agent left running after its turn, or sent to the
+    /// background during it.
+    pub fn background_tasks(&self, cx: &App) -> Vec<BackgroundTask> {
+        let generating = self.status() == ThreadStatus::Generating;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_index, entry)| {
+                let AgentThreadEntry::ToolCall(call) = entry else {
+                    return None;
+                };
+                if generating && call.status() != ToolCallStatus::Completed {
+                    return None;
+                }
+                let terminal = running_terminal(call, cx)?;
+                Some(BackgroundTask {
+                    tool_call_id: call.id.clone(),
+                    entry_index,
+                    title: call.label.read(cx).source().to_string(),
+                    terminal,
+                })
             })
-        });
+            .collect()
+    }
+
+    fn sync_background_work(&mut self, cx: &mut Context<Self>) {
+        let running_terminal_count = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, AgentThreadEntry::ToolCall(call)
+                    if running_terminal(call, cx).is_some())
+            })
+            .count();
+        if running_terminal_count == self.running_terminal_count {
+            return;
+        }
+        self.running_terminal_count = running_terminal_count;
+        let has_background_work = running_terminal_count > 0;
         if has_background_work != self.has_background_work {
             self.has_background_work = has_background_work;
             cx.emit(AcpThreadEvent::BackgroundWorkChanged);
         }
+        // The list of background tasks changes also when one of several ends.
+        cx.notify();
     }
 
     pub fn is_waiting_for_confirmation(&self) -> bool {
@@ -4152,6 +4239,28 @@ impl AcpThread {
                 message_id,
                 ..
             }) => {
+                if self.repairing_turn_status {
+                    return Ok(());
+                }
+                let starts_user_message =
+                    !matches!(self.entries.last(), Some(AgentThreadEntry::UserMessage(_)));
+                if self.turn_status_filter.is_some() && starts_user_message {
+                    // A replayed user message ends the previous turn.
+                    if let Some(parse) = self.finish_turn_status_filter(cx) {
+                        self.turn_status = match parse {
+                            TurnStatusParse::Valid(status) => Some(status),
+                            _ => None,
+                        };
+                    }
+                    self.replaying_turn_status_repair = matches!(
+                        &content,
+                        acp_v1::ContentBlock::Text(text)
+                            if text.text.starts_with(turn_status::TURN_STATUS_REPAIR_MARKER)
+                    );
+                    if self.replaying_turn_status_repair {
+                        return Ok(());
+                    }
+                }
                 let content = content::from_v1(content).map_err(acp_v1::Error::from)?;
                 // We optimistically add the full user prompt before calling `prompt`.
                 // Some ACP servers echo user chunks back over updates. Skip echoed
@@ -4182,21 +4291,24 @@ impl AcpThread {
             acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk {
                 content,
                 message_id,
+                meta,
                 ..
             }) => {
-                self.push_assistant_content_block_with_message_id(
-                    message_id,
-                    content::from_v1(content).map_err(acp_v1::Error::from)?,
-                    false,
-                    false,
-                    cx,
-                );
+                let content = content::from_v1(content).map_err(acp_v1::Error::from)?;
+                if let Some(content) = self.filter_agent_message(content, &meta, cx) {
+                    self.push_assistant_content_block_with_message_id(
+                        message_id, content, false, false, cx,
+                    );
+                }
             }
             acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk {
                 content,
                 message_id,
                 ..
             }) => {
+                if self.hides_agent_output() {
+                    return Ok(());
+                }
                 self.push_assistant_content_block_with_message_id(
                     message_id,
                     content::from_v1(content).map_err(acp_v1::Error::from)?,
@@ -4206,6 +4318,9 @@ impl AcpThread {
                 );
             }
             acp_v1::SessionUpdate::ToolCall(tool_call) => {
+                if !is_subagent_update(&tool_call.meta) {
+                    self.interrupt_turn_status_filter(cx);
+                }
                 self.upsert_tool_call(tool_call, cx)?;
             }
             acp_v1::SessionUpdate::ToolCallUpdate(tool_call_update) => {
@@ -4636,6 +4751,114 @@ impl AcpThread {
                 cx,
             );
         }
+    }
+
+    /// The status the agent reported at the end of its last finished turn.
+    pub fn turn_status(&self) -> Option<TurnStatus> {
+        if self.status() == ThreadStatus::Generating {
+            return None;
+        }
+        self.turn_status
+            .clone()
+            .or_else(|| self.turn_status_filter.as_ref()?.captured_status())
+    }
+
+    fn hides_agent_output(&self) -> bool {
+        self.repairing_turn_status || self.replaying_turn_status_repair
+    }
+
+    /// Returns the part of an agent message chunk to show, without any turn
+    /// status tag.
+    fn filter_agent_message(
+        &mut self,
+        content: acp_v2::ContentBlock,
+        meta: &Option<acp_v1::Meta>,
+        cx: &mut Context<Self>,
+    ) -> Option<acp_v2::ContentBlock> {
+        if self.turn_status_filter.is_none() || is_subagent_update(meta) {
+            return Some(content);
+        }
+        let acp_v2::ContentBlock::Text(mut text) = content else {
+            self.interrupt_turn_status_filter(cx);
+            return (!self.hides_agent_output()).then_some(content);
+        };
+        text.text = self.turn_status_filter.as_mut()?.push(&text.text);
+        (!text.text.is_empty() && !self.hides_agent_output())
+            .then_some(acp_v2::ContentBlock::Text(text))
+    }
+
+    fn push_released_message_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() || self.hides_agent_output() {
+            return;
+        }
+        self.push_assistant_content_block_with_message_id(
+            None,
+            acp_v2::ContentBlock::Text(acp_v2::TextContent::new(text)),
+            false,
+            false,
+            cx,
+        );
+    }
+
+    fn interrupt_turn_status_filter(&mut self, cx: &mut Context<Self>) {
+        if let Some(filter) = &mut self.turn_status_filter {
+            let text = filter.interrupt();
+            self.push_released_message_text(text, cx);
+        }
+    }
+
+    fn finish_turn_status_filter(&mut self, cx: &mut Context<Self>) -> Option<TurnStatusParse> {
+        let (text, parse) = self.turn_status_filter.as_mut()?.finish();
+        self.push_released_message_text(text, cx);
+        Some(parse)
+    }
+
+    /// Ends the turn's message and, when it has no valid turn status tag, asks
+    /// the agent for one with a hidden prompt. The turn keeps running until the
+    /// tag arrives or Zed gives up asking.
+    async fn finish_turn_with_status(
+        this: &WeakEntity<Self>,
+        response: &acp_v1::PromptResponse,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let mut parse = this.update(cx, |this, cx| this.finish_turn_status_filter(cx))?;
+        if response.stop_reason != acp_v1::StopReason::EndTurn {
+            return Ok(());
+        }
+        for _ in 0..turn_status::MAX_TURN_STATUS_REPAIRS {
+            let Some(problem) = parse.as_ref().and_then(TurnStatusParse::problem) else {
+                break;
+            };
+            let repair = this.update(cx, |this, cx| {
+                this.repairing_turn_status = true;
+                let request = acp_v1::PromptRequest::new(
+                    this.session_id.clone(),
+                    vec![turn_status::turn_status_repair_prompt(&problem).into()],
+                );
+                this.connection.prompt(request, cx)
+            })?;
+            let repair_response = repair.await;
+            parse = this.update(cx, |this, cx| {
+                let parse = this.finish_turn_status_filter(cx);
+                this.repairing_turn_status = false;
+                parse
+            })?;
+            match repair_response {
+                Ok(repair_response)
+                    if repair_response.stop_reason == acp_v1::StopReason::EndTurn => {}
+                Ok(_) => break,
+                Err(error) => {
+                    log::error!("Failed to ask the agent for its turn status: {error:?}");
+                    break;
+                }
+            }
+        }
+        this.update(cx, |this, _| {
+            this.turn_status = match parse {
+                Some(TurnStatusParse::Valid(status)) => Some(status),
+                _ => None,
+            };
+        })
     }
 
     pub fn push_assistant_content_block(
@@ -5777,14 +6000,21 @@ impl AcpThread {
                 .ok();
             }
 
-            this.update(cx, |this, cx| {
-                if let (Some(prompt), Some(client_id)) = (client_user_message_ids, client_id) {
-                    prompt.prompt(client_id, request, cx)
-                } else {
-                    this.connection.prompt(request, cx)
-                }
-            })?
-            .await
+            let response = this
+                .update(cx, |this, cx| {
+                    if let (Some(prompt), Some(client_id)) = (client_user_message_ids, client_id) {
+                        prompt.prompt(client_id, request, cx)
+                    } else {
+                        this.connection.prompt(request, cx)
+                    }
+                })?
+                .await?;
+            if push_user_message {
+                Self::finish_turn_with_status(&this, &response, cx)
+                    .await
+                    .log_err();
+            }
+            Ok(response)
         })
     }
 
@@ -5824,6 +6054,12 @@ impl AcpThread {
     ) -> Submission {
         self.clear_completed_plan_entries(cx);
         self.had_error = false;
+        self.turn_status = None;
+        self.repairing_turn_status = false;
+        self.replaying_turn_status_repair = false;
+        if let Some(filter) = &mut self.turn_status_filter {
+            *filter = TurnStatusFilter::default();
+        }
 
         let (tx, rx) = oneshot::channel();
         let cancel_task = self.cancel_inner(RequestPermissionOutcome::InterruptedByFollowUp, cx);
@@ -5901,6 +6137,8 @@ impl AcpThread {
 
                 match response {
                     Ok(r) => {
+                        // Turns without a status request (commands, retries) still end their message.
+                        this.finish_turn_status_filter(cx);
                         this.flush_streaming_text(cx);
 
                         if r.stop_reason == acp_v1::StopReason::MaxTokens {
@@ -6002,6 +6240,7 @@ impl AcpThread {
                         if is_same_turn {
                             cx.emit(AcpThreadEvent::StatusChanged);
                         }
+                        this.interrupt_turn_status_filter(cx);
                         this.flush_streaming_text(cx);
                         if is_same_turn {
                             this.cancel_pending_turn_entries(cx);
@@ -14770,6 +15009,130 @@ mod tests {
         send_task.await.unwrap();
     }
 
+    fn turn_status_connection(
+        replies: &'static [&'static [&'static str]],
+        prompts: Rc<RefCell<Vec<String>>>,
+    ) -> Rc<FakeAgentConnection> {
+        Rc::new(
+            FakeAgentConnection::new()
+                .with_turn_status()
+                .on_user_message(move |request, thread, mut cx| {
+                    let text = match request.prompt.first() {
+                        Some(acp_v1::ContentBlock::Text(text)) => text.text.clone(),
+                        _ => String::new(),
+                    };
+                    let is_repair = text.starts_with(turn_status::TURN_STATUS_REPAIR_MARKER);
+                    let reply = replies[prompts.borrow().len()];
+                    prompts.borrow_mut().push(text);
+                    async move {
+                        thread.update(&mut cx, |thread, cx| {
+                            if is_repair {
+                                assert_eq!(thread.status(), ThreadStatus::Generating);
+                            }
+                            for chunk in reply {
+                                thread
+                                    .handle_session_update(
+                                        acp_v1::SessionUpdate::AgentMessageChunk(
+                                            acp_v1::ContentChunk::new((*chunk).into()),
+                                        ),
+                                        cx,
+                                    )
+                                    .unwrap();
+                            }
+                        })?;
+                        Ok(acp_v1::PromptResponse::new(acp_v1::StopReason::EndTurn))
+                    }
+                    .boxed_local()
+                }),
+        )
+    }
+
+    #[gpui::test]
+    async fn test_missing_turn_status_is_requested_out_of_view(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let prompts = Rc::new(RefCell::new(Vec::new()));
+        let connection = turn_status_connection(
+            &[
+                &["Done. I also found a bug in parse_config, should I fix it?"],
+                &[
+                    "Here it is: <turn_status>{\"status\": \"needs_decision\", ",
+                    "\"pending_decisions\": [\"Fix the bug in parse_config?\"]}</turn_status>",
+                ],
+            ],
+            prompts.clone(),
+        );
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Fix the tests", cx))
+            .await
+            .unwrap();
+
+        assert_eq!(prompts.borrow().len(), 2);
+        assert!(prompts.borrow()[1].starts_with(turn_status::TURN_STATUS_REPAIR_MARKER));
+        thread.read_with(cx, |thread, cx| {
+            let markdown = thread.to_markdown(cx);
+            assert!(
+                markdown.contains("Done. I also found a bug in parse_config, should I fix it?")
+            );
+            assert!(!markdown.contains("turn_status"), "{markdown}");
+            assert!(!markdown.contains("Here it is"), "{markdown}");
+            assert_eq!(
+                thread.turn_status(),
+                Some(TurnStatus {
+                    status: TurnOutcome::NeedsDecision,
+                    pending_decisions: vec!["Fix the bug in parse_config?".to_string()],
+                    incomplete: Vec::new(),
+                })
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_streamed_turn_status_is_hidden(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let prompts = Rc::new(RefCell::new(Vec::new()));
+        let connection = turn_status_connection(
+            &[&[
+                "Couldn't run the browser test.\n\n<turn_",
+                "status>{\"status\": \"partial\", \"incomplete\": [{\"task\": \"Browser test\", ",
+                "\"reason\": \"the MCP server is offline\"}]}</turn_status>",
+            ]],
+            prompts.clone(),
+        );
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| thread.send_raw("Test it", cx))
+            .await
+            .unwrap();
+
+        assert_eq!(prompts.borrow().len(), 1);
+        thread.read_with(cx, |thread, cx| {
+            let markdown = thread.to_markdown(cx);
+            assert!(markdown.contains("Couldn't run the browser test."));
+            assert!(!markdown.contains("turn_status"), "{markdown}");
+            assert_eq!(
+                thread.turn_status().map(|status| status.status),
+                Some(TurnOutcome::Partial)
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_tool_result_refusal(cx: &mut TestAppContext) {
         use std::sync::atomic::AtomicUsize;
@@ -16458,6 +16821,7 @@ mod tests {
     struct FakeAgentConnection {
         auth_methods: Vec<acp_v1::AuthMethod>,
         supports_truncate: bool,
+        reports_turn_status: bool,
         sessions: Arc<parking_lot::Mutex<HashMap<acp_v1::SessionId, WeakEntity<AcpThread>>>>,
         set_title_calls: Rc<RefCell<Vec<SharedString>>>,
         on_user_message: Option<
@@ -16478,6 +16842,7 @@ mod tests {
             Self {
                 auth_methods: Vec::new(),
                 supports_truncate: true,
+                reports_turn_status: false,
                 on_user_message: None,
                 sessions: Arc::default(),
                 set_title_calls: Default::default(),
@@ -16486,6 +16851,11 @@ mod tests {
 
         fn without_truncate_support(mut self) -> Self {
             self.supports_truncate = false;
+            self
+        }
+
+        fn with_turn_status(mut self) -> Self {
+            self.reports_turn_status = true;
             self
         }
 
@@ -16516,6 +16886,10 @@ mod tests {
 
         fn telemetry_id(&self) -> SharedString {
             "fake".into()
+        }
+
+        fn reports_turn_status(&self) -> bool {
+            self.reports_turn_status
         }
 
         fn auth_methods(&self) -> &[acp_v1::AuthMethod] {

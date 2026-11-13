@@ -603,6 +603,7 @@ pub struct ThreadView {
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
+    pub background_tasks_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
@@ -1022,6 +1023,7 @@ impl ThreadView {
             edits_expanded: false,
             plan_expanded: false,
             queue_expanded: true,
+            background_tasks_expanded: true,
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
@@ -3403,8 +3405,15 @@ impl ThreadView {
             .render_main_agent_awaiting_permission(window, cx)
             .or_else(|| self.render_subagents_awaiting_permission(cx));
         let has_awaiting_permission = awaiting_permission.is_some();
+        let background_tasks = thread.background_tasks(cx);
+        let has_background_tasks = !background_tasks.is_empty();
 
-        if changed_buffers.is_empty() && !has_plan && queue_is_empty && !has_awaiting_permission {
+        if changed_buffers.is_empty()
+            && !has_plan
+            && queue_is_empty
+            && !has_awaiting_permission
+            && !has_background_tasks
+        {
             return None;
         }
 
@@ -3490,10 +3499,132 @@ impl ThreadView {
                         .when(queue_expanded, |parent| {
                             parent.child(self.render_message_queue_entries(window, cx))
                         })
+                    })
+                    .when(has_background_tasks, |this| {
+                        this.when(
+                            has_awaiting_permission
+                                || has_plan
+                                || !changed_buffers.is_empty()
+                                || !queue_is_empty,
+                            |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                        )
+                        .child(self.render_background_tasks(background_tasks, cx))
                     }),
             )
             .into_any()
             .into()
+    }
+
+    fn render_background_tasks(
+        &self,
+        tasks: Vec<acp_thread::BackgroundTask>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let expanded = self.background_tasks_expanded;
+        let title: SharedString = if tasks.len() == 1 {
+            "1 Background Task".into()
+        } else {
+            format!("{} Background Tasks", tasks.len()).into()
+        };
+        let task_count = tasks.len();
+
+        v_flex()
+            .child(
+                h_flex()
+                    .id("background_tasks_summary")
+                    .p_1()
+                    .w_full()
+                    .gap_1()
+                    .when(expanded, |this| {
+                        this.border_b_1().border_color(cx.theme().colors().border)
+                    })
+                    .child(Disclosure::new("background_tasks_disclosure", expanded))
+                    .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.background_tasks_expanded = !this.background_tasks_expanded;
+                        cx.notify();
+                    })),
+            )
+            .when(expanded, |this| {
+                this.child(
+                    v_flex().children(tasks.into_iter().enumerate().map(|(ix, task)| {
+                        let entry_ix = task.entry_index;
+                        let group = format!("background-task-group-{entry_ix}");
+                        let can_stop = task.terminal.read(cx).is_process_backed();
+                        let terminal = task.terminal.clone();
+
+                        h_flex()
+                            .id(format!("background-task-{entry_ix}"))
+                            .group(&group)
+                            .cursor_pointer()
+                            .p_1()
+                            .pl_2()
+                            .min_w_0()
+                            .w_full()
+                            .gap_1()
+                            .justify_between()
+                            .bg(cx.theme().colors().editor_background)
+                            .hover(|style| style.bg(cx.theme().colors().element_hover))
+                            .when(ix + 1 < task_count, |this| {
+                                this.border_b_1().border_color(cx.theme().colors().border)
+                            })
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .gap_1p5()
+                                    .child(
+                                        Icon::new(IconName::ToolTerminal)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new(task.title)
+                                            .size(LabelSize::Small)
+                                            .buffer_font(cx)
+                                            .truncate(),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_none()
+                                    .gap_1()
+                                    .child(
+                                        div().visible_on_hover(&group).child(
+                                            Label::new("Scroll to Command")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                    )
+                                    .when(can_stop, |this| {
+                                        this.child(
+                                            IconButton::new(
+                                                format!("stop-background-task-{entry_ix}"),
+                                                IconName::Stop,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Error)
+                                            .tooltip(Tooltip::text("Stop Command"))
+                                            .on_click(
+                                                move |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                    terminal.update(cx, |terminal, cx| {
+                                                        terminal.stop_by_user(cx)
+                                                    });
+                                                },
+                                            ),
+                                        )
+                                    }),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.list_state.scroll_to(ListOffset {
+                                    item_ix: entry_ix,
+                                    offset_in_item: px(0.0),
+                                });
+                                cx.notify();
+                            }))
+                    })),
+                )
+            })
     }
 
     fn render_edited_files(
