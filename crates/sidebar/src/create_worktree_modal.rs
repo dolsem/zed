@@ -1,7 +1,7 @@
 use agent_ui::thread_metadata_store::{ThreadFlairId, ThreadMetadataStore};
 use editor::Editor;
 use gpui::{DismissEvent, Entity, EventEmitter, Focusable, SharedString};
-use ui::prelude::*;
+use ui::{ContextMenu, ContextMenuEntry, DropdownMenu, DropdownStyle, prelude::*};
 use workspace::{ModalView, Workspace};
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
 use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, OpenCreateWorktreeDialog};
@@ -109,80 +109,109 @@ impl CreateWorktreeModal {
             .detach_and_log_err(cx);
     }
 
-    fn render_base(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        let base = &self.bases[index];
-        Button::new(("worktree-base", index), format!("Based on {}", base.label))
-            .full_width()
-            .toggle_state(index == self.selected_base)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.selected_base = index;
-                cx.notify();
-            }))
-            .into_any_element()
+    fn render_base_dropdown(&self, window: &mut Window, cx: &mut Context<Self>) -> DropdownMenu {
+        let this = cx.weak_entity();
+        let selected_base = self.selected_base;
+        let labels = self
+            .bases
+            .iter()
+            .map(|base| base.label.clone())
+            .collect::<Vec<_>>();
+        let selected_label = labels.get(selected_base).cloned().unwrap_or_default();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+            for (index, label) in labels.into_iter().enumerate() {
+                let this = this.clone();
+                menu = menu.toggleable_entry(
+                    label,
+                    index == selected_base,
+                    IconPosition::Start,
+                    None,
+                    move |_window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.selected_base = index;
+                            cx.notify();
+                        })
+                        .ok();
+                    },
+                );
+            }
+            menu
+        });
+        DropdownMenu::new("worktree-base", selected_label, menu)
+            .style(DropdownStyle::Outlined)
+            .full_width(true)
     }
 
-    fn render_flair_choice(
-        &self,
-        id: &'static str,
-        index: usize,
-        label: SharedString,
-        color: Option<gpui::Hsla>,
-        flair: Option<ThreadFlairId>,
-        lazy: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selected = self.flair == flair;
-        let label = if lazy {
-            format!("{label} (lazy)")
-        } else {
-            label.to_string()
-        };
-        h_flex()
-            .id((id, index))
+    fn render_flair_dropdown(&self, window: &mut Window, cx: &mut Context<Self>) -> DropdownMenu {
+        let this = cx.weak_entity();
+        let flairs = ThreadMetadataStore::global(cx).read(cx).flairs().to_vec();
+        let selected_flair = self
+            .flair
+            .as_ref()
+            .and_then(|id| flairs.iter().find(|flair| &flair.id == id))
+            .cloned();
+        let current = self.flair.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+            let select = |flair: Option<ThreadFlairId>| {
+                let this = this.clone();
+                move |_window: &mut Window, cx: &mut App| {
+                    this.update(cx, |this, cx| {
+                        this.flair = flair.clone();
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            };
+            menu = menu.toggleable_entry(
+                "None",
+                current.is_none(),
+                IconPosition::Start,
+                None,
+                select(None),
+            );
+            for flair in flairs {
+                let mut entry = ContextMenuEntry::new(flair.name.clone())
+                    .toggle(IconPosition::Start, current.as_ref() == Some(&flair.id))
+                    .handler(select(Some(flair.id.clone())));
+                if let Some(color) = flair.hsla() {
+                    entry = entry
+                        .icon(IconName::Circle)
+                        .icon_position(IconPosition::End)
+                        .icon_color(Color::Custom(color));
+                }
+                menu = menu.item(entry);
+            }
+            menu
+        });
+        let label = h_flex()
             .gap_1p5()
-            .px_2()
-            .py_0p5()
-            .rounded_sm()
-            .cursor_pointer()
-            .border_1()
-            .border_color(if selected {
-                cx.theme().colors().border_focused
-            } else {
-                gpui::transparent_black()
-            })
-            .when_some(color, |this, color| {
-                this.child(div().size_2().rounded_full().bg(color))
-            })
-            .child(Label::new(label).size(LabelSize::Small))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.flair = flair.clone();
-                cx.notify();
-            }))
-            .into_any_element()
+            .when_some(
+                selected_flair.as_ref().and_then(|flair| flair.hsla()),
+                |this, color| this.child(div().size_2().rounded_full().bg(color)),
+            )
+            .child(Label::new(
+                selected_flair
+                    .map(|flair| flair.name)
+                    .unwrap_or_else(|| "None".into()),
+            ))
+            .into_any_element();
+        DropdownMenu::new_with_element("worktree-flair", label, menu)
+            .style(DropdownStyle::Outlined)
+            .full_width(true)
     }
 }
 
 impl Render for CreateWorktreeModal {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let bases = (0..self.bases.len())
-            .map(|index| self.render_base(index, cx))
-            .collect::<Vec<_>>();
-
-        let flairs = ThreadMetadataStore::global(cx).read(cx).flairs().to_vec();
-        let mut flair_choices =
-            vec![self.render_flair_choice("flair-none", 0, "None".into(), None, None, false, cx)];
-        for (index, flair) in flairs.into_iter().enumerate() {
-            flair_choices.push(self.render_flair_choice(
-                "flair-choice",
-                index,
-                flair.name.clone(),
-                flair.hsla(),
-                Some(flair.id.clone()),
-                flair.is_lazy(),
-                cx,
-            ));
-        }
+        let field = |label: &'static str, dropdown: DropdownMenu| {
+            v_flex()
+                .gap_1()
+                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+                .child(dropdown)
+        };
+        let base_dropdown = self.render_base_dropdown(window, cx);
+        let flair_dropdown = self.render_flair_dropdown(window, cx);
 
         v_flex()
             .key_context("CreateWorktreeModal")
@@ -199,17 +228,8 @@ impl Render for CreateWorktreeModal {
                     .border_color(colors.border_variant)
                     .child(Label::new("New Worktree"))
                     .child(self.name_editor.clone())
-                    .child(v_flex().gap_1().children(bases))
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                Label::new("Flair for new threads")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(h_flex().gap_1().flex_wrap().children(flair_choices)),
-                    ),
+                    .child(field("Based on", base_dropdown))
+                    .child(field("Flair for new threads", flair_dropdown)),
             )
             .child(
                 h_flex()
