@@ -66,6 +66,21 @@ impl MultiBuffer {
         Some(Anchor::in_buffer(path_key_index, excerpt.context.start))
     }
 
+    /// Like [`Self::location_for_path`], but at `point` of the path's buffer,
+    /// or the closest position the path's excerpts show when they leave it out.
+    pub fn location_for_path_point(
+        &self,
+        path: &PathKey,
+        point: Point,
+        cx: &App,
+    ) -> Option<Anchor> {
+        let snapshot = self.snapshot(cx);
+        let excerpt = snapshot.excerpts_for_path(path).next()?;
+        let buffer = self.buffer(excerpt.context.start.buffer_id)?;
+        let point = buffer.read(cx).clip_point(point, Bias::Left);
+        self.buffer_point_to_anchor(&buffer, point, cx)
+    }
+
     pub fn set_excerpts_for_buffer(
         &mut self,
         buffer: Entity<Buffer>,

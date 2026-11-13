@@ -905,6 +905,34 @@ fn thread_run_ranges(thread: &AcpThread) -> Vec<RunRange> {
         .collect()
 }
 
+/// The thread entry of a run's item (its message without `item_index`), or
+/// `None` when the run or item doesn't exist.
+pub fn run_item_entry_index(
+    conversation: &MobileConversation,
+    run_id: &str,
+    item_index: Option<usize>,
+    cx: &App,
+) -> Option<usize> {
+    let ranges = run_ranges(conversation, cx);
+    let range = ranges.iter().find(|range| range.run_id == run_id)?;
+    let entry_index = range.entries.start + item_index.unwrap_or(0);
+    range.entries.contains(&entry_index).then_some(entry_index)
+}
+
+/// Scrolls the thread's view so that the entry is at the top.
+pub fn scroll_to_entry(conversation: &MobileConversation, entry_index: usize, cx: &mut App) {
+    let Some(thread_view) = conversation.thread_view(cx) else {
+        return;
+    };
+    thread_view.update(cx, |thread_view, cx| {
+        thread_view.list_state.scroll_to(gpui::ListOffset {
+            item_ix: entry_index,
+            offset_in_item: gpui::px(0.),
+        });
+        cx.notify();
+    });
+}
+
 pub fn thread_runs(
     conversation: &MobileConversation,
     include_items: bool,

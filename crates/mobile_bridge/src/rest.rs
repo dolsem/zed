@@ -3,18 +3,26 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
 use agent_ui::ThreadId;
 use agent_ui::mobile::{self as agent_mobile, MobileConversation};
 use anyhow::{Context as _, Result};
 use collections::HashMap;
 use futures::FutureExt as _;
-use gpui::{App, AppContext as _, Context, Task};
+use git::repository::RepoPath;
+use git_ui::commit_view::CommitView;
+use git_ui::project_diff::ProjectDiff;
+use gpui::{App, AppContext as _, Context, Entity, Task};
 use mobile_protocol::rest::{self, thread_events};
 use mobile_protocol::{HostMessage, RequestId};
+use project::git_store::Repository;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use text::Point;
 use util::ResultExt as _;
+use util::rel_path::RelPath;
+use workspace::Workspace;
 
 use crate::MobileBridge;
 use crate::threads::{build_all_threads_list, build_new_thread_options, thread_details};
@@ -400,6 +408,19 @@ impl MobileBridge {
                     empty()
                 })
             }
+            ("POST", ["threads", thread_id, "focus"]) => {
+                let request = match body.filter(|body| !body.is_null()) {
+                    Some(body) => match parse_body::<rest::FocusThreadRequest>(Some(body)) {
+                        Ok(request) => request,
+                        Err(error) => return Task::ready(Err(error)),
+                    },
+                    None => rest::FocusThreadRequest::default(),
+                };
+                if let Err(error) = request.validate() {
+                    return Task::ready(Err(bad_request(error)));
+                }
+                self.focus_thread(thread_id, request, cx)
+            }
             ("POST", ["mcp"]) => self.handle_mcp_request(body, cx),
             ("POST", ["pairing"]) => {
                 Task::ready(self.begin_pairing().map_err(conflict).and_then(|code| {
@@ -486,6 +507,65 @@ impl MobileBridge {
         Err(api_error(409, rest::SESSION_NOT_READY))
     }
 
+    /// Shows the thread in Zed, loading it first if needed, then scrolls to
+    /// the run and opens the changes the request asks for.
+    fn focus_thread(
+        &mut self,
+        thread_id: &str,
+        request: rest::FocusThreadRequest,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Reply>> {
+        let Ok(parsed_thread_id) = ThreadId::from_key_string(thread_id) else {
+            return Task::ready(Err(bad_request("invalid thread id")));
+        };
+        let conversation = self.ensure_conversation(thread_id, cx);
+        cx.spawn(async move |_, cx| {
+            let conversation = conversation.await?;
+            let commit_view = cx.update(|cx| {
+                let entry_index = match &request.run_id {
+                    Some(run_id) => Some(
+                        agent_mobile::run_item_entry_index(
+                            &conversation,
+                            run_id,
+                            request.item_index,
+                            cx,
+                        )
+                        .ok_or_else(|| match request.item_index {
+                            Some(item_index) => {
+                                not_found(format!("no item {item_index} in run {run_id:?}"))
+                            }
+                            None => not_found(format!("no run {run_id:?}")),
+                        })?,
+                    ),
+                    None => None,
+                };
+                // Resolved before anything is shown, so that a bad path
+                // changes nothing.
+                let changes = request
+                    .changes
+                    .map(|changes| changes_target(&conversation.workspace, changes, cx))
+                    .transpose()?;
+                sidebar::mobile::show_thread(
+                    parsed_thread_id,
+                    conversation.window,
+                    conversation.workspace.clone(),
+                    cx,
+                )?;
+                if let Some(entry_index) = entry_index {
+                    agent_mobile::scroll_to_entry(&conversation, entry_index, cx);
+                }
+                match changes {
+                    Some(changes) => open_changes(&conversation, changes, cx),
+                    None => Ok(None),
+                }
+            })?;
+            if let Some(commit_view) = commit_view {
+                commit_view.await.context("failed to open the commit")?;
+            }
+            empty()
+        })
+    }
+
     fn with_thread(
         &mut self,
         thread_id: &str,
@@ -523,6 +603,100 @@ pub(crate) fn send_message(
     Ok(rest::SentMessage { run_id, queued })
 }
 
+struct ChangesTarget {
+    repository: Entity<Repository>,
+    commit: Option<String>,
+    path: Option<(RepoPath, Option<Point>)>,
+}
+
+fn changes_target(
+    workspace: &Entity<Workspace>,
+    changes: rest::FocusChanges,
+    cx: &App,
+) -> Result<ChangesTarget> {
+    let project = workspace.read(cx).project().read(cx);
+    let path_style = project.path_style(cx);
+    let repositories = project.repositories(cx);
+    let (repository, repo_path) = match changes.path.as_deref() {
+        Some(path) if util::paths::is_absolute(path, path_style) => repositories
+            .values()
+            .filter_map(|repository| {
+                let repo_path = repository.read(cx).abs_path_to_repo_path(Path::new(path))?;
+                Some((repository.clone(), Some(repo_path)))
+            })
+            // The innermost of nested repositories.
+            .max_by_key(|(repository, _)| {
+                repository
+                    .read(cx)
+                    .work_directory_abs_path
+                    .as_os_str()
+                    .len()
+            })
+            .ok_or_else(|| {
+                not_found(format!(
+                    "{path:?} isn't in any of the workspace's repositories"
+                ))
+            })?,
+        path => {
+            let repository = project
+                .active_repository(cx)
+                .or_else(|| repositories.values().next().cloned())
+                .ok_or_else(|| not_found("the thread's workspace has no git repository"))?;
+            let repo_path = path
+                .map(|path| {
+                    RelPath::new(Path::new(path), path_style)
+                        .map(|path| RepoPath::from_rel_path(&path))
+                        .map_err(|error| bad_request(format!("invalid path {path:?}: {error:#}")))
+                })
+                .transpose()?;
+            (repository, repo_path)
+        }
+    };
+    let point = changes
+        .line
+        .map(|line| Point::new(line.saturating_sub(1), 0));
+    Ok(ChangesTarget {
+        repository,
+        commit: changes.commit,
+        path: repo_path.map(|repo_path| (repo_path, point)),
+    })
+}
+
+/// Opens the changes in the conversation's workspace. A commit takes a while
+/// to load, and fails if it doesn't exist: the returned task tells when it's
+/// open.
+fn open_changes(
+    conversation: &MobileConversation,
+    target: ChangesTarget,
+    cx: &mut App,
+) -> Result<Option<Task<Result<Entity<CommitView>>>>> {
+    let workspace = conversation.workspace.clone();
+    conversation
+        .window
+        .update(cx, |_, window, cx| match target.commit {
+            Some(commit) => Some(CommitView::open_at_path(
+                commit,
+                target.repository.downgrade(),
+                workspace.downgrade(),
+                target.path,
+                window,
+                cx,
+            )),
+            None => {
+                workspace.update(cx, |workspace, cx| {
+                    ProjectDiff::deploy_at_repo_path(
+                        workspace,
+                        target.repository,
+                        target.path,
+                        window,
+                        cx,
+                    );
+                });
+                None
+            }
+        })
+}
+
 fn is_known_path(segments: &[&str]) -> bool {
     matches!(
         segments,
@@ -533,7 +707,11 @@ fn is_known_path(segments: &[&str]) -> bool {
             | ["worktrees"]
             | ["threads"]
             | ["threads", _]
-            | ["threads", _, "events" | "runs" | "messages" | "cancel"]
+            | [
+                "threads",
+                _,
+                "events" | "runs" | "messages" | "cancel" | "focus"
+            ]
             | [
                 "threads",
                 _,

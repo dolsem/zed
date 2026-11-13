@@ -456,6 +456,19 @@ async fn call_tool(
             )
             .await
         }
+        "focus_thread" => {
+            let thread_id = string(arguments, "thread_id")?;
+            let body = body_of(arguments, &["run_id", "item_index", "changes"]);
+            rest_ok(
+                bridge,
+                "POST",
+                &["threads", thread_id, "focus"],
+                &[],
+                Some(body),
+                cx,
+            )
+            .await
+        }
         "wait_for_operation" => {
             let operation_id = string(arguments, "operation_id")?;
             let deadline = cx.background_executor().now() + wait_timeout(arguments)?;

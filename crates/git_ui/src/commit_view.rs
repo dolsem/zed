@@ -3,7 +3,8 @@ use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
-    SplittableEditor, hover_markdown_style, multibuffer_context_lines,
+    SelectionEffects, SplittableEditor, hover_markdown_style, multibuffer_context_lines,
+    scroll::Autoscroll,
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, RepoPath};
@@ -19,7 +20,7 @@ use gpui::{
     Window, actions,
 };
 use language::{
-    Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
+    Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _, Point,
     ReplicaId, Rope, TextBuffer,
 };
 use markdown::{Markdown, MarkdownElement};
@@ -87,6 +88,8 @@ pub struct CommitView {
     remote: Option<GitRemote>,
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
+    /// Where to scroll once that file's diff is loaded.
+    pending_scroll: Option<(RepoPath, Option<Point>)>,
     _load_diff_task: Task<Result<()>>,
 }
 
@@ -204,8 +207,25 @@ impl CommitView {
             stash,
             file_filter,
             false,
+            None,
             window,
             cx,
+        )
+        .detach_and_log_err(cx);
+    }
+
+    /// Opens the commit like [`Self::open`], scrolled to `path` (at the point
+    /// of its version in the commit, if given) once its diff is loaded.
+    pub fn open_at_path(
+        commit_sha: String,
+        repo: WeakEntity<Repository>,
+        workspace: WeakEntity<Workspace>,
+        path: Option<(RepoPath, Option<Point>)>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<CommitView>>> {
+        Self::open_with_options(
+            commit_sha, repo, workspace, None, None, false, path, window, cx,
         )
     }
 
@@ -216,84 +236,73 @@ impl CommitView {
         stash: Option<usize>,
         file_filter: Option<RepoPath>,
         ignore_shallow_boundary: bool,
+        scroll_to: Option<(RepoPath, Option<Point>)>,
         window: &mut Window,
         cx: &mut App,
-    ) {
-        let commit_diff = repo
-            .update(cx, |repo, cx| {
-                repo.load_commit_diff(commit_sha.clone(), ignore_shallow_boundary, cx)
+    ) -> Task<Result<Entity<CommitView>>> {
+        let commit_diff = repo.update(cx, |repo, cx| {
+            repo.load_commit_diff(commit_sha.clone(), ignore_shallow_boundary, cx)
+        });
+        let commit_details = repo.update(cx, |repo, cx| repo.show_commit(commit_sha.clone(), cx));
+
+        window.spawn(cx, async move |cx| {
+            let (commit_diff, commit_details) = futures::join!(commit_diff?, commit_details?);
+            let mut commit_diff = commit_diff?;
+            let commit_details = commit_details?;
+
+            // Filter to specific file if requested
+            if let Some(ref filter_path) = file_filter {
+                commit_diff.files.retain(|f| &f.path == filter_path);
+            }
+
+            let repo = repo.upgrade().context("the repository was closed")?;
+
+            workspace.update_in(cx, |workspace, window, cx| {
+                let project = workspace.project();
+                let workspace_entity = cx.entity();
+                let workspace_handle = cx.weak_entity();
+                let commit_view = cx.new(|cx| {
+                    let mut commit_view = CommitView::new(
+                        commit_details,
+                        commit_diff,
+                        repo,
+                        project.clone(),
+                        workspace_entity,
+                        workspace_handle,
+                        stash,
+                        file_filter,
+                        window,
+                        cx,
+                    );
+                    // The diff loads in the background, which scrolls once
+                    // the file is in.
+                    commit_view.pending_scroll = scroll_to;
+                    commit_view
+                });
+
+                let pane = workspace.active_pane();
+                pane.update(cx, |pane, cx| {
+                    let existing = pane.items().enumerate().find_map(|(ix, item)| {
+                        let view = item.downcast::<CommitView>()?;
+                        (view.read(cx).commit.sha == commit_sha).then_some((ix, view))
+                    });
+                    if let Some((ix, existing)) = existing {
+                        pane.remove_item(existing.item_id(), false, false, window, cx);
+                        pane.add_item(
+                            Box::new(commit_view.clone()),
+                            true,
+                            true,
+                            Some(ix),
+                            window,
+                            cx,
+                        );
+                    } else {
+                        pane.add_item(Box::new(commit_view.clone()), true, true, None, window, cx);
+                    }
+                });
+                commit_view
             })
-            .ok();
-        let commit_details = repo
-            .update(cx, |repo, cx| repo.show_commit(commit_sha.clone(), cx))
-            .ok();
-
-        window
-            .spawn(cx, async move |cx| {
-                let commit_diff = commit_diff?;
-                let commit_details = commit_details?;
-                let (commit_diff, commit_details) = futures::join!(commit_diff, commit_details);
-                let mut commit_diff = commit_diff.log_err()?;
-                let commit_details = commit_details.log_err()?;
-
-                // Filter to specific file if requested
-                if let Some(ref filter_path) = file_filter {
-                    commit_diff.files.retain(|f| &f.path == filter_path);
-                }
-
-                let repo = repo.upgrade()?;
-
-                workspace
-                    .update_in(cx, |workspace, window, cx| {
-                        let project = workspace.project();
-                        let workspace_entity = cx.entity();
-                        let workspace_handle = cx.weak_entity();
-                        let commit_view = cx.new(|cx| {
-                            CommitView::new(
-                                commit_details,
-                                commit_diff,
-                                repo,
-                                project.clone(),
-                                workspace_entity,
-                                workspace_handle,
-                                stash,
-                                file_filter,
-                                window,
-                                cx,
-                            )
-                        });
-
-                        let pane = workspace.active_pane();
-                        pane.update(cx, |pane, cx| {
-                            let ix = pane.items().position(|item| {
-                                let commit_view = item.downcast::<CommitView>();
-                                commit_view
-                                    .is_some_and(|view| view.read(cx).commit.sha == commit_sha)
-                            });
-                            if let Some(ix) = ix {
-                                let existing = pane
-                                    .items()
-                                    .filter_map(|item| item.downcast::<CommitView>())
-                                    .find(|view| view.read(cx).commit.sha == commit_sha)
-                                    .unwrap();
-
-                                pane.remove_item(existing.item_id(), false, false, window, cx);
-                                pane.add_item(
-                                    Box::new(commit_view),
-                                    true,
-                                    true,
-                                    Some(ix),
-                                    window,
-                                    cx,
-                                );
-                            } else {
-                                pane.add_item(Box::new(commit_view), true, true, None, window, cx);
-                            }
-                        })
-                    })
-                    .log_err()
-            })
-            .detach();
+        })
     }
 
     fn new(
@@ -354,6 +363,7 @@ impl CommitView {
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
 
             for file in commit_diff.files {
+                let repo_path = file.path.clone();
                 let is_created = file.old_text.is_none();
                 let is_deleted = file.new_text.is_none();
                 let raw_new_text = file.new_text.unwrap_or_default();
@@ -482,9 +492,13 @@ impl CommitView {
                         yield_now().await;
                     }
                 }
+                this.update_in(cx, |this, window, cx| {
+                    this.apply_pending_scroll(&repo_path, &path, window, cx)
+                })?;
             }
 
             this.update(cx, |this, cx| {
+                this.pending_scroll = None;
                 let commit_view = cx.weak_entity();
                 this.editor.update(cx, |editor, cx| {
                     editor.rhs_editor().update(cx, |editor, _cx| {
@@ -535,8 +549,47 @@ impl CommitView {
             remote,
             is_shallow_boundary,
             file_filter,
+            pending_scroll: None,
             _load_diff_task: load_diff_task,
         }
+    }
+
+    fn apply_pending_scroll(
+        &mut self,
+        repo_path: &RepoPath,
+        path_key: &PathKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pending_path, point)) = &self.pending_scroll else {
+            return;
+        };
+        if pending_path != repo_path {
+            return;
+        }
+        let point = *point;
+        self.pending_scroll = None;
+        let multibuffer = self.multibuffer.read(cx);
+        let (position, autoscroll) = match point {
+            Some(point) => (
+                multibuffer.location_for_path_point(path_key, point, cx),
+                Autoscroll::center(),
+            ),
+            None => (
+                multibuffer.location_for_path(path_key, cx),
+                Autoscroll::focused(),
+            ),
+        };
+        let Some(position) = position else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.change_selections(SelectionEffects::scroll(autoscroll), window, cx, |s| {
+                    s.select_ranges([position..position]);
+                });
+            });
+        });
     }
 
     fn render_shallow_boundary_notice(&self, cx: &App) -> impl IntoElement {
@@ -608,10 +661,13 @@ impl CommitView {
                                                     stash,
                                                     file_filter,
                                                     false,
+                                                    None,
                                                     window,
                                                     cx,
                                                 )
-                                            })
+                                            })?
+                                            .await?;
+                                            anyhow::Ok(())
                                         })
                                         .detach_and_log_err(cx);
                                 }),
@@ -640,9 +696,11 @@ impl CommitView {
                                     stash,
                                     file_filter.clone(),
                                     true,
+                                    None,
                                     window,
                                     cx,
-                                );
+                                )
+                                .detach_and_log_err(cx);
                             }),
                     ),
             )
@@ -1383,6 +1441,7 @@ impl Item for CommitView {
                 remote: self.remote.clone(),
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
+                pending_scroll: None,
                 _load_diff_task: Task::ready(Ok(())),
             }
         })))

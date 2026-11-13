@@ -352,6 +352,29 @@ pub fn tools() -> Vec<Value> {
             false,
         ),
         tool(
+            "focus_thread",
+            "Brings Zed to the front with a thread shown to the user, loading it if needed. Can scroll to one of its runs, and open a commit's or the uncommitted changes, scrolled to a file and line.",
+            object_schema(
+                json!({
+                    "thread_id": thread_id_property(),
+                    "run_id": { "type": "string", "description": "Scroll to this run's message." },
+                    "item_index": { "type": "integer", "minimum": 0, "description": "With run_id: scroll to this item of the run instead (0 is its message)." },
+                    "changes": {
+                        "type": "object",
+                        "description": "Also open these changes.",
+                        "properties": {
+                            "commit": { "type": "string", "description": "A commit SHA. Without it, the uncommitted changes are shown." },
+                            "path": { "type": "string", "description": "Scroll to this file: absolute, or relative to the repository root." },
+                            "line": { "type": "integer", "minimum": 1, "description": "With path: scroll to this line of the file's new version." },
+                        },
+                        "additionalProperties": false,
+                    },
+                }),
+                &["thread_id"],
+            ),
+            false,
+        ),
+        tool(
             "list_operations",
             "Lists recent worktree and thread creations.",
             object_schema(json!({}), &[]),

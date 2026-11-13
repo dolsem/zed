@@ -28,6 +28,7 @@
 //! | POST | `/api/threads/{thread_id}/questions/{question_id}` | [`QuestionResponse`] | `{}` |
 //! | PUT | `/api/threads/{thread_id}/controls/{control_id}` | [`SetControlRequest`] | `{}` |
 //! | DELETE | `/api/threads/{thread_id}/queue/{index}` | | `{}` |
+//! | POST | `/api/threads/{thread_id}/focus` | [`FocusThreadRequest`] (optional) | `{}` |
 //! | GET | `/api/operations` | | [`OperationsResponse`] |
 //! | GET | `/api/operations/{operation_id}` | | [`Operation`] |
 //! | GET | `/api/operations/{operation_id}/events` | | SSE, see [`OperationEvent`] |
@@ -367,6 +368,59 @@ pub enum QuestionAction {
     Cancel,
 }
 
+/// Brings Zed to the front with the thread shown, as clicking it in the
+/// sidebar does. Every field is optional, and so is the body.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusThreadRequest {
+    /// Scrolls the thread to this run's message (see [`Run::run_id`]).
+    pub run_id: Option<String>,
+    /// With `run_id`: scrolls to this item of the run instead (see
+    /// [`RunItemEvent::index`]; 0 is the run's message).
+    pub item_index: Option<usize>,
+    /// Also opens these changes in the thread's workspace.
+    pub changes: Option<FocusChanges>,
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FocusChanges {
+    /// The commit whose changes to show, by SHA. Without it, the uncommitted
+    /// changes are shown.
+    pub commit: Option<String>,
+    /// Scrolls to this file: an absolute path, or one relative to the root of
+    /// the workspace's repository. Absolute paths also pick the repository in
+    /// workspaces with several.
+    pub path: Option<String>,
+    /// With `path`: scrolls to this line (starting at 1) of the file's new
+    /// version, or as close to it as the diff shows.
+    pub line: Option<u32>,
+}
+
+impl FocusThreadRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.item_index.is_some() && self.run_id.is_none() {
+            return Err("item_index needs a run_id".to_string());
+        }
+        if let Some(changes) = &self.changes {
+            if changes.line.is_some() && changes.path.is_none() {
+                return Err("line needs a path".to_string());
+            }
+            if changes.line == Some(0) {
+                return Err("lines start at 1".to_string());
+            }
+            if changes
+                .commit
+                .as_deref()
+                .is_some_and(|commit| commit.trim().is_empty())
+            {
+                return Err("commit is empty".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetControlRequest {
     pub value: ControlValue,
@@ -606,6 +660,49 @@ mod tests {
         .unwrap();
         assert_eq!(response.action, QuestionAction::Accept);
         assert_eq!(response.content["choice"], "B");
+    }
+
+    #[test]
+    fn test_focus_thread_request() {
+        let parse = |value: serde_json::Value| {
+            serde_json::from_value::<FocusThreadRequest>(value).map_err(|error| error.to_string())
+        };
+        let request = parse(serde_json::json!({
+            "run_id": "3",
+            "item_index": 2,
+            "changes": { "commit": "abc123", "path": "src/main.rs", "line": 10 },
+        }))
+        .unwrap();
+        assert_eq!(request.validate(), Ok(()));
+        let changes = request.changes.unwrap();
+        assert_eq!(changes.commit.as_deref(), Some("abc123"));
+        assert_eq!(changes.line, Some(10));
+
+        assert_eq!(
+            parse(serde_json::json!({ "changes": {} }))
+                .unwrap()
+                .validate(),
+            Ok(())
+        );
+        assert!(
+            parse(serde_json::json!({ "item_index": 1 }))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse(serde_json::json!({ "changes": { "line": 4 } }))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(
+            parse(serde_json::json!({ "changes": { "path": "a.rs", "line": 0 } }))
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        assert!(parse(serde_json::json!({ "message": "3" })).is_err());
     }
 
     #[test]

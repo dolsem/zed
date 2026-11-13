@@ -11,13 +11,15 @@ use editor::{
     DefaultDiffHunkRenderer, Editor, EditorEvent, SplittableEditor,
     actions::{GoToHunk, GoToPreviousHunk, SendReviewToAgent},
 };
-use git::{Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext};
+use git::{
+    Commit, StageAll, StageAndNext, ToggleStaged, UnstageAll, UnstageAndNext, repository::RepoPath,
+};
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
     Subscription, Task, WeakEntity, actions,
 };
 use fs::MTime;
-use language::{Buffer, BufferSnapshot, Capability};
+use language::{Buffer, BufferSnapshot, Capability, Point};
 use multi_buffer::MultiBuffer;
 use project::{
     Project, ProjectPath,
@@ -221,6 +223,50 @@ impl ProjectDiff {
         project_diff.update(cx, |project_diff, cx| {
             project_diff.move_to_project_path(&project_path, window, cx);
         });
+    }
+
+    /// Shows `repository`'s uncommitted changes, scrolled to `path` (at the
+    /// point of its current version, if given) once its diff is loaded.
+    pub fn deploy_at_repo_path(
+        workspace: &mut Workspace,
+        repository: Entity<Repository>,
+        path: Option<(RepoPath, Option<Point>)>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        telemetry::event!("Git Diff Opened", source = "API");
+        let existing = workspace.items_of_type::<Self>(cx).next();
+        let project_diff = if let Some(existing) = existing {
+            workspace.activate_item(&existing, true, true, window, cx);
+            existing
+        } else {
+            let workspace_handle = cx.entity();
+            let project_diff =
+                cx.new(|cx| Self::new(workspace.project().clone(), workspace_handle, window, cx));
+            workspace.add_item_to_active_pane(
+                Box::new(project_diff.clone()),
+                None,
+                true,
+                window,
+                cx,
+            );
+            project_diff
+        };
+        project_diff.update(cx, |project_diff, cx| {
+            let needs_switch = project_diff
+                .repo(cx)
+                .is_none_or(|current| current.read(cx).id != repository.read(cx).id);
+            if needs_switch {
+                project_diff.set_repo(Some(repository), cx);
+            }
+            match path {
+                Some((repo_path, point)) => project_diff.diff.update(cx, |diff, cx| {
+                    diff.move_to_repo_path(&repo_path, point, window, cx)
+                }),
+                None => project_diff.move_to_beginning(window, cx),
+            }
+        });
+        project_diff
     }
 
     pub fn autoscroll(&self, cx: &mut Context<Self>) {

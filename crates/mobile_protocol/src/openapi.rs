@@ -47,6 +47,7 @@ pub fn json() -> String {
         answer_question,
         set_control,
         remove_queued_message,
+        focus_thread,
         operations,
         operation,
         operation_events,
@@ -340,6 +341,25 @@ fn set_control() {}
 )]
 fn remove_queued_message() {}
 
+/// Brings Zed to the front with the thread shown, as clicking it in the sidebar does,
+/// loading it first if needed (an archived thread is unarchived). Optionally scrolls to one
+/// of its runs, and opens a commit's or the uncommitted changes, scrolled to a file and line.
+#[utoipa::path(
+    post,
+    path = "/api/threads/{thread_id}/focus",
+    tag = "threads",
+    params(ThreadIdParam),
+    request_body(content = FocusThreadRequest, description = "Optional: an empty body only shows the thread."),
+    responses(
+        (status = 200, body = EmptyResponse),
+        (status = 400, body = ErrorResponse, description = "Invalid body, e.g. `item_index` without `run_id`."),
+        (status = 404, body = ErrorResponse, description = "No such thread, run, item, file or repository."),
+        (status = 409, body = ErrorResponse, description = "The thread couldn't be loaded."),
+        (status = 500, body = ErrorResponse, description = "The commit couldn't be opened, e.g. because no such commit exists."),
+    ),
+)]
+fn focus_thread() {}
+
 /// Lists recent operations.
 #[utoipa::path(
     get,
@@ -442,7 +462,7 @@ mod tests {
     fn test_document() {
         let document: serde_json::Value = serde_json::from_str(&json()).unwrap();
         let paths = document["paths"].as_object().unwrap();
-        assert_eq!(paths.len(), 21);
+        assert_eq!(paths.len(), 22);
         let thread = &paths["/api/threads/{thread_id}"]["get"];
         assert_eq!(
             thread["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],

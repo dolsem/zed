@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use anyhow::Context as _;
-use gpui::AsyncApp;
+use gpui::{AnyWindowHandle, AsyncApp};
 
 use super::*;
 
@@ -559,6 +559,47 @@ fn thread_target(thread_id: ThreadId, cx: &App) -> anyhow::Result<ThreadTarget> 
         open_workspace: open_workspace.map(|(_, workspace)| workspace),
         key,
     })
+}
+
+/// Shows a thread that's loaded in `workspace`'s agent panel as clicking it in
+/// the sidebar does, bringing Zed and the workspace's window to the front.
+pub fn show_thread(
+    thread_id: ThreadId,
+    window: AnyWindowHandle,
+    workspace: Entity<Workspace>,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    let metadata = ThreadMetadataStore::global(cx)
+        .read(cx)
+        .entry(thread_id)
+        .cloned()
+        .context("thread not found")?;
+    cx.activate(true);
+    // Updating the window rather than its `MultiWorkspace` leaves the
+    // multi-workspace free for the sidebar to update.
+    window.update(cx, |root, window, cx| {
+        window.activate_window();
+        let multi_workspace = root
+            .downcast::<MultiWorkspace>()
+            .map_err(|_| anyhow::anyhow!("the thread's window has no workspaces"))?;
+        let sidebar = multi_workspace
+            .read(cx)
+            .sidebar()
+            .and_then(|sidebar| sidebar.to_any().downcast::<Sidebar>().ok());
+        match sidebar {
+            Some(sidebar) => sidebar.update(cx, |sidebar, cx| {
+                sidebar.activate_thread(metadata, &workspace, false, window, cx);
+            }),
+            None => {
+                Sidebar::apply_thread_resource_mode(&workspace, thread_id, cx);
+                multi_workspace.update(cx, |multi_workspace, cx| {
+                    multi_workspace.activate(workspace.clone(), None, window, cx);
+                });
+                Sidebar::load_agent_thread_in_workspace(&workspace, &metadata, true, window, cx);
+            }
+        }
+        anyhow::Ok(())
+    })?
 }
 
 /// Loads an agent thread in its workspace's agent panel without showing it,

@@ -17,7 +17,7 @@ use gpui::{
     App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity,
 };
-use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
+use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{
     ConflictSet, Project, ProjectPath,
@@ -58,7 +58,7 @@ pub struct DiffMultibuffer {
     buffer_subscriptions: HashMap<RepoPath, BufferSubscriptions>,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
-    pending_scroll: Option<PathKey>,
+    pending_scroll: Option<(PathKey, Option<Point>)>,
     review_comment_count: usize,
     empty_label: SharedString,
     _task: Task<Result<()>>,
@@ -245,13 +245,27 @@ impl DiffMultibuffer {
         else {
             return;
         };
+        self.move_to_repo_path(&repo_path, None, window, cx)
+    }
+
+    /// Scrolls to the file, at `point` of its current version if given.
+    pub(crate) fn move_to_repo_path(
+        &mut self,
+        repo_path: &RepoPath,
+        point: Option<Point>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(git_repo) = self.branch_diff.read(cx).repo() else {
+            return;
+        };
         let status = git_repo
             .read(cx)
-            .status_for_path(&repo_path)
+            .status_for_path(repo_path)
             .map(|entry| entry.status)
             .unwrap_or(FileStatus::Untracked);
-        let path_key = project_diff_path_key(&git_repo.read(cx), &repo_path, status, cx);
-        self.move_to_path(path_key, window, cx)
+        let path_key = project_diff_path_key(&git_repo.read(cx), repo_path, status, cx);
+        self.move_to_path_point(path_key, point, window, cx)
     }
 
     pub(crate) fn move_to_beginning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -270,11 +284,31 @@ impl DiffMultibuffer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
+        self.move_to_path_point(path_key, None, window, cx)
+    }
+
+    fn move_to_path_point(
+        &mut self,
+        path_key: PathKey,
+        point: Option<Point>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let multibuffer = self.multibuffer.read(cx);
+        let position = match point {
+            Some(point) => multibuffer.location_for_path_point(&path_key, point, cx),
+            None => multibuffer.location_for_path(&path_key, cx),
+        };
+        if let Some(position) = position {
+            let autoscroll = if point.is_some() {
+                Autoscroll::center()
+            } else {
+                Autoscroll::focused()
+            };
             self.editor.update(cx, |editor, cx| {
                 editor.rhs_editor().update(cx, |editor, cx| {
                     editor.change_selections(
-                        SelectionEffects::scroll(Autoscroll::focused()),
+                        SelectionEffects::scroll(autoscroll),
                         window,
                         cx,
                         |s| {
@@ -284,7 +318,7 @@ impl DiffMultibuffer {
                 })
             });
         } else {
-            self.pending_scroll = Some(path_key);
+            self.pending_scroll = Some((path_key, point));
         }
     }
 
@@ -593,8 +627,11 @@ impl DiffMultibuffer {
                 editor.focus_handle(cx).focus(window, cx);
             });
         }
-        if self.pending_scroll.as_ref() == Some(&path_key) {
-            self.move_to_path(path_key, window, cx);
+        if let Some((pending_path_key, point)) = &self.pending_scroll
+            && pending_path_key == &path_key
+        {
+            let point = *point;
+            self.move_to_path_point(path_key, point, window, cx);
         }
 
         needs_fold.then_some(buffer_id)
