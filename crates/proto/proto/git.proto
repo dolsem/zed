@@ -651,6 +651,36 @@ message GitRepairWorktrees {
   uint64 repository_id = 2;
 }
 
+// A git command that doesn't change the repository, for code reviews.
+message GitRunReadOnlyCommand {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  repeated string args = 3;
+  optional string stdin = 4;
+}
+
+message GitRunReadOnlyCommandResponse {
+  string stdout = 1;
+}
+
+// One of the code review files kept in the repository's git directory.
+message GitLoadReviewFile {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string name = 3;
+}
+
+message GitLoadReviewFileResponse {
+  optional string contents = 1;
+}
+
+message GitSaveReviewFile {
+  uint64 project_id = 1;
+  uint64 repository_id = 2;
+  string name = 3;
+  string contents = 4;
+}
+
 message GitWorktreesResponse {
   repeated Worktree worktrees = 1;
 }

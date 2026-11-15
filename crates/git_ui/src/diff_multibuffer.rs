@@ -259,10 +259,17 @@ impl DiffMultibuffer {
         let Some(git_repo) = self.branch_diff.read(cx).repo() else {
             return;
         };
-        let status = git_repo
+        // Against a merge base, files can be changed without having a status.
+        let status = self
+            .branch_diff
             .read(cx)
-            .status_for_path(repo_path)
-            .map(|entry| entry.status)
+            .status_for_path(repo_path, cx)
+            .or_else(|| {
+                git_repo
+                    .read(cx)
+                    .status_for_path(repo_path)
+                    .map(|entry| entry.status)
+            })
             .unwrap_or(FileStatus::Untracked);
         let path_key = project_diff_path_key(&git_repo.read(cx), repo_path, status, cx);
         self.move_to_path_point(path_key, point, window, cx)

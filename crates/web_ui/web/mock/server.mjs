@@ -8,7 +8,7 @@
 // Options: --port <n>, --dist, --latency <ms> (artificial response delay)
 
 import { ChangeSet, Text } from "@codemirror/state";
-import { createECDH, createHash } from "node:crypto";
+import { createECDH, createHash, randomBytes } from "node:crypto";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { dirname, extname, join, normalize, resolve } from "node:path";
@@ -734,6 +734,104 @@ function listDirectory(worktreeId, path) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Code review
+
+const mockReview = { base: "main", reviews: [], tags: new Set(["bug", "naming", "perf", "nit"]) };
+
+function normalizedText(text) {
+  const tags = [];
+  const body = text
+    .trim()
+    .split("\n")
+    .map((line) =>
+      line
+        .split(" ")
+        .filter((word) => {
+          const match = /^#([\p{L}\p{N}_\-/.]*[\p{L}_\-/.][\p{L}\p{N}_\-/.]*)$/u.exec(word);
+          if (!match) return true;
+          if (!tags.includes(match[1])) tags.push(match[1]);
+          return false;
+        })
+        .join(" "),
+    )
+    .join("\n")
+    .trim();
+  for (const tag of tags) mockReview.tags.add(tag);
+  const prefix = tags.map((tag) => `#${tag}`).join(" ");
+  return { text: [prefix, body].filter(Boolean).join(" "), tags };
+}
+
+function mockComment(text, target) {
+  const now = new Date().toISOString();
+  const isLine = target.kind === "line";
+  const commit = isLine ? target.commit : commits[0].sha;
+  const location = isLine
+    ? `${target.path}:${target.start_row + 1}${target.end_row > target.start_row ? `-${target.end_row + 1}` : ""}${commit ? ` @ ${commit.slice(0, 12)}` : " (uncommitted)"}`
+    : `commit ${commit.slice(0, 12)}`;
+  const file = isLine ? diffFiles.find((candidate) => candidate.path === target.path) : null;
+  const excerpt = file?.buffer ? file.buffer.doc.toString().split("\n").slice(target.start_row, target.end_row + 1).join("\n") : null;
+  const comment = {
+    comment_id: `cm-${randomBytes(6).toString("hex")}`,
+    created_at: now,
+    updated_at: now,
+    addressed: false,
+    ...normalizedText(text),
+    location,
+    commit,
+    path: isLine ? target.path : null,
+    start_line: isLine ? target.start_row + 1 : null,
+    end_line: isLine ? target.end_row + 1 : null,
+    is_deleted_side: false,
+    excerpt,
+    // Where the comment is in the working tree, for `review.diff`.
+    row: isLine && !target.commit ? target.start_row : null,
+    end_row: isLine && !target.commit ? target.end_row : null,
+  };
+  return comment;
+}
+
+function allReviewComments() {
+  return mockReview.reviews.flatMap((review) => review.comments);
+}
+
+function reviewState(workspace_id) {
+  const draft = mockReview.reviews.find((review) => review.is_draft);
+  return {
+    workspace_id,
+    unavailable_reason: null,
+    is_loaded: true,
+    worktree_name: "zed",
+    branch: "mobile-review",
+    base: mockReview.base,
+    is_base_picked: mockReview.base !== "main",
+    branches: ["main", "mobile-review", "release"],
+    commits: commits.slice(0, 4).map((commit) => ({
+      sha: commit.sha,
+      subject: commit.subject,
+      author: commit.author,
+      timestamp: commit.timestamp,
+      comment_count: allReviewComments().filter((comment) => comment.commit === commit.sha).length,
+    })),
+    commits_error: null,
+    uncommitted_files: diffFiles.length,
+    submit_blocker: !draft ? "Add comments to submit a review" : "Commit all changes before submitting the review",
+    is_submitting: false,
+    reviews: mockReview.reviews.map((review) => ({
+      ...review,
+      unaddressed_count: review.comments.filter((comment) => !comment.addressed).length,
+      as_text: `Review ${review.review_id}\n\n${review.comments.map((comment) => `[${comment.comment_id}] ${comment.location}\n${comment.text}`).join("\n\n")}`,
+      comments: review.comments.map((comment) => ({ ...comment, as_text: `[${comment.comment_id}] ${comment.location}\n${comment.text}` })),
+    })),
+    tags: [...mockReview.tags].sort(),
+    error: null,
+  };
+}
+
+function reviewChanged() {
+  broadcast("review.changed", { workspace_id: WORKSPACE_ZED });
+}
+
 function generatedFile(path) {
   const name = path.split("/").pop();
   if (name.endsWith(".rs")) return `//! ${name}\n\npub fn ${name.replace(/\W/g, "_").replace(/_rs$/, "")}() -> usize {\n    let items = vec![1, 2, 3];\n    items.iter().sum()\n}\n`;
@@ -1079,6 +1177,65 @@ const handlers = {
   },
   "git.stage": ({ paths }) => setStaged(paths, true),
   "git.unstage": ({ paths }) => setStaged(paths, false),
+
+  "review.state": ({ workspace_id }) => reviewState(workspace_id),
+  "review.diff": () => ({
+    base: mockReview.base,
+    files: diffFiles.map((file) => ({
+      path: file.path,
+      status: file.status === "untracked" ? "added" : file.status,
+      old_text: file.base_text,
+      new_text: file.buffer ? file.buffer.doc.toString() : null,
+      is_binary: false,
+      comments: allReviewComments()
+        .filter((comment) => !comment.addressed && comment.path === file.path && comment.row !== null)
+        .map((comment) => ({ comment_id: comment.comment_id, start_row: comment.row, end_row: comment.end_row })),
+    })),
+  }),
+  "review.set_base": ({ base }) => {
+    mockReview.base = base;
+    reviewChanged();
+    return null;
+  },
+  "review.add_comment": ({ text, target }) => {
+    if (!text.trim()) throw new Error("the comment is empty");
+    let draft = mockReview.reviews.find((review) => review.is_draft);
+    if (!draft) {
+      draft = { review_id: `rv-${randomBytes(6).toString("hex")}`, is_draft: true, created_at: new Date().toISOString(), submitted_at: null, comments: [] };
+      mockReview.reviews.unshift(draft);
+    }
+    const comment = mockComment(text, target);
+    draft.comments.push(comment);
+    reviewChanged();
+    return { comment_id: comment.comment_id };
+  },
+  "review.edit_comment": ({ comment_id, text }) => {
+    const comment = allReviewComments().find((candidate) => candidate.comment_id === comment_id);
+    if (!comment) throw new Error(`no comment ${comment_id}`);
+    Object.assign(comment, normalizedText(text), { updated_at: new Date().toISOString() });
+    reviewChanged();
+    return null;
+  },
+  "review.delete_comment": ({ comment_id }) => {
+    for (const review of mockReview.reviews) review.comments = review.comments.filter((comment) => comment.comment_id !== comment_id);
+    mockReview.reviews = mockReview.reviews.filter((review) => !review.is_draft || review.comments.length > 0);
+    reviewChanged();
+    return null;
+  },
+  "review.set_addressed": ({ comment_id, addressed }) => {
+    const comment = allReviewComments().find((candidate) => candidate.comment_id === comment_id);
+    if (comment) comment.addressed = addressed;
+    reviewChanged();
+    return null;
+  },
+  "review.submit": () => {
+    const draft = mockReview.reviews.find((review) => review.is_draft);
+    if (!draft) throw new Error("there's no pending review");
+    draft.is_draft = false;
+    draft.submitted_at = new Date().toISOString();
+    reviewChanged();
+    return { review_id: draft.review_id };
+  },
 
   "item.open": ({ workspace_id, item_id }, client) => {
     const { item } = findItem(workspace_id, item_id);

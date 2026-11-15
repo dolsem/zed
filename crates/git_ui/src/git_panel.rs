@@ -10,6 +10,7 @@ use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
 use crate::project_diff::{DeployBranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
+use crate::review_mode::{ReviewModel, ReviewView, ReviewViewEvent};
 use crate::solo_diff_view::SoloDiffView;
 use crate::staged_diff::StagedDiff;
 use crate::unstaged_diff::UnstagedDiff;
@@ -163,6 +164,9 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Enters or leaves review mode, where comments on the branch's
+        /// changes are collected into reviews.
+        ToggleReviewMode,
     ]
 );
 
@@ -1194,6 +1198,7 @@ pub struct GitPanel {
     commit_menu_handle: PopoverMenuHandle<ContextMenu>,
     changes_actions_menu_handle: PopoverMenuHandle<ContextMenu>,
     remote_action_menu_handle: PopoverMenuHandle<ContextMenu>,
+    review: Option<(Entity<ReviewView>, Subscription)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1520,6 +1525,7 @@ impl GitPanel {
                 commit_menu_handle: PopoverMenuHandle::default(),
                 changes_actions_menu_handle: PopoverMenuHandle::default(),
                 remote_action_menu_handle: PopoverMenuHandle::default(),
+                review: None,
             };
 
             this.schedule_update(window, cx);
@@ -5236,6 +5242,10 @@ impl GitPanel {
             }
         }
         self.active_repository = new_active_repository;
+        if active_repository_changed && self.review.is_some() {
+            self.review = None;
+            self.enter_review_mode(window, cx);
+        }
         self.reopen_commit_buffer(window, cx);
         self.preload_commit_history(cx);
         if self.active_tab == GitPanelTab::History {
@@ -7178,6 +7188,40 @@ impl GitPanel {
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
             ))
+            .when(self.active_repository.is_some(), |this| {
+                let can_review = self.can_review(cx);
+                let focus_handle = self.focus_handle.clone();
+                this.child(
+                    h_flex()
+                        .h_full()
+                        .px_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border.opacity(0.6))
+                        .child(
+                            IconButton::new("enter-review-mode", IconName::Eye)
+                                .icon_size(IconSize::Small)
+                                .disabled(!can_review)
+                                .tooltip(move |_window, cx| {
+                                    if can_review {
+                                        Tooltip::for_action_in(
+                                            "Review Changes",
+                                            &ToggleReviewMode,
+                                            &focus_handle,
+                                            cx,
+                                        )
+                                    } else {
+                                        Tooltip::simple(
+                                            "Review mode isn't available in shared projects",
+                                            cx,
+                                        )
+                                    }
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_review_mode(&ToggleReviewMode, window, cx)
+                                })),
+                        ),
+                )
+            })
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7318,6 +7362,60 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) {
         self.set_active_tab(GitPanelTab::History, window, cx);
+    }
+
+    fn toggle_review_mode(
+        &mut self,
+        _: &ToggleReviewMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.review.take().is_some() {
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        } else {
+            self.enter_review_mode(window, cx);
+        }
+    }
+
+    fn can_review(&self, cx: &App) -> bool {
+        self.active_repository.is_some() && crate::review_mode::can_review(self.project.read(cx))
+    }
+
+    fn enter_review_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_review(cx) {
+            return;
+        }
+        let Some(repository) = self.active_repository.clone() else {
+            return;
+        };
+        let model = match ReviewModel::for_repository(&repository, &self.project, cx) {
+            Ok(model) => model,
+            Err(error) => {
+                log::error!("can't review: {error:#}");
+                return;
+            }
+        };
+        let review = cx.new(|cx| {
+            ReviewView::new(
+                self.workspace.clone(),
+                self.project.clone(),
+                model,
+                window,
+                cx,
+            )
+        });
+        let subscription =
+            cx.subscribe_in(&review, window, |this, _, event, window, cx| match event {
+                ReviewViewEvent::Exit => {
+                    this.review = None;
+                    this.focus_handle.focus(window, cx);
+                    cx.notify();
+                }
+            });
+        review.focus_handle(cx).focus(window, cx);
+        self.review = Some((review, subscription));
+        cx.notify();
     }
 
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -9294,17 +9392,20 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::toggle_review_mode))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
             .child(
                 v_flex()
                     .size_full()
-                    .when(!self.commit_editor_expanded, |this| {
-                        this.child(self.render_tab_bar(cx))
-                    })
-                    .map(|this| match self.active_tab {
-                        GitPanelTab::Changes => this
+                    .when(
+                        !self.commit_editor_expanded && self.review.is_none(),
+                        |this| this.child(self.render_tab_bar(cx)),
+                    )
+                    .map(|this| match (&self.review, self.active_tab) {
+                        (Some((review, _)), _) => this.child(review.clone()),
+                        (None, GitPanelTab::Changes) => this
                             .children(self.render_changes_header(window, cx))
                             .when(!self.commit_editor_expanded, |this| {
                                 this.map(|this| {
@@ -9329,7 +9430,9 @@ impl Render for GitPanel {
                             .when(!self.amend_pending, |this| {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
-                        GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        (None, GitPanelTab::History) => {
+                            this.child(self.render_history_tab(window, cx))
+                        }
                     })
                     .into_any_element(),
             )

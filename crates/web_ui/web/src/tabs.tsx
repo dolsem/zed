@@ -67,17 +67,31 @@ export function TabsView() {
           <div class="thread-header-title">{items?.name ?? "Tabs"}</div>
           {items && <div class="thread-header-sub muted">Open tabs</div>}
         </div>
-        <button
-          class="header-button"
-          aria-label="Open a file or commit"
-          disabled={workspaceId === null}
-          onClick={() => {
-            haptic();
-            setAdding(true);
-          }}
-        >
-          <Icon name="plus" size={24} />
-        </button>
+        <div class="panel-header-actions">
+          <button
+            class="header-button"
+            aria-label="Review changes"
+            disabled={workspaceId === null}
+            onClick={() => {
+              if (workspaceId === null) return;
+              haptic();
+              openOverlay({ type: "review", workspaceId });
+            }}
+          >
+            <Icon name="eye" size={22} />
+          </button>
+          <button
+            class="header-button"
+            aria-label="Open a file or commit"
+            disabled={workspaceId === null}
+            onClick={() => {
+              haptic();
+              setAdding(true);
+            }}
+          >
+            <Icon name="plus" size={24} />
+          </button>
+        </div>
       </header>
 
       <div class="panel-scroll tabs-scroll">
@@ -115,6 +129,18 @@ export function TabsView() {
         <button class="add-tab-row pressable" disabled={workspaceId === null} onClick={() => setAdding(true)}>
           <Icon name="plus" size={18} />
           Open file or commit…
+        </button>
+        <button
+          class="add-tab-row pressable"
+          disabled={workspaceId === null}
+          onClick={() => {
+            if (workspaceId === null) return;
+            haptic();
+            openOverlay({ type: "review", workspaceId });
+          }}
+        >
+          <Icon name="eye" size={18} />
+          Review changes…
         </button>
       </div>
 

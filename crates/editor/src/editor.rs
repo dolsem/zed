@@ -110,6 +110,7 @@ pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
     file_status_label_color, render_breadcrumb_text,
 };
+pub use git::REVIEW_COMMENT_KEY_CONTEXT;
 pub use git::blame::{BlameRenderer, GitBlame};
 pub use git::{
     DefaultDiffHunkRenderer, DiffHunkRenderer, HiddenDiffHunkRenderer,
@@ -1168,6 +1169,8 @@ pub struct Editor {
     stored_review_comments: Vec<(DiffHunkKey, Vec<StoredReviewComment>)>,
     /// Counter for generating unique comment IDs.
     next_review_comment_id: usize,
+    /// Completions for the editors review comments are written in.
+    review_comment_completion_provider: Option<Rc<dyn CompletionProvider>>,
     hovered_diff_hunk_row: Option<DisplayRow>,
     pull_diagnostics_task: Task<()>,
     in_project_search: bool,
@@ -2524,6 +2527,7 @@ impl Editor {
             diff_review_overlays: Vec::new(),
             stored_review_comments: Vec::new(),
             next_review_comment_id: 0,
+            review_comment_completion_provider: None,
             hovered_diff_hunk_row: None,
             _subscriptions: (!is_minimap)
                 .then(|| {
@@ -12536,6 +12540,21 @@ pub enum EditorEvent {
     ReviewCommentsChanged {
         /// The new total count of review comments.
         total_count: usize,
+    },
+    /// The user added a review comment on the lines in `range`.
+    ReviewCommentAdded {
+        id: usize,
+        range: Range<Anchor>,
+        text: String,
+    },
+    /// The user changed a review comment's text.
+    ReviewCommentEdited {
+        id: usize,
+        text: String,
+    },
+    /// The user deleted a review comment.
+    ReviewCommentDeleted {
+        id: usize,
     },
     InputIgnored {
         text: Arc<str>,

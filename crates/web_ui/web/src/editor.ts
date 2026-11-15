@@ -46,6 +46,7 @@ import {
   highlightSpecialChars,
   keymap,
   lineNumbers,
+  WidgetType,
   type DecorationSet,
   type ViewUpdate,
 } from "@codemirror/view";
@@ -886,6 +887,137 @@ export class BufferEditor {
 export type AccessoryKey = "tab" | "outdent" | "undo" | "redo" | "left" | "right" | "up" | "down" | "search" | "problems";
 
 /** A read-only unified diff of two texts (commit views, deleted files). */
+// ---------------------------------------------------------------------------
+// Review comments in read-only diffs
+
+/** A review comment shown under the lines it's on. Rows are 0-based and inclusive. */
+export interface ReviewMark {
+  id: string;
+  startRow: number;
+  endRow: number;
+  text: string;
+}
+
+const setReviewMarks = StateEffect.define<ReviewMark[]>();
+
+class ReviewCommentWidget extends WidgetType {
+  constructor(
+    readonly mark: ReviewMark,
+    readonly onTap: (id: string) => void,
+  ) {
+    super();
+  }
+
+  override eq(other: ReviewCommentWidget): boolean {
+    return other.mark.id === this.mark.id && other.mark.text === this.mark.text;
+  }
+
+  toDOM(): HTMLElement {
+    const element = document.createElement("button");
+    element.type = "button";
+    element.className = "review-inline-comment";
+    element.textContent = this.mark.text;
+    element.addEventListener("click", (event) => {
+      event.preventDefault();
+      this.onTap(this.mark.id);
+    });
+    return element;
+  }
+
+  override ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+function reviewMarksField(onTapComment: (id: string) => void) {
+  return StateField.define<DecorationSet>({
+    create: () => Decoration.none,
+    update(decorations, transaction) {
+      decorations = decorations.map(transaction.changes);
+      for (const effect of transaction.effects) {
+        if (!effect.is(setReviewMarks)) continue;
+        const doc = transaction.state.doc;
+        const ranges: Range<Decoration>[] = [];
+        for (const mark of effect.value) {
+          const start = Math.min(Math.max(mark.startRow, 0), doc.lines - 1);
+          const end = Math.min(Math.max(mark.endRow, start), doc.lines - 1);
+          for (let row = start; row <= end; row++) {
+            ranges.push(Decoration.line({ class: "cm-review-commented" }).range(doc.line(row + 1).from));
+          }
+          ranges.push(
+            Decoration.widget({ widget: new ReviewCommentWidget(mark, onTapComment), block: true, side: 1 }).range(
+              doc.line(end + 1).to,
+            ),
+          );
+        }
+        decorations = Decoration.set(ranges, true);
+      }
+      return decorations;
+    },
+    provide: (field) => EditorView.decorations.from(field),
+  });
+}
+
+export interface ReviewDiffView {
+  view: EditorView;
+  setMarks(marks: ReviewMark[]): void;
+  /** Scrolls the row (0-based) of the current version into view. */
+  revealRow(row: number): void;
+}
+
+/**
+ * A read-only diff whose line numbers can be tapped to comment on a line of
+ * `current`, showing the comments under their lines.
+ */
+export function createReviewDiffView(
+  parent: HTMLElement,
+  original: string,
+  current: string,
+  { onLineTap, onCommentTap }: { onLineTap: (row: number) => void; onCommentTap: (id: string) => void },
+): ReviewDiffView {
+  const view = new EditorView({
+    parent,
+    state: EditorState.create({
+      doc: current,
+      extensions: [
+        lineNumbers({
+          domEventHandlers: {
+            click(view, line) {
+              onLineTap(view.state.doc.lineAt(line.from).number - 1);
+              return true;
+            },
+          },
+        }),
+        highlightSpecialChars(),
+        EditorState.readOnly.of(true),
+        EditorView.editable.of(false),
+        editorTheme,
+        darkFlag(),
+        reviewMarksField(onCommentTap),
+        EditorView.lineWrapping,
+        unifiedMergeView({
+          original,
+          mergeControls: false,
+          highlightChanges: true,
+          gutter: true,
+          syntaxHighlightDeletions: false,
+          collapseUnchanged: { margin: 3, minSize: 4 },
+        }),
+      ],
+    }),
+  });
+  view.dom.classList.add("review-diff");
+  return {
+    view,
+    setMarks: (marks) => view.dispatch({ effects: setReviewMarks.of(marks) }),
+    revealRow(row) {
+      const doc = view.state.doc;
+      const line = doc.line(Math.min(Math.max(row, 0), doc.lines - 1) + 1);
+      view.dispatch({ effects: EditorView.scrollIntoView(line.from, { y: "center" }) });
+    },
+  };
+}
+
 export function createStaticDiffView(parent: HTMLElement, original: string, current: string): EditorView {
   return new EditorView({
     parent,

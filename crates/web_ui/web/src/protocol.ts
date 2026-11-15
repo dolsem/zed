@@ -490,6 +490,109 @@ export interface Hover {
 }
 
 // ---------------------------------------------------------------------------
+// Code review (the git panel's review mode)
+
+export interface ReviewState {
+  workspace_id: WorkspaceId;
+  /** Why the workspace can't be reviewed, e.g. it has no repository. */
+  unavailable_reason: string | null;
+  is_loaded: boolean;
+  worktree_name: string | null;
+  branch: string | null;
+  base: string | null;
+  /** Whether the user picked the base rather than Zed. */
+  is_base_picked: boolean;
+  /** Local branches, to pick the base from. */
+  branches: string[];
+  /** On top of the base, newest first. */
+  commits: ReviewCommitSummary[];
+  commits_error: string | null;
+  uncommitted_files: number;
+  /** Why the pending review can't be submitted, if it can't. */
+  submit_blocker: string | null;
+  is_submitting: boolean;
+  /** The pending review first, then the submitted ones, newest first. */
+  reviews: ReviewSnapshot[];
+  /** Every tag used so far, without its `#`. */
+  tags: string[];
+  error: string | null;
+}
+
+export interface ReviewCommitSummary {
+  sha: string;
+  subject: string;
+  author: string;
+  /** Unix seconds. */
+  timestamp: number;
+  comment_count: number;
+}
+
+export interface ReviewSnapshot {
+  review_id: string;
+  is_draft: boolean;
+  /** RFC 3339. */
+  created_at: string;
+  submitted_at: string | null;
+  unaddressed_count: number;
+  /** The whole review as text, as Zed copies it. */
+  as_text: string;
+  comments: ReviewCommentSnapshot[];
+}
+
+export interface ReviewCommentSnapshot {
+  comment_id: string;
+  created_at: string;
+  updated_at: string;
+  addressed: boolean;
+  /** Starts with the tags. */
+  text: string;
+  /** Without their `#`. */
+  tags: string[];
+  /** e.g. `src/main.rs:10-12 @ 1a2b3c4d5e6f`. */
+  location: string;
+  commit: string | null;
+  /** For comments on lines. */
+  path: string | null;
+  /** 1-based and inclusive, in `commit`'s version. */
+  start_line: number | null;
+  end_line: number | null;
+  is_deleted_side: boolean;
+  excerpt: string | null;
+  as_text: string;
+}
+
+export interface ReviewDiff {
+  base: string | null;
+  files: ReviewDiffFile[];
+}
+
+export interface ReviewDiffFile {
+  path: string;
+  status: FileStatus;
+  old_text: string | null;
+  new_text: string | null;
+  is_binary: boolean;
+  /** The review's unaddressed comments on the file, where they are now. */
+  comments: ReviewLineComment[];
+}
+
+export interface ReviewLineComment {
+  comment_id: string;
+  /** 0-based and inclusive, in `new_text`. */
+  start_row: number;
+  end_row: number;
+}
+
+/** Rows are 0-based and inclusive, in the working tree's version or `commit`'s. */
+export type ReviewCommentTarget =
+  | { kind: "general" }
+  | { kind: "line"; path: string; start_row: number; end_row: number; commit: string | null };
+
+export interface ReviewChangedEvent {
+  workspace_id: WorkspaceId;
+}
+
+// ---------------------------------------------------------------------------
 // Terminals
 
 export interface TerminalScreen {
@@ -585,6 +688,24 @@ export interface Methods {
     result: unknown;
   };
 
+  "review.state": { params: { workspace_id: WorkspaceId }; result: ReviewState };
+  "review.diff": { params: { workspace_id: WorkspaceId }; result: ReviewDiff };
+  "review.set_base": { params: { workspace_id: WorkspaceId; base: string }; result: unknown };
+  "review.add_comment": {
+    params: { workspace_id: WorkspaceId; text: string; target: ReviewCommentTarget };
+    result: { comment_id: string };
+  };
+  "review.edit_comment": {
+    params: { workspace_id: WorkspaceId; comment_id: string; text: string };
+    result: unknown;
+  };
+  "review.delete_comment": { params: { workspace_id: WorkspaceId; comment_id: string }; result: unknown };
+  "review.set_addressed": {
+    params: { workspace_id: WorkspaceId; comment_id: string; addressed: boolean };
+    result: unknown;
+  };
+  "review.submit": { params: { workspace_id: WorkspaceId }; result: { review_id: string } };
+
   "item.open": { params: { workspace_id: WorkspaceId; item_id: ItemId }; result: ItemContent };
   "item.close": { params: { workspace_id: WorkspaceId; item_id: ItemId }; result: unknown };
 
@@ -657,6 +778,7 @@ export interface Events {
   "diff.files_changed": DiffFilesChangedEvent;
   "terminal.screen": TerminalScreen;
   "terminal.closed": TerminalClosedEvent;
+  "review.changed": ReviewChangedEvent;
   toast: ToastEvent;
 }
 

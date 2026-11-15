@@ -24,6 +24,7 @@ askpass.workspace = true
 async-channel.workspace = true
 buffer_diff.workspace = true
 call = { workspace = true, optional = true }
+chrono.workspace = true
 client.workspace = true
 collections.workspace = true
 component.workspace = true
@@ -36,6 +37,7 @@ futures.workspace = true
 fuzzy.workspace = true
 fuzzy_nucleo.workspace = true
 git.workspace = true
+git_review.workspace = true
 gpui.workspace = true
 itertools.workspace = true
 language.workspace = true
@@ -91,6 +93,7 @@ remote_connection = { workspace = true, features = ["test-support"] }
 search.workspace = true
 settings = { workspace = true, features = ["test-support"] }
 task.workspace = true
+tempfile.workspace = true
 tree-sitter-md.workspace = true
 unindent.workspace = true
 workspace = { workspace = true, features = ["test-support"] }

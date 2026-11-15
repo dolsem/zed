@@ -191,6 +191,10 @@ impl CommitView {
         &self.repository
     }
 
+    pub(crate) fn editor(&self) -> &Entity<SplittableEditor> {
+        &self.editor
+    }
+
     pub fn open(
         commit_sha: String,
         repo: WeakEntity<Repository>,

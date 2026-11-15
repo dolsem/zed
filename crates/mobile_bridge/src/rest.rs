@@ -421,6 +421,23 @@ impl MobileBridge {
                 }
                 self.focus_thread(thread_id, request, cx)
             }
+            ("GET", ["reviews"]) => match rest::ReviewsQuery::parse(&query) {
+                Ok(query) => {
+                    cx.background_spawn(async move { json(crate::reviews::list_reviews(&query)?) })
+                }
+                Err(error) => Task::ready(Err(bad_request(error))),
+            },
+            ("GET", ["reviews", review_id, "comments"]) => {
+                match rest::ReviewCommentsQuery::parse(&query) {
+                    Ok(query) => {
+                        let review_id = review_id.to_string();
+                        cx.background_spawn(async move {
+                            json(crate::reviews::review_comments(&review_id, &query)?)
+                        })
+                    }
+                    Err(error) => Task::ready(Err(bad_request(error))),
+                }
+            }
             ("POST", ["mcp"]) => self.handle_mcp_request(body, cx),
             ("POST", ["pairing"]) => {
                 Task::ready(self.begin_pairing().map_err(conflict).and_then(|code| {
@@ -722,6 +739,8 @@ fn is_known_path(segments: &[&str]) -> bool {
             | ["operations"]
             | ["operations", _]
             | ["operations", _, "events"]
+            | ["reviews"]
+            | ["reviews", _, "comments"]
     )
 }
 

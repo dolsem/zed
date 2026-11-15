@@ -33,6 +33,8 @@
 //! | GET | `/api/operations/{operation_id}` | | [`Operation`] |
 //! | GET | `/api/operations/{operation_id}/events` | | SSE, see [`OperationEvent`] |
 //! | POST | `/api/pairing` | | [`PairingResponse`] |
+//! | GET | `/api/reviews` | | [`ReviewsResponse`], filtered by [`ReviewsQuery`] |
+//! | GET | `/api/reviews/{review_id}/comments` | | [`ReviewCommentsResponse`], filtered by [`ReviewCommentsQuery`] |
 //! | POST | `/api/mcp` | JSON-RPC | the same API as an MCP server, see [`crate::mcp`] |
 //!
 //! Path segments are percent-decoded. The run and thread endpoints take
@@ -600,9 +602,185 @@ pub enum OperationStep {
     StartingAgent,
 }
 
+/// The query of `GET /api/reviews`, which lists the code reviews submitted in
+/// Zed's git panel, whether or not their worktree is open.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewsQuery {
+    /// Also list reviews whose comments were all addressed.
+    pub all: bool,
+    /// Only the reviews of the worktree at this path.
+    pub worktree_path: Option<String>,
+}
+
+impl ReviewsQuery {
+    /// Reads `?all=true` and `?worktree_path=<path>`.
+    pub fn parse(query: &BTreeMap<String, String>) -> Result<Self, String> {
+        let all = match query.get("all").map(String::as_str) {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(other) => return Err(format!("all must be true or false, not {other:?}")),
+        };
+        Ok(Self {
+            all,
+            worktree_path: query
+                .get("worktree_path")
+                .filter(|path| !path.is_empty())
+                .cloned(),
+        })
+    }
+}
+
+/// The query of `GET /api/reviews/{review_id}/comments`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewCommentsQuery {
+    pub status: CommentStatusFilter,
+    /// Only comments with this tag, with or without its `#`.
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CommentStatusFilter {
+    #[default]
+    Unaddressed,
+    Addressed,
+    All,
+}
+
+impl ReviewCommentsQuery {
+    /// Reads `?status=unaddressed|addressed|all` and `?tag=<tag>`.
+    pub fn parse(query: &BTreeMap<String, String>) -> Result<Self, String> {
+        let status = match query.get("status").map(String::as_str) {
+            None | Some("unaddressed") => CommentStatusFilter::Unaddressed,
+            Some("addressed") => CommentStatusFilter::Addressed,
+            Some("all") => CommentStatusFilter::All,
+            Some(other) => {
+                return Err(format!(
+                    "status must be unaddressed, addressed or all, not {other:?}"
+                ));
+            }
+        };
+        Ok(Self {
+            status,
+            tag: query
+                .get("tag")
+                .map(|tag| tag.trim().to_string())
+                .filter(|tag| !tag.is_empty() && tag != "#"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReviewsResponse {
+    /// Newest first.
+    pub reviews: Vec<ReviewSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReviewSummary {
+    pub review_id: String,
+    /// The worktree the review is about.
+    pub worktree_path: String,
+    /// The machine the worktree is on, for worktrees of remote projects.
+    pub host: Option<String>,
+    pub branch: Option<String>,
+    /// The branch the reviewed commits are on top of.
+    pub base_branch: Option<String>,
+    /// HEAD when the review was submitted.
+    pub head_commit: Option<String>,
+    /// RFC 3339.
+    pub created_at: String,
+    /// RFC 3339.
+    pub submitted_at: Option<String>,
+    pub comment_count: usize,
+    pub unaddressed_count: usize,
+    /// The tags of the review's comments, without their `#`.
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReviewCommentsResponse {
+    pub review: ReviewSummary,
+    /// In the order they were made.
+    pub comments: Vec<ReviewComment>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReviewComment {
+    pub comment_id: String,
+    /// RFC 3339.
+    pub created_at: String,
+    /// RFC 3339.
+    pub updated_at: String,
+    /// RFC 3339, for addressed comments.
+    pub addressed_at: Option<String>,
+    /// Starts with the comment's tags.
+    pub text: String,
+    /// Without their `#`.
+    pub tags: Vec<String>,
+    /// The commit the comment is about: for comments on lines, the one that
+    /// last changed them (for deleted lines, the version they were deleted
+    /// from); for other comments, HEAD when the comment was made.
+    pub commit: Option<String>,
+    /// For comments on lines.
+    pub location: Option<ReviewCommentLocation>,
+    /// The comment as text, with its commit, file and lines, as Zed copies it.
+    pub as_text: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReviewCommentLocation {
+    /// Relative to the repository's root.
+    pub path: String,
+    pub side: ReviewCommentSide,
+    /// 1-based and inclusive, in `commit`'s version of the file.
+    pub start_line: u32,
+    pub end_line: u32,
+    /// The lines as they were when the comment was made.
+    pub excerpt: String,
+    /// Where the lines are in the file on disk now (1-based and inclusive),
+    /// following the changes made since. For deleted lines, where they were.
+    /// Absent if the file is gone, or on a remote machine.
+    pub current_start_line: Option<u32>,
+    pub current_end_line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCommentSide {
+    /// Lines of the file's new version.
+    New,
+    /// Deleted lines.
+    Old,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_review_queries() {
+        let query = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(
+            ReviewsQuery::parse(&query(&[])).unwrap(),
+            ReviewsQuery::default()
+        );
+        assert!(ReviewsQuery::parse(&query(&[("all", "true")])).unwrap().all);
+        assert!(ReviewsQuery::parse(&query(&[("all", "maybe")])).is_err());
+        assert_eq!(
+            ReviewCommentsQuery::parse(&query(&[("status", "all"), ("tag", "#bug")])).unwrap(),
+            ReviewCommentsQuery {
+                status: CommentStatusFilter::All,
+                tag: Some("#bug".to_string()),
+            }
+        );
+        assert!(ReviewCommentsQuery::parse(&query(&[("status", "open")])).is_err());
+    }
 
     #[test]
     fn test_operation_event_shape() {

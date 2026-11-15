@@ -8,6 +8,13 @@ use ::git::{
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
 use project::git_store::Repository;
 
+/// How tall the editors review comments are written in grow before scrolling.
+const REVIEW_COMMENT_MAX_LINES: usize = 12;
+
+/// The key context around editors review comments are written in, where
+/// ctrl-enter (cmd-enter on macOS) submits since enter inserts a newline.
+pub const REVIEW_COMMENT_KEY_CONTEXT: &str = "DiffReviewComment";
+
 #[derive(Clone)]
 struct ResolvedDiffHunk {
     buffer_range: Range<text::Anchor>,
@@ -562,7 +569,6 @@ impl Editor {
     ) {
         let Range { start, end } = display_range.sorted();
 
-        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
         let editor_snapshot = self.snapshot(window, cx);
 
         // Convert display rows to multibuffer points
@@ -572,6 +578,21 @@ impl Editor {
         let end_point = editor_snapshot
             .display_snapshot
             .display_point_to_point(end.as_display_point(), Bias::Left);
+        self.open_diff_review_overlay(start_point, end_point.row, true, window, cx);
+    }
+
+    /// Opens the overlay for comments on the lines from `start_point` to
+    /// `end_row`, returning the key of its hunk.
+    fn open_diff_review_overlay(
+        &mut self,
+        start_point: Point,
+        end_row: u32,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<DiffHunkKey> {
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let end_point = Point::new(end_row.max(start_point.row), 0);
         let end_multi_buffer_row = MultiBufferRow(end_point.row);
 
         // Create anchor range for the selected lines (start of first line to end of last line)
@@ -598,13 +619,17 @@ impl Editor {
             Self::hunk_keys_match(&overlay.hunk_key, &new_hunk_key, &buffer_snapshot)
         }) {
             // Just focus the existing overlay's prompt editor
-            let focus_handle = existing_overlay.prompt_editor.focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            return;
+            if focus {
+                let focus_handle = existing_overlay.prompt_editor.focus_handle(cx);
+                window.focus(&focus_handle, cx);
+            }
+            return Some(existing_overlay.hunk_key.clone());
         }
 
         // Dismiss overlays that have no comments for their hunks
-        self.dismiss_overlays_without_comments(cx);
+        if focus {
+            self.dismiss_overlays_without_comments(cx);
+        }
 
         // Get the current user's avatar URI from the project's user_store
         let user_avatar_uri = self.project.as_ref().and_then(|project| {
@@ -624,18 +649,25 @@ impl Editor {
         let hunk_key = new_hunk_key;
 
         // Create the prompt editor for the review input
+        let completion_provider = self.review_comment_completion_provider.clone();
         let prompt_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
+            let mut editor = Editor::auto_height(1, REVIEW_COMMENT_MAX_LINES, window, cx);
             editor.set_placeholder_text("Add a review comment...", window, cx);
+            editor.set_show_gutter(false, cx);
+            if completion_provider.is_some() {
+                editor.set_completion_provider(completion_provider);
+            }
             editor
         });
 
-        // Register the Newline action on the prompt editor to submit the review
+        // Comments can span several lines, so enter inserts a newline and
+        // submitting takes `SubmitDiffReviewComment` (bound to ctrl-enter). The
+        // prompt editor would handle that action itself, finding no overlay.
         let parent_editor = cx.entity().downgrade();
         let subscription = prompt_editor.update(cx, |prompt_editor, _cx| {
             prompt_editor.register_action({
                 let parent_editor = parent_editor.clone();
-                move |_: &crate::actions::Newline, window, cx| {
+                move |_: &crate::actions::SubmitDiffReviewComment, window, cx| {
                     if let Some(editor) = parent_editor.upgrade() {
                         editor.update(cx, |editor, cx| {
                             editor.submit_diff_review_comment(window, cx);
@@ -670,14 +702,14 @@ impl Editor {
         let block_ids = self.insert_blocks([block], None, cx);
         let Some(block_id) = block_ids.into_iter().next() else {
             log::error!("Failed to insert diff review overlay block");
-            return;
+            return None;
         };
 
         self.diff_review_overlays.push(DiffReviewOverlay {
             anchor_range,
             block_id,
             prompt_editor: prompt_editor.clone(),
-            hunk_key,
+            hunk_key: hunk_key.clone(),
             comments_expanded: true,
             inline_edit_editors: HashMap::default(),
             inline_edit_subscriptions: HashMap::default(),
@@ -685,11 +717,80 @@ impl Editor {
             _subscription: subscription,
         });
 
-        // Focus the prompt editor
-        let focus_handle = prompt_editor.focus_handle(cx);
-        window.focus(&focus_handle, cx);
+        if focus {
+            let focus_handle = prompt_editor.focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        }
 
         cx.notify();
+        Some(hunk_key)
+    }
+
+    /// Sets the provider of completions for the editors review comments are
+    /// written in.
+    pub fn set_review_comment_completion_provider(
+        &mut self,
+        provider: Option<Rc<dyn CompletionProvider>>,
+    ) {
+        self.review_comment_completion_provider = provider;
+    }
+
+    /// Shows a review comment that was made before, e.g. in an earlier
+    /// session, below the lines in `range`. Returns its id, or `None` if the
+    /// lines aren't in this editor.
+    pub fn restore_review_comment(
+        &mut self,
+        range: Range<Anchor>,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let start = range.start.to_point(&snapshot);
+        let end = range.end.to_point(&snapshot);
+        let hunk_key = self.open_diff_review_overlay(start, end.row, false, window, cx)?;
+        let id = self.add_review_comment(hunk_key.clone(), text, range, cx);
+        self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        Some(id)
+    }
+
+    /// Changes a review comment's text without reporting it as an edit, e.g.
+    /// because the edit was made elsewhere.
+    pub fn set_review_comment_text(
+        &mut self,
+        id: usize,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.update_review_comment(id, text, cx)
+            && let Some(hunk_key) = self.hunk_key_for_comment(id)
+        {
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
+    }
+
+    /// Removes a review comment without reporting it as deleted, e.g. because
+    /// it was deleted elsewhere.
+    pub fn forget_review_comment(
+        &mut self,
+        id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hunk_key = self.hunk_key_for_comment(id);
+        if self.remove_review_comment(id, cx)
+            && let Some(hunk_key) = hunk_key
+        {
+            self.refresh_diff_review_overlay_height(&hunk_key, window, cx);
+        }
+    }
+
+    fn hunk_key_for_comment(&self, id: usize) -> Option<DiffHunkKey> {
+        self.stored_review_comments
+            .iter()
+            .find(|(_, comments)| comments.iter().any(|comment| comment.id == id))
+            .map(|(key, _)| key.clone())
     }
 
     /// Stores the diff review comment locally.
@@ -713,7 +814,17 @@ impl Editor {
         let anchor_range = overlay.anchor_range.clone();
         let hunk_key = overlay.hunk_key.clone();
 
-        self.add_review_comment(hunk_key.clone(), comment_text, anchor_range, cx);
+        let id = self.add_review_comment(
+            hunk_key.clone(),
+            comment_text.clone(),
+            anchor_range.clone(),
+            cx,
+        );
+        cx.emit(EditorEvent::ReviewCommentAdded {
+            id,
+            range: anchor_range,
+            text: comment_text,
+        });
 
         // Clear the prompt editor but keep the overlay open
         if let Some(overlay) = self.diff_review_overlays.get(overlay_index) {
@@ -1325,19 +1436,25 @@ impl Editor {
 
                     // Create inline editor
                     let parent_editor = cx.entity().downgrade();
+                    let completion_provider = self.review_comment_completion_provider.clone();
                     let inline_editor = cx.new(|cx| {
-                        let mut editor = Editor::single_line(window, cx);
+                        let mut editor =
+                            Editor::auto_height(1, REVIEW_COMMENT_MAX_LINES, window, cx);
+                        editor.set_show_gutter(false, cx);
+                        if completion_provider.is_some() {
+                            editor.set_completion_provider(completion_provider);
+                        }
                         editor.set_text(&*comment_text, window, cx);
                         // Select all text for easy replacement
                         editor.select_all(&crate::actions::SelectAll, window, cx);
                         editor
                     });
 
-                    // Register the Newline action to confirm the edit
+                    // Like in the prompt editor, enter inserts a newline.
                     let subscription = inline_editor.update(cx, |inline_editor, _cx| {
                         inline_editor.register_action({
                             let parent_editor = parent_editor.clone();
-                            move |_: &crate::actions::Newline, window, cx| {
+                            move |_: &crate::actions::SubmitDiffReviewComment, window, cx| {
                                 if let Some(editor) = parent_editor.upgrade() {
                                     editor.update(cx, |editor, cx| {
                                         editor.confirm_edit_review_comment(comment_id, window, cx);
@@ -1397,8 +1514,12 @@ impl Editor {
             .map(|editor| editor.read(cx).text(cx).trim().to_string());
 
         if let Some(new_text) = new_text {
-            if !new_text.is_empty() {
-                self.update_review_comment(comment_id, new_text, cx);
+            if !new_text.is_empty() && self.update_review_comment(comment_id, new_text.clone(), cx)
+            {
+                cx.emit(EditorEvent::ReviewCommentEdited {
+                    id: comment_id,
+                    text: new_text,
+                });
             }
         }
 
@@ -1501,7 +1622,9 @@ impl Editor {
             .first()
             .map(|o| o.hunk_key.clone());
 
-        self.remove_review_comment(action.id, cx);
+        if self.remove_review_comment(action.id, cx) {
+            cx.emit(EditorEvent::ReviewCommentDeleted { id: action.id });
+        }
 
         // Refresh the overlay height after removing a comment
         if let Some(hunk_key) = hunk_key.or(overlay_hunk_key) {
@@ -2633,6 +2756,7 @@ impl Editor {
                             .bg(colors.editor_background)
                             .px_2()
                             .py_1()
+                            .key_context(REVIEW_COMMENT_KEY_CONTEXT)
                             .child(prompt_editor.clone()),
                     )
                     .child(
@@ -2791,6 +2915,7 @@ impl Editor {
                     .bg(colors.editor_background)
                     .px_2()
                     .py_1()
+                    .key_context(REVIEW_COMMENT_KEY_CONTEXT)
                     .child(editor)
                     .into_any_element()
             } else {
@@ -2842,8 +2967,36 @@ impl Editor {
                     )
                     .into_any_element()
             } else {
-                // Display mode: no action buttons for now (edit/delete not yet implemented)
-                gpui::Empty.into_any_element()
+                h_flex()
+                    .gap_1()
+                    .child(
+                        IconButton::new(format!("diff-review-edit-{comment_id}"), IconName::Pencil)
+                            .icon_color(ui::Color::Muted)
+                            .icon_size(action_icon_size)
+                            .tooltip(Tooltip::text("Edit"))
+                            .on_click(move |_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(crate::actions::EditReviewComment { id: comment_id }),
+                                    cx,
+                                );
+                            }),
+                    )
+                    .child(
+                        IconButton::new(
+                            format!("diff-review-delete-{comment_id}"),
+                            IconName::Trash,
+                        )
+                        .icon_color(ui::Color::Muted)
+                        .icon_size(action_icon_size)
+                        .tooltip(Tooltip::text("Delete"))
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(crate::actions::DeleteReviewComment { id: comment_id }),
+                                cx,
+                            );
+                        }),
+                    )
+                    .into_any_element()
             })
     }
 

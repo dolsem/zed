@@ -51,6 +51,7 @@ pub mod picker_prompt;
 pub mod project_diff;
 pub(crate) mod remote_output;
 pub mod repository_selector;
+pub mod review_mode;
 pub mod solo_diff_view;
 pub mod staged_diff;
 pub mod stash_picker;
@@ -64,6 +65,7 @@ pub fn init(cx: &mut App) {
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     git_graph::init(cx);
+    review_mode::init(cx);
 
     git_ui_core::set_branch_picker_builder(
         |workspace, repository, window, cx| {

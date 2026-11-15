@@ -6,9 +6,11 @@
 
 mod api;
 mod buffers;
+mod code_review;
 mod mcp;
 mod operations;
 mod rest;
+mod reviews;
 mod status_bar;
 mod terminals;
 mod threads;
@@ -187,6 +189,7 @@ pub struct MobileBridge {
     pub(crate) workspace_items: workspace_items::WorkspaceItemsState,
     pub(crate) rest: rest::RestState,
     pub(crate) operations: operations::OperationsState,
+    pub(crate) reviews: code_review::ReviewWatches,
     _settings_subscription: gpui::Subscription,
     _theme_subscription: gpui::Subscription,
 }
@@ -223,6 +226,7 @@ impl MobileBridge {
             workspace_items: workspace_items::WorkspaceItemsState::default(),
             rest: rest::RestState::default(),
             operations: operations::OperationsState::default(),
+            reviews: code_review::ReviewWatches::default(),
             _settings_subscription: settings_subscription,
             _theme_subscription: theme_subscription,
         };
@@ -587,6 +591,31 @@ impl MobileBridge {
                 self.open_uncommitted_changes(workspace_id, cx)
             }
             Request::OpenCommit { workspace_id, sha } => self.open_commit(workspace_id, sha, cx),
+            Request::ReviewState { workspace_id } => self.review_state(workspace_id, cx),
+            Request::ReviewDiff { workspace_id } => self.review_diff(workspace_id, cx),
+            Request::SetReviewBase { workspace_id, base } => {
+                self.set_review_base(workspace_id, base, cx)
+            }
+            Request::AddReviewComment {
+                workspace_id,
+                text,
+                target,
+            } => self.add_review_comment(workspace_id, text, target, cx),
+            Request::EditReviewComment {
+                workspace_id,
+                comment_id,
+                text,
+            } => self.edit_review_comment(workspace_id, comment_id, text, cx),
+            Request::DeleteReviewComment {
+                workspace_id,
+                comment_id,
+            } => self.delete_review_comment(workspace_id, comment_id, cx),
+            Request::SetReviewCommentAddressed {
+                workspace_id,
+                comment_id,
+                addressed,
+            } => self.set_review_comment_addressed(workspace_id, comment_id, addressed, cx),
+            Request::SubmitReview { workspace_id } => self.submit_review(workspace_id, cx),
             Request::StagePaths {
                 workspace_id,
                 repository_id,

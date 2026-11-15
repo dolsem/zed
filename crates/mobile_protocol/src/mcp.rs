@@ -33,7 +33,8 @@ new git worktree, whose setup hooks it waits for) and can send its first message
 continues a thread. Every user message starts a run, and tools that wait return the run once the \
 agent finished it or needs something: answer permission prompts with respond_to_permission and \
 questions with answer_question, then call wait_for_run again. A run only shows its outcome unless \
-detail is requested; command output is left out of it, get it with get_command_output.";
+detail is requested; command output is left out of it, get it with get_command_output. \
+list_reviews and get_review_comments return the code review comments submitted in Zed's git panel.";
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcMessage {
@@ -389,6 +390,31 @@ pub fn tools() -> Vec<Value> {
                     wait_properties(),
                 ),
                 &["operation_id"],
+            ),
+            true,
+        ),
+        tool(
+            "list_reviews",
+            "Lists the code reviews submitted in Zed's git panel for any worktree, whether or not it's open. By default only reviews with unaddressed comments.",
+            object_schema(
+                json!({
+                    "all": { "type": "boolean", "description": "Also list reviews whose comments were all addressed." },
+                    "worktree_path": { "type": "string", "description": "Only the reviews of the worktree at this path." },
+                }),
+                &[],
+            ),
+            true,
+        ),
+        tool(
+            "get_review_comments",
+            "Returns a review's comments with the commit, file and lines each is about, and where those lines are now. By default only unaddressed comments.",
+            object_schema(
+                json!({
+                    "review_id": { "type": "string", "description": "From list_reviews." },
+                    "status": { "enum": ["unaddressed", "addressed", "all"], "description": "Which comments to return by whether they were addressed (default unaddressed)." },
+                    "tag": { "type": "string", "description": "Only comments with this tag, with or without its #." },
+                }),
+                &["review_id"],
             ),
             true,
         ),

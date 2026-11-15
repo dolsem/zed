@@ -1,9 +1,10 @@
 import type { EditorView } from "@codemirror/view";
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import { BufferEditor, createStaticDiffView, type AccessoryKey } from "./editor";
+import { BufferEditor, createReviewDiffView, createStaticDiffView, type AccessoryKey, type ReviewDiffView } from "./editor";
 import { handleMarkdownClick, renderMarkdown } from "./markdown";
-import type { CommitFile, DiffFile, FileStatus, Hover, ItemContent, RepositoryId, WorkspaceId } from "./protocol";
+import type { CommitFile, DiffFile, FileStatus, Hover, ItemContent, RepositoryId, ReviewCommentSnapshot, ReviewState, WorkspaceId } from "./protocol";
+import { EditCommentSheet, LineCommentSheet, ReviewOverlay, useReviewMarks, useReviewState, type LineCommentRequest } from "./review";
 import { call, closeOverlay, conn, errorMessage, openOverlay, overlay, reportError, toast, type OverlayTarget } from "./state";
 import { TerminalView } from "./terminal";
 import {
@@ -47,17 +48,19 @@ export function ItemOverlay() {
   useEffect(() => {
     if (!target) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !(event.target instanceof HTMLElement && event.target.closest(".cm-editor"))) closeOverlay();
+      if (event.key === "Escape" && !(event.target instanceof HTMLElement && event.target.closest(".cm-editor, textarea, input, .sheet"))) closeOverlay();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [target]);
 
   if (!shown) return null;
-  const key = `${shown.type}:${shown.workspaceId}:${shown.itemId}`;
+  const key = shown.type === "review" ? `review:${shown.workspaceId}` : `${shown.type}:${shown.workspaceId}:${shown.itemId}`;
   return (
     <div class={`item-overlay ${closing ? "closing" : ""}`}>
-      {shown.type === "terminal" ? (
+      {shown.type === "review" ? (
+        <ReviewOverlay key={key} target={shown} />
+      ) : shown.type === "terminal" ? (
         <TerminalView key={key} target={shown} />
       ) : shown.kind === "file" ? (
         <FileItemView key={key} target={shown} />
@@ -605,6 +608,10 @@ function CommitItemView({ target }: { target: Extract<OverlayTarget, { type: "it
   const { error, retry } = useItemContent(target, (next) => {
     if (next.kind === "commit") setContent(next);
   });
+  const review = useReviewState(target.workspaceId);
+  const canReview = !!review && !review.unavailable_reason;
+  const [lineRequest, setLineRequest] = useState<LineCommentRequest | null>(null);
+  const [editing, setEditing] = useState<ReviewCommentSnapshot | null>(null);
   const date = content ? parseDate(content.timestamp) : null;
   const [subject, ...bodyLines] = (content?.message ?? "").split("\n");
   const body = bodyLines.join("\n").trim();
@@ -625,29 +632,104 @@ function CommitItemView({ target }: { target: Extract<OverlayTarget, { type: "it
               </div>
               <div class="commit-stats">
                 {content.files.length} file{content.files.length === 1 ? "" : "s"} changed
+                {canReview && " · Tap a line number to comment"}
               </div>
             </div>
             {content.files.map((file) => (
-              <CommitSection key={file.path} file={file} />
+              <CommitSection
+                key={file.path}
+                file={file}
+                sha={content.sha}
+                review={canReview ? review : null}
+                onLineTap={(row) =>
+                  setLineRequest({ path: file.path, lines: (file.new_text ?? "").split("\n"), row, commit: content.sha })
+                }
+                onCommentTap={(comment) => setEditing(comment)}
+              />
             ))}
           </>
         )}
         <div class="multibuffer-end" />
       </div>
+      {canReview && (
+        <>
+          <LineCommentSheet
+            workspaceId={target.workspaceId}
+            request={lineRequest}
+            tags={review.tags}
+            onClose={() => setLineRequest(null)}
+          />
+          <EditCommentSheet workspaceId={target.workspaceId} comment={editing} tags={review.tags} onClose={() => setEditing(null)} />
+        </>
+      )}
     </OverlayFrame>
   );
 }
 
-function CommitSection({ file }: { file: CommitFile }) {
+function CommitSection({
+  file,
+  sha,
+  review,
+  onLineTap,
+  onCommentTap,
+}: {
+  file: CommitFile;
+  sha: string;
+  review: ReviewState | null;
+  onLineTap: (row: number) => void;
+  onCommentTap: (comment: ReviewCommentSnapshot) => void;
+}) {
   const [visible, setVisible] = useState(false);
   const hostRef = useRef<HTMLDivElement>(null);
+  const [reviewView, setReviewView] = useState<ReviewDiffView | null>(null);
+  const handlers = useRef({ onLineTap, onCommentTap, review });
+  handlers.current = { onLineTap, onCommentTap, review };
   const placeholderRef = useInView<HTMLDivElement>(() => setVisible(true), { rootMargin: "800px", enabled: !visible && !file.is_binary });
+  const commentable = !!review && file.new_text !== null;
 
   useEffect(() => {
     if (!visible || !hostRef.current || file.is_binary) return;
-    const view = createStaticDiffView(hostRef.current, file.old_text ?? "", file.new_text ?? "");
-    return () => view.destroy();
-  }, [visible]);
+    if (!commentable) {
+      const view = createStaticDiffView(hostRef.current, file.old_text ?? "", file.new_text ?? "");
+      return () => view.destroy();
+    }
+    const created = createReviewDiffView(hostRef.current, file.old_text ?? "", file.new_text ?? "", {
+      onLineTap: (row) => handlers.current.onLineTap(row),
+      onCommentTap: (id) => {
+        const comment = handlers.current.review?.reviews
+          .flatMap((candidate) => candidate.comments)
+          .find((candidate) => candidate.comment_id === id);
+        if (comment) handlers.current.onCommentTap(comment);
+      },
+    });
+    setReviewView(created);
+    return () => {
+      created.view.destroy();
+      setReviewView(null);
+    };
+  }, [visible, commentable]);
+
+  // Comments on this commit's version of the file are where they were made.
+  useReviewMarks(
+    reviewView,
+    (review?.reviews ?? [])
+      .flatMap((candidate) => candidate.comments)
+      .filter(
+        (comment) =>
+          !comment.addressed &&
+          !comment.is_deleted_side &&
+          comment.commit === sha &&
+          comment.path === file.path &&
+          comment.start_line !== null &&
+          comment.end_line !== null,
+      )
+      .map((comment) => ({
+        id: comment.comment_id,
+        startRow: (comment.start_line ?? 1) - 1,
+        endRow: (comment.end_line ?? 1) - 1,
+        text: comment.text,
+      })),
+  );
 
   return (
     <section class="file-section">

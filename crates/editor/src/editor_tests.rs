@@ -46567,6 +46567,97 @@ fn test_diff_review_inline_edit_flow(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_review_comment_events_and_restore(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let editor = cx.add_window({
+        let events = events.clone();
+        |window, cx| {
+            let buffer = cx.new(|cx| Buffer::local("line 1\nline 2\nline 3\n", cx));
+            let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            cx.subscribe_in(
+                &cx.entity(),
+                window,
+                move |_, _, event: &EditorEvent, _, _| match event {
+                    EditorEvent::ReviewCommentAdded { id, text, .. } => {
+                        events.borrow_mut().push(format!("added {id} {text}"))
+                    }
+                    EditorEvent::ReviewCommentEdited { id, text } => {
+                        events.borrow_mut().push(format!("edited {id} {text}"))
+                    }
+                    EditorEvent::ReviewCommentDeleted { id } => {
+                        events.borrow_mut().push(format!("deleted {id}"))
+                    }
+                    _ => {}
+                },
+            )
+            .detach();
+            Editor::new(EditorMode::full(), multi_buffer, None, window, cx)
+        }
+    });
+
+    // Restoring a comment shows it without reporting it as new.
+    let restored_id = editor
+        .update(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let range =
+                snapshot.anchor_after(Point::new(1, 0))..snapshot.anchor_before(Point::new(1, 6));
+            editor.restore_review_comment(range, "Restored".to_string(), window, cx)
+        })
+        .unwrap()
+        .expect("the lines are in the editor");
+    editor
+        .update(cx, |editor, _, _| {
+            assert_eq!(editor.total_review_comment_count(), 1);
+            assert_eq!(editor.diff_review_overlays.len(), 1);
+        })
+        .unwrap();
+    assert!(events.borrow().is_empty());
+
+    // Comments written in an overlay are reported.
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.show_diff_review_overlay(DisplayRow(0)..DisplayRow(0), window, cx);
+            let prompt_editor = editor
+                .diff_review_overlays
+                .last()
+                .unwrap()
+                .prompt_editor
+                .clone();
+            prompt_editor.update(cx, |prompt_editor, cx| {
+                prompt_editor.insert("New", window, cx);
+            });
+            editor.submit_diff_review_comment(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(events.borrow().len(), 1);
+    assert!(
+        events.borrow()[0].ends_with(" New"),
+        "{:?}",
+        events.borrow()
+    );
+
+    // Changes made elsewhere aren't reported back; deletions in the editor are.
+    editor
+        .update(cx, |editor, window, cx| {
+            editor.set_review_comment_text(restored_id, "Changed".to_string(), window, cx);
+            let texts = editor
+                .stored_review_comments
+                .iter()
+                .flat_map(|(_, comments)| comments.iter().map(|comment| comment.comment.clone()))
+                .collect::<Vec<_>>();
+            assert!(texts.contains(&"Changed".to_string()));
+            editor.delete_review_comment(&DeleteReviewComment { id: restored_id }, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(events.borrow().len(), 2);
+    assert_eq!(events.borrow()[1], format!("deleted {restored_id}"));
+}
+
+#[gpui::test]
 fn test_orphaned_comments_are_cleaned_up(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

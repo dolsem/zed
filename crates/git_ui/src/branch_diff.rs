@@ -12,7 +12,10 @@ use editor::{
     Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
     actions::SendReviewToAgent,
 };
-use git::{repository::DiffType, status::FileStatus};
+use git::{
+    repository::{DiffType, RepoPath},
+    status::FileStatus,
+};
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity,
@@ -374,6 +377,68 @@ impl BranchDiff {
 
     pub(crate) fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
         self.diff.read(cx).diff_base(cx)
+    }
+
+    pub(crate) fn diff_multibuffer(&self) -> &Entity<DiffMultibuffer> {
+        &self.diff
+    }
+
+    /// Shows the changes since `base_ref`, reusing an open diff against the
+    /// same base, scrolled to `scroll_to` if given.
+    pub(crate) fn open_for_review(
+        workspace: &mut Workspace,
+        repository: Entity<Repository>,
+        base_ref: SharedString,
+        scroll_to: Option<(RepoPath, Option<language::Point>)>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Task<Result<Entity<Self>>> {
+        let repository_id = repository.read(cx).id;
+        let existing = workspace.items_of_type::<Self>(cx).find(|item| {
+            let item = item.read(cx);
+            matches!(
+                item.diff_base(cx),
+                DiffBase::Merge { base_ref: existing_base_ref } if existing_base_ref == &base_ref
+            ) && item
+                .repo(cx)
+                .is_some_and(|repo| repo.read(cx).id == repository_id)
+        });
+        if let Some(existing) = existing {
+            workspace.activate_item(&existing, true, true, window, cx);
+            if let Some((repo_path, point)) = scroll_to {
+                existing.update(cx, |this, cx| {
+                    this.diff.update(cx, |diff, cx| {
+                        diff.move_to_repo_path(&repo_path, point, window, cx)
+                    })
+                });
+            }
+            return Task::ready(Ok(existing));
+        }
+
+        let project = workspace.project().clone();
+        let new_diff = Self::new_with_branch_base(
+            project,
+            cx.entity(),
+            base_ref,
+            repository,
+            None,
+            window,
+            cx,
+        );
+        cx.spawn_in(window, async move |workspace, cx| {
+            let this = new_diff.await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.add_item_to_active_pane(Box::new(this.clone()), None, true, window, cx);
+                if let Some((repo_path, point)) = scroll_to {
+                    this.update(cx, |this, cx| {
+                        this.diff.update(cx, |diff, cx| {
+                            diff.move_to_repo_path(&repo_path, point, window, cx)
+                        })
+                    });
+                }
+            })?;
+            Ok(this)
+        })
     }
 
     pub(crate) fn repo(&self, cx: &App) -> Option<Entity<Repository>> {

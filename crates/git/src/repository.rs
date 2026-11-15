@@ -1153,6 +1153,16 @@ pub trait GitRepository: Send + Sync {
 
     fn repair_worktrees(&self) -> BoxFuture<'_, Result<()>>;
 
+    /// Runs a git command that doesn't modify the repository and returns its
+    /// standard output, writing `stdin` to its standard input when given.
+    fn run_read_only_command(
+        &self,
+        _args: Vec<String>,
+        _stdin: Option<String>,
+    ) -> BoxFuture<'_, Result<String>> {
+        async { anyhow::bail!("this repository can't run git commands") }.boxed()
+    }
+
     fn set_trusted(&self, trusted: bool);
     fn is_trusted(&self) -> bool;
 }
@@ -2851,6 +2861,45 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn run_read_only_command(
+        &self,
+        args: Vec<String>,
+        stdin: Option<String>,
+    ) -> BoxFuture<'_, Result<String>> {
+        let git = self.git_binary();
+        self.executor
+            .spawn(async move {
+                check_read_only_command(&args)?;
+                let Some(stdin) = stdin else {
+                    return git.run_raw(&args).await;
+                };
+                let mut process = git
+                    .build_command(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+                let mut writer = process
+                    .stdin
+                    .take()
+                    .context("no stdin for git subprocess")?;
+                writer.write_all(stdin.as_bytes()).await?;
+                writer.flush().await?;
+                drop(writer);
+                let output = process.output().await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    GitBinaryCommandError {
+                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                        status: output.status,
+                    }
+                );
+                Ok(String::from_utf8(output.stdout)?)
+            })
+            .boxed()
+    }
+
     fn push(
         &self,
         branch_name: String,
@@ -3909,6 +3958,37 @@ async fn add_files_to_index(git: &GitBinary, files: &[String]) -> Result<()> {
             status: output.status,
         }
     );
+    Ok(())
+}
+
+/// Remote clients can ask for these commands, so only ones that can't change
+/// anything or run other programs are allowed.
+fn check_read_only_command(args: &[String]) -> Result<()> {
+    const SUBCOMMANDS: &[&str] = &[
+        "blame",
+        "cat-file",
+        "diff",
+        "for-each-ref",
+        "log",
+        "ls-files",
+        "merge-base",
+        "rev-list",
+        "rev-parse",
+        "show",
+    ];
+    let subcommand = args.first().context("no git command given")?;
+    anyhow::ensure!(
+        SUBCOMMANDS.contains(&subcommand.as_str()),
+        "git {subcommand} isn't a read-only command"
+    );
+    if let Some(arg) = args.iter().find(|arg| {
+        arg.starts_with("--output")
+            || arg.starts_with("--exec")
+            || arg.starts_with("--ext-diff")
+            || arg.starts_with("--textconv")
+    }) {
+        anyhow::bail!("{arg} isn't allowed in read-only git commands");
+    }
     Ok(())
 }
 

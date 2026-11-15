@@ -547,7 +547,12 @@ message Envelope {
     ContextServerRequest context_server_request = 513;
     ContextServerResponse context_server_response = 514;
     GetContextServerProxy get_context_server_proxy = 515;
-    ContextServerProxy context_server_proxy = 516; // current max
+    ContextServerProxy context_server_proxy = 516;
+    GitRunReadOnlyCommand git_run_read_only_command = 517;
+    GitRunReadOnlyCommandResponse git_run_read_only_command_response = 518;
+    GitLoadReviewFile git_load_review_file = 519;
+    GitLoadReviewFileResponse git_load_review_file_response = 520;
+    GitSaveReviewFile git_save_review_file = 521; // current max
   }
 
   reserved 87 to 88;

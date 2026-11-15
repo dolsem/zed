@@ -1099,6 +1099,9 @@ impl GitStore {
         client.add_entity_request_handler(Self::handle_rename_worktree);
         client.add_entity_request_handler(Self::handle_worktree_created_at);
         client.add_entity_request_handler(Self::handle_get_head_sha);
+        client.add_entity_request_handler(Self::handle_run_read_only_command);
+        client.add_entity_request_handler(Self::handle_load_review_file);
+        client.add_entity_request_handler(Self::handle_save_review_file);
         client.add_entity_request_handler(Self::handle_edit_ref);
         client.add_entity_request_handler(Self::handle_repair_worktrees);
         client.add_entity_request_handler(Self::handle_get_commit_data);
@@ -4113,6 +4116,53 @@ impl GitStore {
             .await??;
 
         Ok(proto::GitGetHeadShaResponse { sha: head_sha })
+    }
+
+    async fn handle_run_read_only_command(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitRunReadOnlyCommand>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitRunReadOnlyCommandResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let stdout = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle
+                    .run_read_only_git_command(envelope.payload.args, envelope.payload.stdin)
+            })
+            .await??;
+        Ok(proto::GitRunReadOnlyCommandResponse { stdout })
+    }
+
+    async fn handle_load_review_file(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitLoadReviewFile>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::GitLoadReviewFileResponse> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        let contents = repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle.load_review_file(envelope.payload.name)
+            })
+            .await??;
+        Ok(proto::GitLoadReviewFileResponse { contents })
+    }
+
+    async fn handle_save_review_file(
+        this: Entity<Self>,
+        envelope: TypedEnvelope<proto::GitSaveReviewFile>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
+        let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
+        repository_handle
+            .update(&mut cx, |repository_handle, _| {
+                repository_handle
+                    .save_review_file(envelope.payload.name, envelope.payload.contents)
+            })
+            .await??;
+        Ok(proto::Ack {})
     }
 
     async fn handle_get_commit_data(
@@ -9490,6 +9540,92 @@ impl Repository {
                         .await?;
 
                     Ok(response.sha)
+                }
+            }
+        })
+    }
+
+    /// Runs a git command that doesn't modify the repository, returning its
+    /// standard output. Only local repositories can run arbitrary commands.
+    pub fn run_read_only_git_command(
+        &mut self,
+        args: Vec<String>,
+        stdin: Option<String>,
+    ) -> oneshot::Receiver<Result<String>> {
+        let id = self.id;
+        self.send_job("read_only_command", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.run_read_only_command(args, stdin).await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response = client
+                        .request(proto::GitRunReadOnlyCommand {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            args,
+                            stdin,
+                        })
+                        .await?;
+                    Ok(response.stdout)
+                }
+            }
+        })
+    }
+
+    /// Reads one of the code review files kept in the repository's git
+    /// directory (see [`git_review::review_dir`]), `None` if it doesn't exist.
+    pub fn load_review_file(&mut self, name: String) -> oneshot::Receiver<Result<Option<String>>> {
+        let id = self.id;
+        let git_dir = self.snapshot.repository_dir_abs_path.clone();
+        self.send_job("load_review_file", None, move |repo, cx| async move {
+            match repo {
+                RepositoryState::Local(_) => {
+                    cx.background_spawn(
+                        async move { git_review::read_review_file(&git_dir, &name) },
+                    )
+                    .await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    let response = client
+                        .request(proto::GitLoadReviewFile {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            name,
+                        })
+                        .await?;
+                    Ok(response.contents)
+                }
+            }
+        })
+    }
+
+    /// Writes one of the code review files kept in the repository's git directory.
+    pub fn save_review_file(
+        &mut self,
+        name: String,
+        contents: String,
+    ) -> oneshot::Receiver<Result<()>> {
+        let id = self.id;
+        let git_dir = self.snapshot.repository_dir_abs_path.clone();
+        self.send_job("save_review_file", None, move |repo, cx| async move {
+            match repo {
+                RepositoryState::Local(_) => {
+                    cx.background_spawn(async move {
+                        git_review::write_review_file(&git_dir, &name, &contents)
+                    })
+                    .await
+                }
+                RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    client
+                        .request(proto::GitSaveReviewFile {
+                            project_id: project_id.0,
+                            repository_id: id.to_proto(),
+                            name,
+                            contents,
+                        })
+                        .await?;
+                    Ok(())
                 }
             }
         })

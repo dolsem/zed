@@ -266,16 +266,28 @@ export type OverlayTarget =
       offset: number | null;
       title: string;
     }
-  | { type: "terminal"; workspaceId: WorkspaceId; itemId: ItemId; title: string };
+  | { type: "terminal"; workspaceId: WorkspaceId; itemId: ItemId; title: string }
+  | { type: "review"; workspaceId: WorkspaceId };
 
 export const overlay = signal<OverlayTarget | null>(null);
 
+/** Overlays to go back to, e.g. the review a commit was opened from. */
+let overlayStack: OverlayTarget[] = [];
+
 export function openOverlay(target: OverlayTarget) {
+  overlayStack = [];
+  overlay.value = target;
+}
+
+/** Opens `target` on top of the current overlay, which closing it returns to. */
+export function pushOverlay(target: OverlayTarget) {
+  const current = overlay.peek();
+  if (current) overlayStack.push(current);
   overlay.value = target;
 }
 
 export function closeOverlay() {
-  overlay.value = null;
+  overlay.value = overlayStack.pop() ?? null;
 }
 
 // ---------------------------------------------------------------------------

@@ -295,6 +295,40 @@ async fn call_tool(
             rest_ok(bridge, "GET", &["threads"], &query, None, cx).await
         }
         "list_operations" => rest_ok(bridge, "GET", &["operations"], &[], None, cx).await,
+        "list_reviews" => {
+            let all = if flag(arguments, "all", false)? {
+                Some(("all", "true"))
+            } else {
+                None
+            };
+            let query = [
+                all,
+                optional_string(arguments, "worktree_path")?.map(|path| ("worktree_path", path)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            rest_ok(bridge, "GET", &["reviews"], &query, None, cx).await
+        }
+        "get_review_comments" => {
+            let review_id = string(arguments, "review_id")?;
+            let query = [
+                optional_string(arguments, "status")?.map(|status| ("status", status)),
+                optional_string(arguments, "tag")?.map(|tag| ("tag", tag)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            rest_ok(
+                bridge,
+                "GET",
+                &["reviews", review_id, "comments"],
+                &query,
+                None,
+                cx,
+            )
+            .await
+        }
         "start_pairing" => rest_ok(bridge, "POST", &["pairing"], &[], None, cx).await,
         "create_worktree" => {
             string(arguments, "project_id")?;

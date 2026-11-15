@@ -1691,4 +1691,12 @@
       "shift-tab": "skill_creator::FocusPreviousField",
     },
   },
+  {
+    // Review comments span lines, so enter inserts a newline. Listed last so it wins over
+    // the git diff's and auto-height editors' bindings of the same key.
+    "context": "DiffReviewComment > Editor",
+    "bindings": {
+      "ctrl-enter": "editor::SubmitDiffReviewComment",
+    },
+  },
 ]

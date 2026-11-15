@@ -128,6 +128,47 @@ pub enum Request {
         paths: Vec<String>,
     },
 
+    // Code review of the workspace's active repository
+    /// Returns `ReviewState`. Until the client disconnects, `review.changed`
+    /// events tell it to fetch the state again.
+    #[serde(rename = "review.state")]
+    ReviewState { workspace_id: WorkspaceId },
+    /// Returns `ReviewDiff`: the changes since the base.
+    #[serde(rename = "review.diff")]
+    ReviewDiff { workspace_id: WorkspaceId },
+    #[serde(rename = "review.set_base")]
+    SetReviewBase {
+        workspace_id: WorkspaceId,
+        base: String,
+    },
+    /// Adds a comment to the pending review. Returns `AddedReviewComment`.
+    #[serde(rename = "review.add_comment")]
+    AddReviewComment {
+        workspace_id: WorkspaceId,
+        text: String,
+        target: ReviewCommentTargetParams,
+    },
+    #[serde(rename = "review.edit_comment")]
+    EditReviewComment {
+        workspace_id: WorkspaceId,
+        comment_id: String,
+        text: String,
+    },
+    #[serde(rename = "review.delete_comment")]
+    DeleteReviewComment {
+        workspace_id: WorkspaceId,
+        comment_id: String,
+    },
+    #[serde(rename = "review.set_addressed")]
+    SetReviewCommentAddressed {
+        workspace_id: WorkspaceId,
+        comment_id: String,
+        addressed: bool,
+    },
+    /// Submits the pending review. Returns `SubmittedReview`.
+    #[serde(rename = "review.submit")]
+    SubmitReview { workspace_id: WorkspaceId },
+
     // Full-screen item views
     /// Returns the content of an editor-like tab and subscribes to the
     /// buffers it contains. Returns `ItemContent`.
@@ -296,6 +337,139 @@ pub mod events {
     pub const TERMINAL_CLOSED: &str = "terminal.closed";
     /// `ToastEvent`, for errors from background operations.
     pub const TOAST: &str = "toast";
+    /// `ReviewChangedEvent`; the client should re-fetch `review.state`.
+    pub const REVIEW_CHANGED: &str = "review.changed";
+}
+
+/// What a new review comment is about.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewCommentTargetParams {
+    /// The latest commit, not specific lines.
+    General,
+    /// Lines of a file's new version: in the working tree (as in
+    /// `ReviewDiff`), or in `commit`. Rows are 0-based and inclusive.
+    Line {
+        path: String,
+        start_row: u32,
+        end_row: u32,
+        commit: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewChangedEvent {
+    pub workspace_id: WorkspaceId,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AddedReviewComment {
+    pub comment_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SubmittedReview {
+    pub review_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewState {
+    pub workspace_id: WorkspaceId,
+    /// Why the workspace can't be reviewed, e.g. it has no repository.
+    pub unavailable_reason: Option<String>,
+    pub is_loaded: bool,
+    pub worktree_name: Option<String>,
+    pub branch: Option<String>,
+    pub base: Option<String>,
+    /// Whether the user picked the base rather than Zed.
+    pub is_base_picked: bool,
+    /// Local branches, to pick the base from.
+    pub branches: Vec<String>,
+    /// On top of the base, newest first.
+    pub commits: Vec<ReviewCommitSummary>,
+    pub commits_error: Option<String>,
+    pub uncommitted_files: usize,
+    /// Why the pending review can't be submitted, if it can't.
+    pub submit_blocker: Option<String>,
+    pub is_submitting: bool,
+    /// The pending review first, then the submitted ones, newest first.
+    pub reviews: Vec<ReviewSnapshot>,
+    /// Every tag used so far, without its `#`.
+    pub tags: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewCommitSummary {
+    pub sha: String,
+    pub subject: String,
+    pub author: String,
+    /// Unix seconds.
+    pub timestamp: i64,
+    pub comment_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewSnapshot {
+    pub review_id: String,
+    pub is_draft: bool,
+    /// RFC 3339.
+    pub created_at: String,
+    pub submitted_at: Option<String>,
+    pub unaddressed_count: usize,
+    /// The whole review as text, as Zed copies it.
+    pub as_text: String,
+    pub comments: Vec<ReviewCommentSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewCommentSnapshot {
+    pub comment_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub addressed: bool,
+    /// Starts with the tags.
+    pub text: String,
+    /// Without their `#`.
+    pub tags: Vec<String>,
+    /// e.g. `src/main.rs:10-12 @ 1a2b3c4d5e6f`.
+    pub location: String,
+    pub commit: Option<String>,
+    /// For comments on lines.
+    pub path: Option<String>,
+    /// 1-based and inclusive, in `commit`'s version.
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
+    /// Whether the comment is on deleted lines.
+    pub is_deleted_side: bool,
+    pub excerpt: Option<String>,
+    /// The comment as text, as Zed copies it.
+    pub as_text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewDiff {
+    pub base: Option<String>,
+    pub files: Vec<ReviewDiffFile>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewDiffFile {
+    pub path: String,
+    pub status: FileStatus,
+    pub old_text: Option<String>,
+    pub new_text: Option<String>,
+    pub is_binary: bool,
+    /// The review's unaddressed comments on the file, where they are now.
+    pub comments: Vec<ReviewLineComment>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewLineComment {
+    pub comment_id: String,
+    /// 0-based and inclusive, in `new_text`.
+    pub start_row: u32,
+    pub end_row: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

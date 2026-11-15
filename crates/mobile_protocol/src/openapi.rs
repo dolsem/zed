@@ -52,6 +52,8 @@ pub fn json() -> String {
         operation,
         operation_events,
         pairing,
+        reviews,
+        review_comments,
         mcp,
     ),
     // Only referenced from the server-sent events' descriptions.
@@ -62,6 +64,7 @@ pub fn json() -> String {
         (name = "projects", description = "Projects open in Zed and the agents that can work on them."),
         (name = "threads", description = "Agent threads, their runs and everything the agent waits on."),
         (name = "operations", description = "Work that takes a while, like creating a worktree or a thread."),
+        (name = "reviews", description = "Code reviews submitted in the git panel's review mode, with their comments."),
         (name = "session", description = "The connection to Zed itself."),
     ),
 )]
@@ -408,6 +411,55 @@ fn operation_events() {}
 )]
 fn pairing() {}
 
+/// Lists the submitted reviews of every worktree, whether or not it's open in
+/// Zed. Without `all`, only reviews with unaddressed comments are listed.
+#[utoipa::path(
+    get,
+    path = "/api/reviews",
+    tag = "reviews",
+    params(ReviewsQueryParams),
+    responses(
+        (status = 200, body = ReviewsResponse),
+        (status = 400, body = ErrorResponse, description = "A filter has an invalid value."),
+    ),
+)]
+fn reviews() {}
+
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct ReviewsQueryParams {
+    /// `true` to also list reviews whose comments were all addressed.
+    all: Option<bool>,
+    /// Only the reviews of the worktree at this path.
+    worktree_path: Option<String>,
+}
+
+/// A review's comments: by default the unaddressed ones.
+#[utoipa::path(
+    get,
+    path = "/api/reviews/{review_id}/comments",
+    tag = "reviews",
+    params(
+        ("review_id" = String, Path, description = "See `ReviewSummary::review_id`."),
+        ReviewCommentsQueryParams,
+    ),
+    responses(
+        (status = 200, body = ReviewCommentsResponse),
+        (status = 400, body = ErrorResponse, description = "A filter has an invalid value."),
+        (status = 404, body = ErrorResponse, description = "No such review."),
+    ),
+)]
+fn review_comments() {}
+
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct ReviewCommentsQueryParams {
+    /// Which comments to return by whether they were addressed (default `unaddressed`).
+    status: Option<CommentStatusFilter>,
+    /// Only comments with this tag, with or without its `#`.
+    tag: Option<String>,
+}
+
 /// The same API as an MCP server (streamable HTTP transport, JSON-RPC 2.0).
 #[utoipa::path(
     post,
@@ -462,7 +514,7 @@ mod tests {
     fn test_document() {
         let document: serde_json::Value = serde_json::from_str(&json()).unwrap();
         let paths = document["paths"].as_object().unwrap();
-        assert_eq!(paths.len(), 22);
+        assert_eq!(paths.len(), 24);
         let thread = &paths["/api/threads/{thread_id}"]["get"];
         assert_eq!(
             thread["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
